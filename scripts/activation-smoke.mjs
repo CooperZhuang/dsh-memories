@@ -87,15 +87,37 @@ class Settings {
   }
 }
 
+/** Minimal Typert registry stand-in: validates and records the contribution. */
+class Typert {
+  constructor() {
+    this.contributions = []
+  }
+  register(contribution) {
+    if (typeof contribution?.package !== 'string' || contribution.package.length === 0) throw new Error('contribution without a package')
+    if (contribution.face !== 'host') throw new Error('host contribution must declare face "host"')
+    for (const invocation of contribution.invocations ?? []) {
+      if (typeof invocation.method !== 'string' || invocation.method.length === 0) throw new Error('invocation without a method')
+      if (typeof invocation.result?.schema?.parse !== 'function') throw new Error(`${invocation.method}: result codec is not strict`)
+      for (const parameter of invocation.parameters ?? []) {
+        if (typeof parameter.codec?.schema?.parse !== 'function') throw new Error(`${invocation.method}.${parameter.name}: parameter codec is not strict`)
+      }
+    }
+    this.contributions.push(contribution)
+    return () => { this.contributions = this.contributions.filter((candidate) => candidate !== contribution) }
+  }
+}
+
 const memoriesDir = await mkdtemp(join(tmpdir(), 'dsh-memories-smoke-'))
 const root = new Context()
 const ctx = root.extend({ name: 'smoke' })
 const tools = new Tools()
 const commands = new Commands()
 const settings = new Settings({})
+const typert = new Typert()
 ctx.provide('tools', tools)
 ctx.provide('commands', commands)
 ctx.provide('settings', settings)
+ctx.provide('typert', typert)
 ctx.provide('llm', { stream: async function* () {} })
 
 const module = await import(entry)
@@ -108,6 +130,7 @@ await new Promise((settle) => setTimeout(settle, 200))
 console.log('settings namespaces:', settings.describe().map((d) => d.ns).join(', ') || '(none)')
 console.log('tools registered:', [...tools.registered.keys()].join(', ') || '(none)')
 console.log('commands registered:', [...commands.registered.keys()].join(', ') || '(none)')
+console.log('typert invocations:', typert.contributions[0]?.invocations.map((i) => i.method).join(', ') || '(none)')
 
 // Live toggle: disabling the tool through the settings scope must unregister it.
 const flip = async (patch) => {
@@ -150,6 +173,23 @@ if (memories !== undefined) {
   console.log('search --kind:', JSON.stringify(await run(' search linter --kind preference')).slice(0, 200))
   console.log('search wrong kind:', JSON.stringify(await run(' search linter --kind failure')).slice(0, 120))
   console.log('skills:', JSON.stringify(await run(' skills')).slice(0, 120))
+}
+
+// The Settings page reaches the store through the provided `memories` service;
+// this exercises that surface the same way the gateway would. Arguments are
+// positional, one per descriptor parameter.
+const remote = ctx.get('memories')
+if (remote !== undefined) {
+  console.log('remote binding:', JSON.stringify({ serviceKey: remote.typertRemote?.serviceKey, namespace: remote.typertRemote?.namespace }))
+  const overview = await remote.overview()
+  console.log('remote overview:', JSON.stringify({ storePath: overview.storePath === memoriesDir, globalCount: overview.globalCount, projects: overview.projects.length }))
+  const listed = await remote.list('', 'global', 'linter', '', 10)
+  console.log('remote list:', JSON.stringify(listed.entries.map((entry) => `${entry.kind}:${entry.title}`)))
+  const added = await remote.add('', 'global', 'knowledge', 'Smoke remote write', 'Written through the Remote service.', 'smoke')
+  console.log('remote add:', JSON.stringify({ id: added.entry.id, kind: added.entry.kind, tags: added.entry.tags }))
+  console.log('remote forget:', JSON.stringify(await remote.forget('', 'global', added.entry.id)))
+} else {
+  console.log('remote service: MISSING')
 }
 
 await plugin.dispose?.()

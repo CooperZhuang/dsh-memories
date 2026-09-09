@@ -45,6 +45,8 @@ import type { ConsolidationTarget, SubagentSeam } from './consolidate.js'
 import { MEMORY_KINDS } from './types.js'
 import type { MemoryEntry, MemoryKind, MemoryScope } from './types.js'
 import { registerMemoryTool } from './tool.js'
+import { REMOTE_CONTRIBUTION, REMOTE_SERVICE, createRemoteService } from './remote.js'
+import type { TypertRegistryLike } from './remote.js'
 
 /** Plugin name; also the source tag of every injected message. */
 export const name = 'memories'
@@ -871,6 +873,22 @@ export function apply(ctx: Context, config: MemoriesConfig = {}): void {
 
   const runtime = new MemoriesRuntime(ctx, config, read)
   ctx.effect(() => () => runtime.dispose(), 'dsh-memories.lifecycle')
+  // The Settings page reads and edits memories through the Typert gateway, so
+  // registering the invocation manifest and providing the `memories` service
+  // are what make `ctx.remote.memories.*` callable from the browser. Both are
+  // optional: a deployment that composes no gateway (headless, tui) keeps every
+  // model-facing and command-facing surface and simply has no browser page.
+  const typert = ctx.get('typert') as TypertRegistryLike | undefined
+  if (typert !== undefined) {
+    try {
+      const withdraw = typert.register(REMOTE_CONTRIBUTION)
+      ctx.effect(() => withdraw, 'dsh-memories.remoteContribution')
+      const service = createRemoteService({ store: runtime.store, dshHome: deployment.dshHome })
+      ctx.effect(() => ctx.provide(REMOTE_SERVICE, service), 'dsh-memories.remoteService')
+    } catch (error) {
+      ctx.logger.warn('dsh-memories: remote registration failed, the settings page stays unavailable: %o', error)
+    }
+  }
   // Import (and remove) a pre-SQLite watermark file once, so upgrading does not
   // re-mine conversations that were already processed.
   void importLegacyState(runtime.state, runtime.store.memoriesDir).then((imported) => {
