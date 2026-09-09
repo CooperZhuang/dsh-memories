@@ -7,7 +7,7 @@
  *
  * @module dsh-memories/search
  */
-import type { MemoryEntry, MemoryHit, MemoryScope } from './types.js'
+import type { MemoryEntry, MemoryHit, MemoryKind, MemoryScope } from './types.js'
 
 /** Split text into lowercase tokens, keeping CJK runs intact. */
 export function tokenize(text: string): string[] {
@@ -69,6 +69,8 @@ export interface SearchOptions {
   readonly scopes?: readonly MemoryScope[]
   /** Only consider entries carrying every one of these tags. */
   readonly tags?: readonly string[]
+  /** Only consider entries of these kinds. */
+  readonly kinds?: readonly MemoryKind[]
   /** Maximum hits returned. */
   readonly limit?: number
   /** Clock used for the recency tie-break; injected for deterministic tests. */
@@ -100,11 +102,13 @@ export function searchMemories(
   const limit = options.limit ?? 10
   const wantedScopes = options.scopes
   const wantedTags = (options.tags ?? []).map((tag) => tag.toLowerCase())
+  const wantedKinds = options.kinds
   const now = options.now ?? Date.now()
   const hits: MemoryHit[] = []
   for (const group of groups) {
     if (wantedScopes !== undefined && !wantedScopes.includes(group.scope)) continue
     for (const entry of group.entries) {
+      if (wantedKinds !== undefined && !wantedKinds.includes(entry.kind)) continue
       if (wantedTags.length > 0 && !wantedTags.every((tag) => entry.tags.includes(tag))) continue
       const score = scoreEntry(entry, query, now)
       if (score <= 0) continue
@@ -131,10 +135,12 @@ export function browseMemories(
   const limit = options.limit ?? 10
   const wantedScopes = options.scopes
   const wantedTags = (options.tags ?? []).map((tag) => tag.toLowerCase())
+  const wantedKinds = options.kinds
   const hits: MemoryHit[] = []
   for (const group of groups) {
     if (wantedScopes !== undefined && !wantedScopes.includes(group.scope)) continue
     for (const entry of group.entries) {
+      if (wantedKinds !== undefined && !wantedKinds.includes(entry.kind)) continue
       if (wantedTags.length > 0 && !wantedTags.every((tag) => entry.tags.includes(tag))) continue
       hits.push({ entry, score: 0 })
     }

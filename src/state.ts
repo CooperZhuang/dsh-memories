@@ -17,6 +17,7 @@
  * @module dsh-memories/state
  */
 import { mkdirSync } from 'node:fs'
+import { readFile, rm } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
 
@@ -26,6 +27,12 @@ import { dirname, join } from 'node:path'
  * instead of failing the whole plugin at import time.
  */
 const requireOptional = createRequire(import.meta.url)
+
+/** Whether a filesystem error means "absent". */
+function isMissing(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error
+    && (error.code === 'ENOENT' || error.code === 'ENOTDIR')
+}
 
 /** One session's extraction progress. */
 export interface SessionState {
@@ -311,7 +318,69 @@ export class StateStore {
   }
 }
 
-/** Resolve the state database path inside one memory store. */
+/**
+ * Resolve the state database path inside one memory store. */
 export function statePath(memoriesDir: string): string {
   return join(memoriesDir, 'state.db')
+}
+
+/** The pre-SQLite watermark file, imported once and then removed. */
+export const LEGACY_STATE_FILE = 'extract-state.json'
+
+/** Shape of the legacy `extract-state.json` document. */
+interface LegacyState {
+  version?: number
+  sessions?: Record<string, { lastSeq?: number; at?: number; root?: string; contributed?: boolean }>
+}
+
+/**
+ * Import and remove a pre-SQLite `extract-state.json`.
+ *
+ * The file only ever held extraction watermarks. Importing them matters: a
+ * session with no watermark is re-mined, which spends quota re-reading a
+ * conversation that was already processed. The import is skipped when the
+ * database already holds sessions, so it can never overwrite newer state.
+ *
+ * @param store - the state store to import into.
+ * @param memoriesDir - directory the legacy file lives in.
+ * @returns how many watermarks were imported, or `undefined` when there was nothing to do.
+ */
+export async function importLegacyState(store: StateStore, memoriesDir: string): Promise<number | undefined> {
+  const path = join(memoriesDir, LEGACY_STATE_FILE)
+  let text: string
+  try {
+    text = await readFile(path, 'utf8')
+  } catch (error) {
+    if (isMissing(error)) return undefined
+    throw error
+  }
+  let parsed: LegacyState
+  try {
+    parsed = JSON.parse(text) as LegacyState
+  } catch {
+    // A corrupt legacy file is not worth failing the plugin over; remove it so
+    // it stops looking like live state.
+    await rm(path, { force: true })
+    return 0
+  }
+  let imported = 0
+  if (store.sessionCount() === 0 && typeof parsed.sessions === 'object' && parsed.sessions !== null) {
+    for (const [id, value] of Object.entries(parsed.sessions)) {
+      if (typeof value !== 'object' || value === null) continue
+      const lastSeq = Number(value.lastSeq)
+      if (!Number.isFinite(lastSeq) || lastSeq <= 0) continue
+      store.putSession(id, {
+        lastSeq: Math.trunc(lastSeq),
+        at: Number.isFinite(Number(value.at)) ? Number(value.at) : 0,
+        ...typeof value.root === 'string' ? { root: value.root } : {},
+        ...value.contributed === true ? { contributed: true } : {},
+        // The legacy file never recorded activity; the watermark time is the
+        // closest honest proxy for "when this session was last touched".
+        activityAt: Number.isFinite(Number(value.at)) ? Number(value.at) : 0,
+      })
+      imported += 1
+    }
+  }
+  await rm(path, { force: true })
+  return imported
 }

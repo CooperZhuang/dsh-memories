@@ -102,7 +102,7 @@ export function registerMemoryTool(ctx: Context, runtime: MemoriesRuntime): () =
       kind: {
         type: 'string',
         enum: [...KINDS],
-        description: 'write: what kind of memory this is — preference (how the user wants work done), failure (what went wrong), procedure (an ordered recipe), knowledge (a non-obvious technique), fact (background). Defaults to fact.',
+        description: 'write: what kind of memory this is — preference (how the user wants work done), failure (what went wrong), procedure (an ordered recipe), knowledge (a non-obvious technique), fact (background). Defaults to fact. search: keep only this kind.',
       },
       appliesTo: {
         type: 'string',
@@ -161,9 +161,15 @@ export function registerMemoryTool(ctx: Context, runtime: MemoriesRuntime): () =
           const scopes = args.scope === undefined ? undefined : [args.scope]
           const tags = args.tags ?? []
           const query = args.query?.trim() ?? ''
+          const filters = {
+            ...scopes === undefined ? {} : { scopes },
+            tags,
+            ...args.kind === undefined ? {} : { kinds: [args.kind] },
+            limit,
+          }
           const hits = query.length === 0
-            ? await runtime.browse(session, { ...scopes === undefined ? {} : { scopes }, tags, limit })
-            : await runtime.search(session, query, { ...scopes === undefined ? {} : { scopes }, tags, limit })
+            ? await runtime.browse(session, filters)
+            : await runtime.search(session, query, filters)
           if (hits.length === 0) {
             return {
               ok: true,

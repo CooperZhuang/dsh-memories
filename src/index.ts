@@ -32,7 +32,7 @@ import { Config as ConfigSchema, MemoriesSettingsSchema, SETTINGS_NS, normalizeS
 import type { MemoriesConfig, MemoriesSettings, ResolvedConfig } from './config.js'
 import type { SettingsProvider } from '@deepseek-ai/dsh-settings'
 import { MemoryStore, slugify } from './storage.js'
-import { StateStore, statePath } from './state.js'
+import { StateStore, importLegacyState, statePath } from './state.js'
 import { browseMemories, searchMemories } from './search.js'
 import type { ScopeEntries } from './search.js'
 import { rankForSummary, renderEntry, renderHit, renderMemorySummary, renderScopeListing } from './render.js'
@@ -42,7 +42,8 @@ import { collectWindow, runExtraction } from './extract.js'
 import { applyPlan, runConsolidation } from './consolidate.js'
 import { discardDraft, listDrafts, promote, writeDraft } from './skills.js'
 import type { ConsolidationTarget, SubagentSeam } from './consolidate.js'
-import type { MemoryEntry, MemoryScope } from './types.js'
+import { MEMORY_KINDS } from './types.js'
+import type { MemoryEntry, MemoryKind, MemoryScope } from './types.js'
 import { registerMemoryTool } from './tool.js'
 
 /** Plugin name; also the source tag of every injected message. */
@@ -178,13 +179,13 @@ export class MemoriesRuntime {
   }
 
   /** Search both scopes. */
-  async search(session: Session, query: string, options: { scopes?: readonly MemoryScope[]; tags?: readonly string[]; limit?: number }) {
+  async search(session: Session, query: string, options: { scopes?: readonly MemoryScope[]; tags?: readonly string[]; kinds?: readonly MemoryKind[]; limit?: number }) {
     const states = await this.allScopes(session)
     return searchMemories(this.groups(states), query, options)
   }
 
   /** Browse both scopes without a query. */
-  async browse(session: Session, options: { scopes?: readonly MemoryScope[]; tags?: readonly string[]; limit?: number }) {
+  async browse(session: Session, options: { scopes?: readonly MemoryScope[]; tags?: readonly string[]; kinds?: readonly MemoryKind[]; limit?: number }) {
     const states = await this.allScopes(session)
     return browseMemories(this.groups(states), options)
   }
@@ -761,9 +762,27 @@ export class MemoriesRuntime {
   }
 }
 
+/**
+ * Split an optional `--kind <kind>` flag out of one command's arguments.
+ *
+ * The flag is accepted anywhere after the verb, so `add global text --kind
+ * preference` and `search query --kind failure` both work. An unknown kind is
+ * ignored rather than rejected: a typo should not silently filter everything
+ * out, and the caller's text is still meaningful.
+ * @param raw - the text after the subcommand.
+ * @returns the text with the flag removed, and the requested kinds.
+ */
+function parseKindFlag(raw: string): { text: string; kinds?: readonly MemoryKind[] } {
+  const match = /(?:^|\s)--kind[= ]([A-Za-z]+)/u.exec(raw)
+  if (match === null) return { text: raw.trim() }
+  const value = match[1]?.toLowerCase()
+  const kind = MEMORY_KINDS.find((candidate) => candidate === value)
+  const text = `${raw.slice(0, match.index)} ${raw.slice(match.index + match[0].length)}`.trim()
+  return kind === undefined ? { text } : { text, kinds: [kind] }
+}
+
 /** Narrow the `/memories` argument grammar. */
-function parseCommandInput(raw: string): { verb: string; rest: string } {
-  const trimmed = raw.trim()
+function parseCommandInput(raw: string): { verb: string; rest: string } {  const trimmed = raw.trim()
   if (trimmed.length === 0) return { verb: 'help', rest: '' }
   const separator = trimmed.search(/\s/u)
   if (separator < 0) return { verb: trimmed.toLowerCase(), rest: '' }
@@ -775,14 +794,14 @@ function helpText(): string {
   return [
     'Usage: /memories [subcommand]',
     '  list [global|project]   list stored memories',
-    '  search <query>          search both scopes',
+    '  search <query> [--kind <kind>]   search both scopes',
     '  show <id>               show one memory (project first)',
-    '  add <global|project> <text>   store a memory by hand',
+    '  add <global|project> <text> [--kind <kind>]   store a memory by hand',
     '  forget <id>             delete a memory',
     '  mine                    extract memories from this session now',
     '  consolidate             merge and reconcile all memories now',
     '  skills                  list staged skill drafts',
-    '  promote <name>          copy a staged draft into \/skills',
+    '  promote <name>          copy a staged draft into the harness skill root',
     '  discard <name>          delete a staged draft',
     '  stats                   store location and counters',
   ].join('\n')
@@ -832,6 +851,14 @@ export function apply(ctx: Context, config: MemoriesConfig = {}): void {
 
   const runtime = new MemoriesRuntime(ctx, config, read)
   ctx.effect(() => () => runtime.dispose(), 'dsh-memories.lifecycle')
+  // Import (and remove) a pre-SQLite watermark file once, so upgrading does not
+  // re-mine conversations that were already processed.
+  void importLegacyState(runtime.state, runtime.store.memoriesDir).then((imported) => {
+    if (imported === undefined) return
+    ctx.logger.info('dsh-memories: imported %d watermarks from the legacy state file', imported)
+  }).catch((error: unknown) => {
+    ctx.logger.warn('dsh-memories: legacy state import failed: %o', error)
+  })
   ctx.logger.info(
     'dsh-memories: store at %s autoExtract=%s idle=%d settings=%s',
     runtime.store.memoriesDir,
@@ -847,7 +874,7 @@ export function apply(ctx: Context, config: MemoriesConfig = {}): void {
   const registerCommand = (): (() => void) => ctx.commands.register({
     name: 'memories',
     description: 'Inspect and manage cross-session memories',
-    input: { hint: 'list | search <query> | show <id> | add <scope> <text> | forget <id> | mine | stats' },
+    input: { hint: 'list | search <query> [--kind <k>] | show <id> | add <scope> <text> [--kind <k>] | forget <id> | mine | consolidate | skills | stats' },
     handler: async (invocation: CommandInvocation) => handleCommand(runtime, invocation),
   })
   let toolDisposer: (() => void) | undefined
@@ -929,9 +956,11 @@ async function handleCommand(runtime: MemoriesRuntime, invocation: CommandInvoca
       }
     }
     case 'search': {
-      if (rest.length === 0) return { kind: 'error', text: 'Usage: /memories search <query>' }
-      const hits = await runtime.search(session, rest, { limit: 10 })
-      if (hits.length === 0) return { kind: 'success', text: `No memories match ${JSON.stringify(rest)}.` }
+      if (rest.length === 0) return { kind: 'error', text: 'Usage: /memories search <query> [--kind <kind>]' }
+      const { text: query, kinds } = parseKindFlag(rest)
+      if (query.length === 0) return { kind: 'error', text: 'Usage: /memories search <query> [--kind <kind>]' }
+      const hits = await runtime.search(session, query, { limit: 10, ...kinds === undefined ? {} : { kinds } })
+      if (hits.length === 0) return { kind: 'success', text: `No memories match ${JSON.stringify(query)}.` }
       return { kind: 'success', text: hits.map((hit, index) => renderHit(hit, index)).join('\n') }
     }
     case 'show': {
@@ -941,15 +970,22 @@ async function handleCommand(runtime: MemoriesRuntime, invocation: CommandInvoca
       return { kind: 'success', text: renderEntry(entry) }
     }
     case 'add': {
-      const separator = rest.search(/\s/u)
-      const scope = (separator < 0 ? rest : rest.slice(0, separator)).trim().toLowerCase()
-      const text = separator < 0 ? '' : rest.slice(separator + 1).trim()
+      const { text: body, kinds } = parseKindFlag(rest)
+      const separator = body.search(/\s/u)
+      const scope = (separator < 0 ? body : body.slice(0, separator)).trim().toLowerCase()
+      const text = separator < 0 ? '' : body.slice(separator + 1).trim()
       if ((scope !== 'global' && scope !== 'project') || text.length === 0) {
-        return { kind: 'error', text: 'Usage: /memories add <global|project> <text>' }
+        return { kind: 'error', text: 'Usage: /memories add <global|project> <text> [--kind <kind>]' }
       }
       const title = text.length <= 80 ? text : `${text.slice(0, 77)}...`
-      const result = await runtime.write(session, { scope, title, body: text, tags: [] }, 'user')
-      return { kind: 'success', text: `${result.action === 'created' ? 'Stored' : 'Updated'} ${scope} memory ${result.entry.id}.` }
+      const result = await runtime.write(session, {
+        scope,
+        title,
+        body: text,
+        tags: [],
+        ...kinds === undefined ? {} : { kind: kinds[0] },
+      }, 'user')
+      return { kind: 'success', text: `${result.action === 'created' ? 'Stored' : 'Updated'} ${scope} ${result.entry.kind} memory ${result.entry.id}.` }
     }
     case 'forget': {
       if (rest.length === 0) return { kind: 'error', text: 'Usage: /memories forget <id>' }

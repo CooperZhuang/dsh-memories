@@ -169,9 +169,9 @@ frontmatter 的目录包），下次技能目录刷新后进入目录。草稿�
 ```
 /memories                     列出两个作用域
 /memories list global|project 只列某一作用域
-/memories search <query>      检索
+/memories search <query> [--kind <kind>]      检索，可按类别过滤
 /memories show <id>           看全文
-/memories add <global|project> <text>   手工写入
+/memories add <global|project> <text> [--kind <kind>]   手工写入
 /memories forget <id>         删除
 /memories mine                立刻从当前会话抽取一次（不等空闲）
 /memories consolidate         立刻合并重整全部记忆（不等冷却）
@@ -180,6 +180,9 @@ frontmatter 的目录包），下次技能目录刷新后进入目录。草稿�
 /memories discard <name>      丢弃一份草稿
 /memories stats               存储位置与计数
 ```
+
+`kind` 取值：`fact` / `preference` / `knowledge` / `failure` / `procedure`。写错的 kind 会被忽略
+而不是让过滤结果为空——手滑不该让检索静默失效。
 
 ## 存储格式
 

@@ -122,6 +122,10 @@ console.log('after enableTool=false, tools:', [...tools.registered.keys()].join(
 await flip({ enableTool: true, enableCommand: false })
 await new Promise((settle) => setTimeout(settle, 50))
 console.log('after enableTool=true/enableCommand=false, tools:', [...tools.registered.keys()].join(', ') || '(none)', '| commands:', [...commands.registered.keys()].join(', ') || '(none)')
+// Restore both so the command smoke below exercises a fully enabled plugin.
+await flip({ enableCommand: true })
+await new Promise((settle) => setTimeout(settle, 50))
+console.log('after re-enable, commands:', [...commands.registered.keys()].join(', ') || '(none)')
 
 const tool = tools.registered.get('memory')
 if (tool !== undefined) {
@@ -133,14 +137,19 @@ if (tool !== undefined) {
 
 const memories = commands.registered.get('memories')
 if (memories !== undefined) {
-  const result = await memories.handler({
-    rawInput: ' stats',
+  const run = (rawInput) => memories.handler({
+    rawInput,
     commandId: 'smoke',
     agent: { session: { id: 'smoke-session', header: { cwd: pluginDir } } },
     attachments: [],
     signal: new AbortController().signal,
   })
-  console.log('command stats:', JSON.stringify(result).slice(0, 300))
+  console.log('command stats:', JSON.stringify(await run(' stats')).slice(0, 300))
+  // The `--kind` flag must survive argument parsing and reach the store.
+  console.log('add --kind:', JSON.stringify(await run(' add global Always run the linter before committing --kind preference')).slice(0, 160))
+  console.log('search --kind:', JSON.stringify(await run(' search linter --kind preference')).slice(0, 200))
+  console.log('search wrong kind:', JSON.stringify(await run(' search linter --kind failure')).slice(0, 120))
+  console.log('skills:', JSON.stringify(await run(' skills')).slice(0, 120))
 }
 
 await plugin.dispose?.()
