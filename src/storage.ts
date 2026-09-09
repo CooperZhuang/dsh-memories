@@ -10,7 +10,8 @@
  *   projects/<slug>/index.json     # project scope index
  *   projects/<slug>/entries/*.md
  *   projects/<slug>/project.json   # how the slug was derived (diagnostics)
- *   extract-state.json             # per-session extraction watermarks
+ *   skills/<name>/SKILL.md         # staged skill drafts, not yet promoted
+ *   state.db                       # SQLite: watermarks, jobs, usage counters
  * ```
  *
  * Entry files are the source of truth: an index is a rebuildable cache, so a

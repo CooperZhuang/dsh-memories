@@ -129,7 +129,7 @@ memories:
 ### 设置界面
 
 这个包还带一个**浏览器半**（`./client`，由 `dsh.client` 声明），在
-**设置 → 插件 → 插件配置** 里注册一张 `Memories` 卡片，14 个可调项都能直接改，
+**设置 → 插件 → 插件配置** 里注册一张 `Memories` 卡片：上表 **21 个可调项全都能在界面里改**，
 改完立即生效。卡片通过 `ctx.settingsScope.bind({ namespace: 'memories' })` 读写，
 走的是和内置设置页完全相同的 describe 镜像 + revision 围栏写入路径，没有自建 HTTP 路由。
 
