@@ -34,7 +34,7 @@ const FIELDS = [
   {
     field: 'maxSummaryBytes', kind: 'number', min: 0, step: 256,
     label: { zh: '摘要字节上限', en: 'Summary byte budget' },
-    hint: { zh: '每个回合注入的记忆摘要最大字节数，0 表示关闭注入。', en: 'Bytes of memory summary injected per turn. 0 disables injection.' },
+    hint: { zh: '一次会话注入的记忆摘要最大字节数，0 表示关闭注入。', en: 'Bytes of memory summary injected once per conversation. 0 disables injection.' },
   },
   {
     field: 'maxSummaryEntries', kind: 'number', min: 1, step: 1,

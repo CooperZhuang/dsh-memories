@@ -76,7 +76,7 @@ export const DEFAULT_CONSOLIDATE_TIMEOUT_MS = 180_000
  */
 export const MemoriesSettingsSchema = z.object({
   /** Byte budget for the injected summary. `0` disables injection. */
-  maxSummaryBytes: z.number().default(DEFAULT_MAX_SUMMARY_BYTES).description('Byte budget for the memory summary injected into each turn. 0 disables injection and leaves only the memory tool.'),
+  maxSummaryBytes: z.number().default(DEFAULT_MAX_SUMMARY_BYTES).description('Byte budget for the memory summary injected once per conversation. 0 disables injection and leaves only the memory tool.'),
   /** Max entries listed per scope in the injected summary. */
   maxSummaryEntries: z.number().default(DEFAULT_MAX_SUMMARY_ENTRIES).description('How many memories each scope lists in the injected summary.'),
   /** Max stored entries per scope; the least-recently-updated are evicted. */

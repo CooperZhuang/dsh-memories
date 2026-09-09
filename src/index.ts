@@ -16,12 +16,11 @@
  *    `autoExtractIdleMs`, one auxiliary model call mines the transcript tail for
  *    durable facts and upserts them (deduplicated by title).
  * 3. **Layered injection** — a bounded summary of both scopes enters the
- *    conversation once per session, and is refreshed if the store changed;
- *    details stay behind `memory_search`.
+ *    conversation once, at the first step that has something to say; details
+ *    stay behind `memory_search`.
  *
  * @module dsh-memories
  */
-import { createHash } from 'node:crypto'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { LlmRuntime, UserMessage } from '@deepseek-ai/dsh-llm'
 import type { Agent, SessionStartSource } from '@deepseek-ai/dsh-agent'
@@ -76,17 +75,6 @@ interface ScopeState {
   readonly entries: readonly MemoryEntry[]
 }
 
-/** Per-session injected-state marker. */
-interface InjectionState {
-  /** Turn whose first step carried the last injection. */
-  turn: number
-  /** Digest of the summary the model currently sees. */
-  digest: string
-  /** Surface seq at the moment of injection, for diagnostics. */
-  seq?: number
-  /** Set when the store changed after the last injection. */
-  dirty?: boolean
-}
 
 /**
  * The memory runtime: one instance per plugin mount, shared by the tool, the
@@ -117,7 +105,8 @@ export class MemoriesRuntime {
   /** The subagent seam, read once; absent in a deployment without delegation. */
   private readonly subagents: SubagentSeam | undefined
   private readonly rootCache = new WeakMap<Session, Promise<string>>()
-  private readonly injection = new WeakMap<Session, InjectionState>()
+  /** Sessions whose conversation already carries the memory block. */
+  private readonly injected = new WeakSet<Session>()
   private readonly idleTimers = new WeakMap<Agent, NodeJS.Timeout>()
   private readonly extracting = new Set<string>()
   private readonly lifecycle = new AbortController()
@@ -226,38 +215,23 @@ export class MemoriesRuntime {
     source: MemoryEntry['source'],
   ) {
     const root = draft.scope === 'project' ? await this.projectRoot(session) : undefined
-    const result = await this.store.upsert(draft, root, source)
-    this.bumpInjection(session)
-    return result
+    return await this.store.upsert(draft, root, source)
   }
 
   /** Delete one entry. */
   async forget(session: Session, scope: MemoryScope, id: string): Promise<boolean> {
     const root = scope === 'project' ? await this.projectRoot(session) : undefined
-    const removed = await this.store.remove(scope, root, id)
-    if (removed) this.bumpInjection(session)
-    return removed
-  }
-
-  /** Mark the injected summary stale so the next step refreshes it. */
-  private bumpInjection(session: Session): void {
-    const state = this.injection.get(session)
-    if (state !== undefined) this.injection.set(session, { ...state, dirty: true })
+    return await this.store.remove(scope, root, id)
   }
 
   /**
    * Build the injected summary block for one session, or `undefined` when the
    * store is empty or injection is disabled.
    *
-   * The digest covers the CONTENT only, never the intro sentence: the intro
-   * changes between the first and later injections, and hashing it would make an
-   * unchanged store look changed and re-inject on every step.
-   *
    * @param session - session whose scopes to summarize.
-   * @param replacesEarlier - whether the block supersedes an earlier one.
-   * @returns the framed text plus the content digest.
+   * @returns the framed block, or `undefined` when there is nothing to say.
    */
-  async summary(session: Session, replacesEarlier: boolean): Promise<{ text: string; digest: string } | undefined> {
+  async summary(session: Session): Promise<string | undefined> {
     if (this.settings.maxSummaryBytes <= 0) return undefined
     const states = await this.allScopes(session)
     const scopes: SummaryScope[] = states.map((state) => ({
@@ -266,50 +240,44 @@ export class MemoriesRuntime {
       entries: state.entries,
       total: state.entries.length,
     }))
-    const text = renderMemorySummary(scopes, {
+    return renderMemorySummary(scopes, {
       maxBytes: this.settings.maxSummaryBytes,
       maxEntriesPerScope: this.settings.maxSummaryEntries,
-      replacesEarlier,
     })
-    if (text === undefined) return undefined
-    const content = scopes
-      .filter((scope) => scope.total > 0)
-      .map((scope) => `${scope.heading}\u0000${scope.entries.slice(0, this.settings.maxSummaryEntries).map((entry) => `${entry.id}:${entry.updatedAt}:${entry.uses}`).join(',')}`)
-      .join('\n')
-    return { text, digest: createHash('sha1').update(content).digest('hex') }
   }
 
   /**
    * Decide what the model should see at this step boundary.
    *
-   * Injection is turn-scoped, mirroring Codex's re-injected developer policy:
-   * the block enters at the first step of a turn, and again inside that turn
-   * only when the store actually changed (a memory was written or forgotten, or
-   * another writer touched the files). A turn that changes nothing never
-   * re-injects, so the summary cannot crowd out the conversation.
+   * The block enters exactly ONCE per conversation: at the first step where the
+   * store has something to say. Nothing re-injects afterwards, so a long session
+   * pays for its memories once instead of once per turn, and every later recall
+   * goes through `memory_search`. `clear`/`compact` replace the conversation and
+   * therefore drop the block with it, which is why {@link resetInjection} re-arms
+   * this state there.
+   *
+   * An empty store deliberately leaves the state unset: the block should still
+   * appear later if the first memory arrives after the session started.
    *
    * @param agent - the agent whose next step is being prepared.
-   * @param turn - the turn that will own the step.
-   * @returns the message to enter the conversation, or `undefined` when the
-   *   visible summary is already current for this step.
+   * @returns the message to enter the conversation, or `undefined` when this
+   *   conversation already carries one.
    */
-  async injectionFor(agent: Agent, turn: number): Promise<UserMessage | undefined> {
+  async injectionFor(agent: Agent): Promise<UserMessage | undefined> {
     const session = agent.session
-    const state = this.injection.get(session)
-    const dirty = state !== undefined && (state.dirty || state.turn !== turn)
-    const summary = await this.summary(session, state !== undefined)
-    if (summary === undefined) return undefined
-    if (state !== undefined && !dirty && state.digest === summary.digest) return undefined
-    this.injection.set(session, { turn, digest: summary.digest, seq: session.seq })
+    if (this.injected.has(session)) return undefined
+    const text = await this.summary(session)
+    if (text === undefined) return undefined
+    this.injected.add(session)
     return createUserMessage({
-      content: [{ type: 'text', text: summary.text }],
+      content: [{ type: 'text', text }],
       source: { kind: 'plugin', plugin: name, form: 'recall' },
     })
   }
 
-  /** Reset one session's injection state (used on `clear`/`compact` restarts). */
+  /** Re-arm injection for one session (used on `clear`/`compact` restarts). */
   resetInjection(session: Session): void {
-    this.injection.delete(session)
+    this.injected.delete(session)
   }
 
   /**
@@ -576,7 +544,6 @@ export class MemoriesRuntime {
         for (const draft of outcome.drafts) {
           await this.store.upsert(draft, draft.scope === 'project' ? root : undefined, 'auto')
         }
-        this.bumpInjection(session)
         this.ctx.logger.info('dsh-memories: stored %d memories from session %s', outcome.drafts.length, key)
       }
       this.state.putSession(key, {
@@ -693,7 +660,6 @@ export class MemoriesRuntime {
         }
       }
       this.state.deleteJob(CONSOLIDATE_JOB)
-      this.bumpAllInjections()
       this.ctx.logger.info('dsh-memories: consolidated %d written, %d retired, %d skill drafts', result.written, result.retired, staged.length)
       return [
         `Consolidated ${entries.length} memories: ${result.written} written, ${result.retired} retired.`,
@@ -713,15 +679,6 @@ export class MemoriesRuntime {
       })
       this.ctx.logger.warn('dsh-memories: consolidation failed: %s', message)
       return undefined
-    }
-  }
-
-  /** Mark every session's injected summary stale (used after a consolidation). */
-  private bumpAllInjections(): void {
-    for (const reference of this.tracked) {
-      const agent = reference.deref()
-      if (agent === undefined) continue
-      this.bumpInjection(agent.session)
     }
   }
 
@@ -961,10 +918,10 @@ export function apply(ctx: Context, config: MemoriesConfig = {}): void {
     if (source === 'clear' || source === 'compact') runtime.resetInjection(agent.session)
   })
 
-  ctx.on('agent/pre-step', async ({ agent, turn }, next) => {
+  ctx.on('agent/pre-step', async ({ agent }, next) => {
     const decision = await next()
     if (decision.kind === 'reject') return decision
-    const message = await runtime.injectionFor(agent, turn)
+    const message = await runtime.injectionFor(agent)
     if (message === undefined) return decision
     if (decision.messages.some((existing) => existing.id === message.id)) return decision
     return { ...decision, messages: [...decision.messages, message] }
