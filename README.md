@@ -17,10 +17,16 @@
 
 冲突时**项目记忆覆盖全局记忆**，这一点写进了注入块的说明里。
 
+每条记忆还有一个 **kind**，因为不同种类的东西回忆方式不同：`preference`（用户要你怎么做事）、
+`failure`（踩过的坑）、`procedure`（可复用的有序流程）、`knowledge`（不显然的技巧）、
+`fact`（纯背景）。注入摘要按 kind 分组，**可执行的那几类排在前面**；没有 `kind:` 行的旧文件
+按 `fact` 解析，所以格式演进不需要迁移脚本。
+
 ## 四个协同机制
 
 1. **显式写入（工具）** — 模型调用 `memory` 工具，每次写入都必须显式指定 `global` 或
-   `project`。标题即身份：同一标题再写一次是**更新**而不是新增。
+   `project`。标题即身份：同一标题再写一次是**更新**而不是新增。可以顺带指明 `kind` 和
+   `appliesTo`（什么时候该想起它）。
 2. **空闲抽取（阶段 1）** — 会话空闲 `autoExtractIdleMs`（默认 5 分钟）后，用一次辅助模型
    调用把最近一段对话里**值得长期保留的事实**抽成记忆并写入。子代理会话、委派深度 > 0
    的会话不参与。抽出来的内容先做**密钥擦除**（`sk-…`、`ghp_…`、AKIA…、JWT、私钥块、
@@ -34,6 +40,7 @@
    再委派（`maxDepth: 0` + 工具黑名单），只能返回一份严格 JSON 的合并方案——合并重复、
    改写过期、退役失效、补上遗漏。**插件是唯一的写入者**：它校验方案里的 id 必须真实存在，
    然后在快照保护下应用；中途失败会回滚已改动的条目。想立刻合并用 `/memories consolidate`。
+   它还会从记忆里提炼**技能草稿**（见下）。
 4. **分层注入（上下文）** — 每个 turn 的第一个 step 注入一段有界摘要：先全局、后项目，
    每段列出标题 + 日期 + 一句话预览。**同一 turn 内不重复注入**；只有记忆真的变了（模型写入、
    忘记、外部改动、合并重整）才在下一个 step 刷新一次。`/compact` 或清空会话后会自动重新注入，
@@ -130,12 +137,32 @@ memories:
 
 | action | 参数 | 作用 |
 | --- | --- | --- |
-| `write` | `scope` + `title` + `body` + `tags?` | 写入或更新一条记忆（标题即身份） |
+| `write` | `scope` + `title` + `body` + `tags?` + `kind?` + `appliesTo?` | 写入或更新一条记忆（标题即身份） |
 | `search` | `query?` + `scope?` + `tags?` + `limit?` | 关键词检索两个作用域；`query` 为空时按最近更新列出 |
 | `read` | `id` + `scope?` | 按 id 读全文（默认先项目、后全局） |
 | `forget` | `id` + `scope?` | 删除一条 |
 
 写项目记忆时，工具结果里会附一句提示：**如果这条事实对无关项目也成立，请同时写一份全局记忆**。
+
+## 技能草稿
+
+合并阶段若发现多条记忆合起来就是一套可重复的流程，会把它提炼成**技能草稿**，写进：
+
+```
+$DSH_HOME/memories/skills/<name>/SKILL.md    # 草稿：DSH 的技能系统看不到它
+```
+
+**草稿不会自动生效**。DSH 只扫描 `$DSH_HOME/skills/` 和 `<项目>/.dsh/skills/`，而让一个后台
+过程悄悄往技能目录里写文件、把模型的行为面扩大，不是应该自动发生的事。所以要显式晋升：
+
+```
+/memories skills              列出草稿
+/memories promote <name>      复制到 $DSH_HOME/skills/<name>/SKILL.md（幂等，可覆盖重推）
+/memories discard <name>      丢弃草稿
+```
+
+晋升写出的文件就是 `@deepseek-ai/dsh-skill-filesystem` 能解析的形状（`name` + `description`
+frontmatter 的目录包），下次技能目录刷新后进入目录。草稿留在原处，方便追溯来源。
 
 ## `/memories` 命令
 
@@ -148,6 +175,9 @@ memories:
 /memories forget <id>         删除
 /memories mine                立刻从当前会话抽取一次（不等空闲）
 /memories consolidate         立刻合并重整全部记忆（不等冷却）
+/memories skills              列出技能草稿
+/memories promote <name>      晋升一份草稿到 $DSH_HOME/skills
+/memories discard <name>      丢弃一份草稿
 /memories stats               存储位置与计数
 ```
 
@@ -164,6 +194,7 @@ $DSH_HOME/memories/
 │   ├── index.json
 │   ├── project.json               # slug 由哪个绝对路径推导而来
 │   └── entries/<id>.md
+├── skills/<name>/SKILL.md         # 技能草稿（未晋升前 DSH 看不到）
 └── state.db                       # SQLite：会话水位线 / 任务租约 / 用量计数
 ```
 
@@ -173,8 +204,10 @@ $DSH_HOME/memories/
 ---
 id: prefer-pnpm-over-npm
 scope: global
+kind: preference
 title: Prefer pnpm over npm
 tags: tooling, packages
+appliesTo: before running any install or script
 created: 2026-09-09T02:00:00.000Z
 updated: 2026-09-09T02:00:00.000Z
 source: tool
@@ -184,6 +217,9 @@ lastUsed: 2026-09-09T05:12:00.000Z
 
 The user standardizes on pnpm for every JavaScript project; never run `npm install`.
 ```
+
+`kind` 和 `appliesTo` 是可选的：缺 `kind` 时按 `fact` 解析，所以**旧文件不需要迁移**，
+新字段也不会让老条目失效。
 
 为什么要分开：
 
