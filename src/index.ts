@@ -39,7 +39,7 @@ import { rankForSummary, renderEntry, renderHit, renderMemorySummary, renderScop
 import type { SummaryScope } from './render.js'
 import { findProjectRoot } from './workspace.js'
 import { collectWindow, runExtraction } from './extract.js'
-import { applyPlan, runConsolidation } from './consolidate.js'
+import { applyPlan, denyToolsFor, runConsolidation } from './consolidate.js'
 import { discardDraft, listDrafts, promote, writeDraft } from './skills.js'
 import type { ConsolidationTarget, SubagentSeam } from './consolidate.js'
 import { MEMORY_KINDS } from './types.js'
@@ -368,10 +368,11 @@ export class MemoriesRuntime {
     const timer = setTimeout(() => {
       this.idleTimers.delete(agent)
       void this.mine(agent).then(
-        (stored) => {
+        async (stored) => {
           // New material is what makes a consolidation pass worth running; the
-          // pass itself waits out its own cooldown.
-          if (stored > 0) this.enqueueConsolidation()
+          // pass itself waits out its own cooldown. The workspace root is
+          // recorded so the pass covers THIS session's project scope.
+          if (stored > 0) this.enqueueConsolidation(Date.now(), false, await this.projectRoot(agent.session))
           void this.consolidateIfDue(agent)
         },
         (error: unknown) => {
@@ -594,7 +595,7 @@ export class MemoriesRuntime {
   async mineNow(agent: Agent): Promise<number> {
     this.cancelExtraction(agent)
     const stored = await this.runExtraction(agent)
-    if (stored > 0) this.enqueueConsolidation()
+    if (stored > 0) this.enqueueConsolidation(Date.now(), false, await this.projectRoot(agent.session))
     return stored
   }
 
@@ -604,15 +605,22 @@ export class MemoriesRuntime {
    * Enqueueing is cheap and only sets a flag: the pass itself runs on the
    * cooldown, so a burst of new memories produces one consolidation, not one
    * per write.
+   *
+   * @param now - clock for the enqueue timestamp.
+   * @param readyNow - skip the cooldown (a manual pass), so the claim that
+   *   follows can succeed immediately.
+   * @param root - workspace root whose project scope this pass should cover;
+   *   recorded so a later pass does not consolidate a different workspace.
    */
-  enqueueConsolidation(now = Date.now()): void {
+  enqueueConsolidation(now = Date.now(), readyNow = false, root?: string): void {
     if (!this.settings.consolidate) return
+    const notBefore = readyNow ? now : now + this.settings.consolidateCooldownHours * 3_600_000
     const existing = this.state.getJob(CONSOLIDATE_JOB)
     if (existing !== undefined) {
-      this.state.putJob({ ...existing, enqueuedAt: now })
+      this.state.putJob({ ...existing, enqueuedAt: now, notBefore, ...root === undefined ? {} : { root } })
       return
     }
-    this.state.putJob({ key: CONSOLIDATE_JOB, enqueuedAt: now, notBefore: now + this.settings.consolidateCooldownHours * 3_600_000, retries: 0 })
+    this.state.putJob({ key: CONSOLIDATE_JOB, enqueuedAt: now, notBefore, retries: 0, ...root === undefined ? {} : { root } })
   }
 
   /**
@@ -629,10 +637,19 @@ export class MemoriesRuntime {
     if (!this.settings.consolidate) return undefined
     const seam = this.subagents
     if (seam === undefined) return undefined
+    // A manual pass creates the job when none exists: the cooldown gates the
+    // BACKGROUND pass, and a user who types the command is asking for it now.
+    // Without this, `/memories consolidate` silently did nothing on a store
+    // that had never been mined.
+    const sessionRoot = await this.projectRoot(parent.session)
+    if (this.state.getJob(CONSOLIDATE_JOB) === undefined) this.enqueueConsolidation(Date.now(), true, sessionRoot)
     const token = `consolidate-${process.pid}-${Date.now().toString(36)}`
     const job = this.state.claimJob(CONSOLIDATE_JOB, token, 600_000)
     if (job === undefined) return undefined
-    const root = await this.projectRoot(parent.session)
+    // The job's recorded root wins: consolidation is process-level, so the
+    // session that happens to run the pass must not decide whose project
+    // memories get consolidated.
+    const root = job.root ?? sessionRoot
     try {
       const global = await this.store.list('global', undefined, { fresh: true })
       const project = await this.store.list('project', root, { fresh: true })
@@ -651,6 +668,9 @@ export class MemoriesRuntime {
         entries,
         projectLabel: this.store.target('project', root).label,
         maxUpserts: this.settings.consolidateMaxEntries,
+        // Only names the registry actually has: `tools.restrict()` rejects an
+        // unknown name, and this deny list is cross-platform.
+        denyTools: denyToolsFor(new Set((this.ctx.get('tools')?.schemas() ?? []).map((schema) => schema.name))),
         timeoutMs: this.settings.consolidateTimeoutMs,
         signal: this.lifecycle.signal,
       })

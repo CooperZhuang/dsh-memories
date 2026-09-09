@@ -109,6 +109,32 @@ test('usage counters accumulate per scope and id', async (t) => {
   assert.equal(store.listUsage().length, 2)
 })
 
+test('a store created before the root column migrates on open', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-state-migrate-'))
+  // A jobs table in the v1 shape: no `root` column.
+  const legacy = new StateStore(statePath(dir))
+  legacy.close()
+  const { DatabaseSync } = await import('node:sqlite')
+  const raw = new DatabaseSync(statePath(dir))
+  raw.exec('DROP TABLE jobs')
+  raw.exec('CREATE TABLE jobs (key TEXT PRIMARY KEY, enqueued_at INTEGER NOT NULL, not_before INTEGER NOT NULL DEFAULT 0, lease TEXT, lease_until INTEGER NOT NULL DEFAULT 0, retries INTEGER NOT NULL DEFAULT 0, last_error TEXT)')
+  raw.prepare('INSERT INTO jobs (key, enqueued_at, not_before, retries) VALUES (?, ?, ?, ?)').run('global', 1, 2, 0)
+  raw.close()
+
+  const reopened = new StateStore(statePath(dir))
+  t.after(() => {
+    reopened.close()
+    return rm(dir, { recursive: true, force: true })
+  })
+  // Reading and writing a job must work: without the migration this throws
+  // "no such column: root".
+  const job = reopened.getJob('global')
+  assert.equal(job?.enqueuedAt, 1)
+  assert.equal(job?.root, undefined)
+  reopened.putJob({ key: 'global', enqueuedAt: 1, notBefore: 2, retries: 0, root: 'C:\\work' })
+  assert.equal(reopened.getJob('global')?.root, 'C:\\work')
+})
+
 test('closing twice is safe and a closed store degrades instead of throwing', async (t) => {
   const { store } = await tempStore(t)
   store.close()

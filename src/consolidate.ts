@@ -57,7 +57,10 @@ export const CONSOLIDATE_JSON_SCHEMA = {
         additionalProperties: false,
         required: ['scope', 'title', 'body'],
         properties: {
-          id: { type: ['string', 'null'] },
+          // A nullable field must be spelled with `oneOf`: the harness schema
+          // subset rejects `type: ["string", "null"]`, and a rejected schema
+          // fails the whole child run at start.
+          id: { oneOf: [{ type: 'string' }, { type: 'null' }] },
           scope: { type: 'string', enum: ['global', 'project'] },
           kind: { type: 'string', enum: ['fact', 'preference', 'knowledge', 'failure', 'procedure'] },
           title: { type: 'string' },
@@ -240,6 +243,8 @@ export interface ConsolidateRequest {
   readonly projectLabel: string
   /** Cap on returned memories. */
   readonly maxUpserts: number
+  /** Tool names to deny the child; must be names the registry actually has. */
+  readonly denyTools: readonly string[]
   /** Deadline for the child run. */
   readonly timeoutMs: number
   readonly signal: AbortSignal
@@ -259,15 +264,36 @@ export interface SubagentSeam {
   }): Promise<{ result: Promise<{ output: readonly unknown[]; structured?: unknown; stopReason?: { kind: string } }> }>
 }
 
-/** Tools the consolidation child must not have: it reads and proposes, nothing else. */
 /** Cap on skill drafts one pass may propose. */
 const MAX_SKILL_DRAFTS = 2
 
+/**
+ * Tools the consolidation child must not have: it reads and proposes, nothing else.
+ *
+ * The list is deliberately cross-platform (it names both `bash` and `pwsh`,
+ * both `str_replace_editor` and `edit`), so any single deployment has only a
+ * subset. {@link denyToolsFor} narrows it before use.
+ */
 export const CONSOLIDATE_DENY_TOOLS = [
   'write', 'edit', 'str_replace_editor', 'pwsh', 'bash', 'terminal',
   'web_search', 'web_fetch', 'subagent', 'subagent_fork', 'workflow', 'ralph',
   'job_kill', 'interrupt_agent', 'memory', 'todo_write', 'create_goal', 'update_goal',
 ] as const
+
+/**
+ * Narrow the deny list to tools this deployment actually has.
+ *
+ * `tools.restrict()` fails loud on an unknown name — a feature, since a typo in
+ * a filter must not silently leave a capability enabled. But a cross-platform
+ * deny list names tools that do not exist here, and that loud failure would
+ * sink every consolidation pass. Pass the registry's own names and this returns
+ * the intersection.
+ * @param available - every tool name the registry knows.
+ * @returns the deny list, filtered to known names.
+ */
+export function denyToolsFor(available: ReadonlySet<string>): string[] {
+  return CONSOLIDATE_DENY_TOOLS.filter((tool) => available.has(tool))
+}
 
 /**
  * Run one consolidation through a restricted sub-agent.
@@ -290,8 +316,13 @@ export async function runConsolidation(seam: SubagentSeam, request: ConsolidateR
     outputSchema: CONSOLIDATE_JSON_SCHEMA,
     // The child may not delegate further, may not write anything, and may not
     // reach the network: its only output is the JSON plan it returns.
-    maxDepth: 0,
-    toolFilter: { deny: [...CONSOLIDATE_DENY_TOOLS] },
+    //
+    // `maxDepth` is the cap on the CHILD's depth, and DSH counts depth from 1
+    // (a top-level agent is 0, its child is 1). So 1 admits this child and
+    // rejects any grandchild — 0 would reject the child itself, which is how
+    // this line was wrong the first time.
+    maxDepth: 1,
+    toolFilter: { deny: request.denyTools },
   })
   const result = await run.result
   const text = typeof result.structured === 'object' && result.structured !== null

@@ -56,6 +56,14 @@ export interface ConsolidateJob {
   enqueuedAt: number
   /** Unix epoch milliseconds before which the job must not run. */
   notBefore: number
+  /**
+   * Absolute workspace root whose project scope this pass covers.
+   *
+   * Consolidation is process-level but project scope is per-workspace, so the
+   * job has to remember which workspace enqueued it: using whichever session
+   * happens to run the pass would consolidate a different project's memories.
+   */
+  root?: string
   /** Lease holder token, or `undefined` when unclaimed. */
   lease?: string
   /** Unix epoch milliseconds the lease expires. */
@@ -110,6 +118,7 @@ export class StateStore {
         CREATE TABLE IF NOT EXISTS jobs (
           key TEXT PRIMARY KEY,
           enqueued_at INTEGER NOT NULL,
+          root TEXT,
           not_before INTEGER NOT NULL DEFAULT 0,
           lease TEXT,
           lease_until INTEGER NOT NULL DEFAULT 0,
@@ -124,11 +133,31 @@ export class StateStore {
           PRIMARY KEY (scope, id)
         );
       `)
+      this.migrate()
     } catch (error) {
       driver = error instanceof Error ? error.message : String(error)
       this.db = undefined
     }
     this.degradedReason = driver
+  }
+
+  /**
+   * Add columns a newer version introduced.
+   *
+   * `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table, so a column
+   * added to the schema above would silently never appear on an upgraded store
+   * and every query naming it would fail. Each column is checked and added
+   * individually, which is safe to run on every open.
+   */
+  private migrate(): void {
+    const db = this.db
+    if (db === undefined) return
+    const columns = (table: string): Set<string> => {
+      const rows = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]
+      return new Set(rows.map((row) => row.name))
+    }
+    // jobs.root: which workspace a consolidation pass covers (added after v1).
+    if (!columns('jobs').has('root')) db.exec('ALTER TABLE jobs ADD COLUMN root TEXT')
   }
 
   /** Whether SQLite is backing this store. */
@@ -219,14 +248,15 @@ export class StateStore {
   /** Read one job. */
   getJob(key: string): ConsolidateJob | undefined {
     if (this.db === undefined) return this.jobs.get(key)
-    const row = this.db.prepare('SELECT key, enqueued_at, not_before, lease, lease_until, retries, last_error FROM jobs WHERE key = ?').get(key) as
-      | { key: string; enqueued_at: number; not_before: number; lease: string | null; lease_until: number; retries: number; last_error: string | null }
+    const row = this.db.prepare('SELECT key, enqueued_at, not_before, root, lease, lease_until, retries, last_error FROM jobs WHERE key = ?').get(key) as
+      | { key: string; enqueued_at: number; not_before: number; root: string | null; lease: string | null; lease_until: number; retries: number; last_error: string | null }
       | undefined
     if (row === undefined) return undefined
     return {
       key: row.key,
       enqueuedAt: Number(row.enqueued_at),
       notBefore: Number(row.not_before),
+      ...row.root === null ? {} : { root: row.root },
       ...row.lease === null ? {} : { lease: row.lease },
       leaseUntil: Number(row.lease_until),
       retries: Number(row.retries),
@@ -241,12 +271,12 @@ export class StateStore {
       return
     }
     this.db.prepare(`
-      INSERT INTO jobs (key, enqueued_at, not_before, lease, lease_until, retries, last_error)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO jobs (key, enqueued_at, not_before, root, lease, lease_until, retries, last_error)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(key) DO UPDATE SET
-        enqueued_at = excluded.enqueued_at, not_before = excluded.not_before, lease = excluded.lease,
+        enqueued_at = excluded.enqueued_at, not_before = excluded.not_before, root = excluded.root, lease = excluded.lease,
         lease_until = excluded.lease_until, retries = excluded.retries, last_error = excluded.last_error
-    `).run(job.key, job.enqueuedAt, job.notBefore, job.lease ?? null, job.leaseUntil ?? 0, job.retries, job.lastError ?? null)
+    `).run(job.key, job.enqueuedAt, job.notBefore, job.root ?? null, job.lease ?? null, job.leaseUntil ?? 0, job.retries, job.lastError ?? null)
   }
 
   /** Delete one job. */

@@ -9,8 +9,11 @@
  */
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { assertObjectJsonSchema } from '@deepseek-ai/dsh-tools'
 import {
   CONSOLIDATE_DENY_TOOLS,
+  CONSOLIDATE_JSON_SCHEMA,
+  denyToolsFor,
   applyPlan,
   parsePlan,
   renderConsolidationInput,
@@ -68,6 +71,28 @@ function target(initial: MemoryEntry[], failOn?: string) {
   return { api, writes, get: (scope: MemoryScope, id: string) => entries.get(`${scope}\u0000${id}`), all: () => [...entries.values()] }
 }
 
+test('the consolidation schema is accepted by the harness schema subset', () => {
+  // The child run fails at start if the harness rejects the schema, and the
+  // failure is opaque ("unsupported JSON schema: ..."), so validate it here
+  // with the same function the subagent seam uses. `type: ["string","null"]`
+  // for a nullable field is exactly what this catches.
+  assert.doesNotThrow(() => { assertObjectJsonSchema(CONSOLIDATE_JSON_SCHEMA) })
+})
+
+test('denyToolsFor keeps only names the registry actually has', () => {
+  // The deny list is cross-platform; `tools.restrict()` rejects an unknown
+  // name, so passing the raw list would sink every consolidation pass.
+  const available = new Set(['write', 'edit', 'pwsh', 'read', 'memory', 'subagent_fork'])
+  const denied = denyToolsFor(available)
+  assert.ok(denied.includes('write'))
+  assert.ok(denied.includes('pwsh'))
+  assert.ok(denied.includes('subagent_fork'))
+  assert.ok(!denied.includes('bash'), 'bash is not registered on this deployment')
+  assert.ok(!denied.includes('str_replace_editor'), 'that name does not exist here')
+  assert.ok(!denied.includes('read'), 'read stays available to the child')
+  assert.equal(denyToolsFor(new Set()).length, 0)
+})
+
 test('the consolidation child is denied every write and network tool', async () => {
   const seen: { request?: unknown } = {}
   const reply = '{"memories":[{"id":null,"scope":"global","title":"t","body":"b"}],"retire":[],"notes":"n"}'
@@ -76,6 +101,7 @@ test('the consolidation child is denied every write and network tool', async () 
     entries: [entry({ id: 'a', title: 'A', body: 'a' })],
     projectLabel: 'project:x',
     maxUpserts: 10,
+    denyTools: [...CONSOLIDATE_DENY_TOOLS],
     timeoutMs: 5_000,
     signal: new AbortController().signal,
   })
@@ -83,7 +109,10 @@ test('the consolidation child is denied every write and network tool', async () 
   for (const tool of ['write', 'edit', 'pwsh', 'web_search', 'subagent', 'memory']) {
     assert.ok(request.toolFilter.deny.includes(tool), `${tool} must be denied to the consolidation child`)
   }
-  assert.equal(request.maxDepth, 0, 'the child must not delegate further')
+  // DSH counts depth from 1 (a top-level agent is 0, its child is 1): the cap
+  // must admit THIS child while refusing a grandchild. `0` rejects the child
+  // itself, which is the bug this pins.
+  assert.equal(request.maxDepth, 1, 'the child runs, but cannot delegate further')
   assert.ok(request.outputSchema !== undefined, 'the child must answer through the JSON schema')
   assert.deepEqual([...CONSOLIDATE_DENY_TOOLS].length, request.toolFilter.deny.length)
 })
@@ -145,6 +174,7 @@ test('runConsolidation reads the structured result when the provider returns one
     entries: [entry({ id: 'a', title: 'A', body: 'a' })],
     projectLabel: 'project:x',
     maxUpserts: 5,
+    denyTools: [...CONSOLIDATE_DENY_TOOLS],
     timeoutMs: 5_000,
     signal: new AbortController().signal,
   })
