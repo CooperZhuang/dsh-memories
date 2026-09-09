@@ -113,6 +113,43 @@ test('a rewrite that omits the kind keeps the stored one', async () => {
   }
 })
 
+test('supersedes retires the entry it replaces', async () => {
+  const { store, dir } = await tempStore()
+  try {
+    await store.upsert({ scope: 'global', title: 'Use npm', body: 'Run npm install.', tags: [] }, undefined, 'tool', 1_000)
+    const replacement = await store.upsert({
+      scope: 'global',
+      title: 'Use pnpm',
+      body: 'Run pnpm install.',
+      tags: [],
+      supersedes: 'use-npm',
+    }, undefined, 'auto', 2_000)
+    assert.equal(replacement.entry.supersedes, 'use-npm')
+    const listed = await store.list('global', undefined, { fresh: true })
+    assert.deepEqual(listed.map((item) => item.id), ['use-pnpm'], 'the superseded entry is gone')
+    assert.equal(await store.read('global', undefined, 'use-npm'), undefined)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('supersedes never deletes the entry that carries it, and is scope-local', async () => {
+  const { store, dir } = await tempStore()
+  try {
+    // A self-reference must be a no-op rather than a self-delete.
+    const self = await store.upsert({ scope: 'global', title: 'Self', body: 'x', tags: [], supersedes: 'self' }, undefined, 'tool', 1_000)
+    assert.equal(self.entry.supersedes, 'self')
+    assert.ok(await store.read('global', undefined, 'self') !== undefined)
+
+    // A project entry cannot retire a global one that happens to share an id.
+    await store.upsert({ scope: 'global', title: 'Shared', body: 'global', tags: [] }, undefined, 'tool', 2_000)
+    await store.upsert({ scope: 'project', title: 'Other', body: 'project', tags: [], supersedes: 'shared' }, dir, 'tool', 3_000)
+    assert.ok(await store.read('global', undefined, 'shared') !== undefined, 'the global entry survives')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
 test('parseEntry rejects a non-entry file instead of throwing', () => {
   assert.equal(parseEntry('just prose', 'global', 'x'), undefined)
   assert.equal(parseEntry('---\nscope: global\n---\n\nbody', 'global', 'x'), undefined)

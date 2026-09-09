@@ -500,6 +500,11 @@ export class MemoryStore {
     }
     await writeAtomic(join(this.entriesDir(draft.scope, projectRoot), `${id}.md`), formatEntry(entry))
     if (draft.scope === 'project' && projectRoot !== undefined) await this.writeProjectDescriptor(projectRoot, now)
+    // Honour `supersedes`: the entry this one replaces is retired, in the same
+    // scope, unless it IS this entry (an id can never supersede itself).
+    if (entry.supersedes !== undefined && entry.supersedes !== id) {
+      await rm(join(this.entriesDir(draft.scope, projectRoot), `${slugify(entry.supersedes)}.md`), { force: true })
+    }
     this.invalidate(draft.scope, projectRoot)
     const limit = this.entryLimit()
     if (limit > 0) await this.evict(draft.scope, projectRoot, limit)

@@ -309,6 +309,18 @@ export class MemoriesRuntime {
     this.injection.delete(session)
   }
 
+  /**
+   * Record that a session was used just now.
+   *
+   * This is the input the `maxAgeDays` gate reads. It is deliberately separate
+   * from the extraction watermark: a session can be used for days without ever
+   * being mined (background extraction needs a long-lived process), and the age
+   * gate must still see it as recent.
+   */
+  recordActivity(session: Session, now = Date.now()): void {
+    this.state.touchSession(session.id, now)
+  }
+
   /** Whether one session is eligible for extraction (scope and configuration). */
   private eligible(session: Session): boolean {
     if (!this.settings.autoExtract) return false
@@ -320,10 +332,13 @@ export class MemoriesRuntime {
   /**
    * Whether a session is still young enough to mine.
    *
-   * `maxAgeDays` is the Codex gate that keeps a pass from resurrecting very old
-   * conversations: past that horizon a fact is more likely stale than useful,
-   * and mining it costs quota. A session with no recorded activity yet (a brand
-   * new one) is always in range.
+   * `maxAgeDays` keeps a pass from resurrecting very old conversations: past
+   * that horizon a fact is more likely stale than useful, and mining it costs
+   * quota. The clock is the session's last observed activity (see
+   * {@link recordActivity}), not its watermark — a session that was never mined
+   * would otherwise read as infinitely young and the gate would never fire.
+   *
+   * A session with no recorded activity yet is treated as fresh.
    */
   private withinAge(session: Session, now = Date.now()): boolean {
     const limit = this.settings.maxAgeDays
@@ -861,6 +876,10 @@ export function apply(ctx: Context, config: MemoriesConfig = {}): void {
   ctx.on('agent/status', ({ agent, status }) => {
     if (status === 'idle') runtime.scheduleExtraction(agent)
     else runtime.cancelExtraction(agent)
+    // Record real activity on every transition, so `maxAgeDays` judges a
+    // session by when it was last USED rather than by when it was last mined —
+    // a session that is never mined would otherwise look infinitely young.
+    runtime.recordActivity(agent.session)
   })
 
   ctx.on('agent/disposed', ({ agent }) => {
