@@ -1,0 +1,22 @@
+# Dependencies are installed from the registry (or linked from the DSH
+# installation during development); never committed.
+node_modules/
+package-lock.json
+pnpm-lock.yaml
+
+# Build output. `npm run build` (and the `prepare` hook, which runs on
+# `npm install` and on a git install) regenerates it from src/ and client/.
+lib/
+
+# Playwright CLI scratch output and ad-hoc run artifacts.
+.playwright-cli/
+output/
+
+# Local editor and OS noise.
+.DS_Store
+Thumbs.db
+*.log
+
+# Scratch overlays used while testing background passes; the settings they
+# carry are documented in README.md instead.
+scripts/*.patch.yml
