@@ -55,6 +55,11 @@ const CSS = [
   '.dshm-area{box-sizing:border-box;width:100%;min-height:64px;font:inherit;font-size:13px;padding:6px 8px;border-radius:8px;border:.5px solid var(--dsw-alias-border-l4);background:var(--dsw-alias-bg-module-platform);color:var(--dsw-alias-label-primary);resize:vertical}',
   '.dshm-area:focus{outline:none;border-color:var(--dsw-alias-brand-primary)}',
   '.dshm-section-title{color:var(--dsw-alias-label-primary);font-size:13px;font-weight:500;line-height:20px;margin:0}',
+  '.dshm-tabs{display:flex;gap:4px;border-bottom:.5px solid var(--dsw-alias-border-l2);padding-bottom:4px}',
+  '.dshm-tab{height:28px;padding:0 12px;font:inherit;font-size:13px;border:none;border-radius:8px;background:transparent;color:var(--dsw-alias-label-tertiary);cursor:pointer}',
+  '.dshm-tab:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}',
+  '.dshm-tab-active{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);font-weight:500}',
+  '.dshm-panel{display:flex;flex-direction:column;gap:12px}',
 ].join('\n')
 
 /** Inject the stylesheet once per document. */

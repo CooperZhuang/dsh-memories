@@ -12,6 +12,7 @@
 /** Every string the page renders, per locale. */
 const SECTION_COPY = {
   zh: {
+    lang: 'zh',
     label: '记忆',
     title: '记忆',
     intro: '跨会话记忆：全局库对所有项目生效，项目库只对同一个工作区生效。这里可以查看、搜索、新增和删除记忆。',
@@ -37,7 +38,9 @@ const SECTION_COPY = {
     promote: '提升到技能目录',
     discard: '丢弃',
     promoted: '已提升',
-    tunables: '可调项',
+    tunables: '配置项',
+    tabMemories: '记忆',
+    tabConfig: '配置',
     unavailable: '本部署没有把 memories 远程接口暴露给浏览器，只能编辑可调项。',
     uses: '使用',
     updated: '更新于',
@@ -46,6 +49,7 @@ const SECTION_COPY = {
     needTitle: '标题和正文都要填。',
   },
   en: {
+    lang: 'en',
     label: 'Memories',
     title: 'Memories',
     intro: 'Cross-session memory: the global store applies to every project, the project store to one workspace. Inspect, search, add, and delete memories here.',
@@ -72,6 +76,8 @@ const SECTION_COPY = {
     discard: 'Discard',
     promoted: 'Promoted',
     tunables: 'Tunables',
+    tabMemories: 'Memories',
+    tabConfig: 'Configuration',
     unavailable: 'This deployment does not expose the memories Remote API to the browser; only the tunables can be edited.',
     uses: 'used',
     updated: 'updated',
@@ -175,6 +181,7 @@ function createMemoriesSection(React, Card) {
     const [kind, setKind] = React.useState('')
     const [project, setProject] = React.useState('')
     const [formOpen, setFormOpen] = React.useState(false)
+    const [tab, setTab] = React.useState('memories')
     const [draft, setDraft] = React.useState({ scope: 'global', kind: 'fact', title: '', body: '', tags: '' })
 
     const loadOverview = React.useCallback(async () => {
@@ -418,20 +425,54 @@ function createMemoriesSection(React, Card) {
       ])
       : null
 
+    const tabList = h('div', { key: 'tabs', className: 'dshm-tabs', role: 'tablist' }, [
+      h('button', {
+        key: 'memories',
+        type: 'button',
+        role: 'tab',
+        'aria-selected': tab === 'memories',
+        className: `dshm-tab${tab === 'memories' ? ' dshm-tab-active' : ''}`,
+        onClick: () => setTab('memories'),
+      }, copy.tabMemories),
+      h('button', {
+        key: 'config',
+        type: 'button',
+        role: 'tab',
+        'aria-selected': tab === 'config',
+        className: `dshm-tab${tab === 'config' ? ' dshm-tab-active' : ''}`,
+        onClick: () => setTab('config'),
+      }, copy.tabConfig),
+    ])
+
+    // The two tabs keep the store's CONTENT and the plugin's SETTINGS apart: one
+    // page, one place to look, and neither surface buries the other.
+    const memoriesPanel = h('div', { key: 'panel-memories', role: 'tabpanel', className: 'dshm-panel' }, [
+      api === undefined ? h('p', { key: 'unavailable', className: 'dshm-status dshm-error' }, copy.unavailable) : null,
+      overview !== null && stats !== null ? stats : null,
+      toolbar,
+      form,
+      h('p', { key: 'count', className: 'dshm-note' }, `${entries.length} / ${total} ${copy.unit}`),
+      list,
+      drafts,
+      error !== null ? h('p', { key: 'error', className: 'dshm-status dshm-error' }, error) : null,
+      notice !== null ? h('p', { key: 'notice', className: 'dshm-status dshm-ok' }, notice) : null,
+    ])
+
+    const configPanel = h('div', { key: 'panel-config', role: 'tabpanel', className: 'dshm-panel' }, [
+      h(Card, {
+        key: 'tunables',
+        scope: props.scope,
+        useSnapshot: props.useSnapshot,
+        title: copy.tunables,
+        intro: false,
+        lang: copy.lang,
+      }),
+    ])
+
     const children = [head]
-    if (api === undefined) children.push(h('p', { key: 'unavailable', className: 'dshm-status dshm-error' }, copy.unavailable))
-    if (overview !== null) {
-      children.push(h('p', { key: 'store', className: 'dshm-path' }, `${copy.store}: ${overview.storePath}`))
-      if (stats !== null) children.push(stats)
-    }
-    children.push(toolbar)
-    children.push(form)
-    children.push(h('p', { key: 'count', className: 'dshm-note' }, `${entries.length} / ${total} ${copy.unit}`))
-    children.push(list)
-    if (drafts !== null) children.push(drafts)
-    if (error !== null) children.push(h('p', { key: 'error', className: 'dshm-status dshm-error' }, error))
-    if (notice !== null) children.push(h('p', { key: 'notice', className: 'dshm-status dshm-ok' }, notice))
-    children.push(h(Card, { key: 'tunables', scope: props.scope, useSnapshot: props.useSnapshot, title: copy.tunables, intro: false }))
+    if (overview !== null) children.push(h('p', { key: 'store', className: 'dshm-path' }, `${copy.store}: ${overview.storePath}`))
+    children.push(tabList)
+    children.push(tab === 'config' ? configPanel : memoriesPanel)
     return h('div', { className: 'dshm-page' }, children)
   }
 }
