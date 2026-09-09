@@ -1,0 +1,911 @@
+/**
+ * `dsh-memories` — cross-session memory for the DeepSeek Harness.
+ *
+ * Two scopes, mirroring the Codex memories split:
+ *
+ * - **global** — facts that hold across every project (`$DSH_HOME/memories`).
+ * - **project** — facts tied to one workspace
+ *   (`$DSH_HOME/memories/projects/<slug>`), shared by every session opened in
+ *   that workspace, whichever subdirectory it starts in.
+ *
+ * Three cooperating mechanisms:
+ *
+ * 1. **Explicit capture** — the `memory` tool lets the model write, search,
+ *    read, update, and forget entries, choosing the scope per call.
+ * 2. **Idle-time extraction** — after a session has been quiet for
+ *    `autoExtractIdleMs`, one auxiliary model call mines the transcript tail for
+ *    durable facts and upserts them (deduplicated by title).
+ * 3. **Layered injection** — a bounded summary of both scopes enters the
+ *    conversation once per session, and is refreshed if the store changed;
+ *    details stay behind `memory_search`.
+ *
+ * @module dsh-memories
+ */
+import { createHash } from 'node:crypto'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import type { LlmRuntime, UserMessage } from '@deepseek-ai/dsh-llm'
+import type { Agent, SessionStartSource } from '@deepseek-ai/dsh-agent'
+import type { Session } from '@deepseek-ai/dsh-session'
+import type { CommandInvocation } from '@deepseek-ai/dsh-commands'
+import type { Context } from '@deepseek-ai/cordis'
+import { Config as ConfigSchema, MemoriesSettingsSchema, SETTINGS_NS, normalizeSettings, resolveConfig } from './config.js'
+import type { MemoriesConfig, MemoriesSettings, ResolvedConfig } from './config.js'
+import type { SettingsProvider } from '@deepseek-ai/dsh-settings'
+import { MemoryStore, slugify } from './storage.js'
+import { StateStore, statePath } from './state.js'
+import { browseMemories, searchMemories } from './search.js'
+import type { ScopeEntries } from './search.js'
+import { rankForSummary, renderEntry, renderHit, renderMemorySummary, renderScopeListing } from './render.js'
+import type { SummaryScope } from './render.js'
+import { findProjectRoot } from './workspace.js'
+import { collectWindow, runExtraction } from './extract.js'
+import { applyPlan, runConsolidation } from './consolidate.js'
+import type { ConsolidationTarget, SubagentSeam } from './consolidate.js'
+import type { MemoryEntry, MemoryScope } from './types.js'
+import { registerMemoryTool } from './tool.js'
+
+/** Plugin name; also the source tag of every injected message. */
+export const name = 'memories'
+
+/** Budget for the extraction a shutdown is allowed to wait for. */
+const EXIT_FLUSH_TIMEOUT_MS = 8_000
+
+/**
+ * Services this plugin requires at activation: the tool registry (for the
+ * `memory` tool), the command registry (for `/memories`), and the settings
+ * provider (which owns the `memories` namespace).
+ *
+ * The LLM and the subagent seam are read opportunistically with `ctx.get`, so a
+ * deployment with no model adapter or no delegation still loads — it just never
+ * runs background extraction or consolidation.
+ */
+export const inject: string[] = ['tools', 'commands', 'settings']
+
+/** Job key of the single global consolidation job. */
+const CONSOLIDATE_JOB = 'global'
+
+/** One scope's loaded state. */
+interface ScopeState {
+  readonly scope: MemoryScope
+  readonly label: string
+  readonly heading: string
+  readonly entries: readonly MemoryEntry[]
+}
+
+/** Per-session injected-state marker. */
+interface InjectionState {
+  /** Turn whose first step carried the last injection. */
+  turn: number
+  /** Digest of the summary the model currently sees. */
+  digest: string
+  /** Surface seq at the moment of injection, for diagnostics. */
+  seq?: number
+  /** Set when the store changed after the last injection. */
+  dirty?: boolean
+}
+
+/**
+ * The memory runtime: one instance per plugin mount, shared by the tool, the
+ * injector, the extractor, and the command handler.
+ */
+export class MemoriesRuntime {
+  /** Deployment facts resolved once: paths and workspace discovery. */
+  readonly deployment: ResolvedConfig
+  readonly store: MemoryStore
+  /** Operational state: watermarks, consolidation jobs, usage counters. */
+  readonly state: StateStore
+  /**
+   * Live tunables.
+   *
+   * A thunk rather than a snapshot: the settings namespace is hot-reloaded, so
+   * every read must see the value committed most recently, and a restart is
+   * never required to change a knob.
+   */
+  private readonly settingsThunk: () => MemoriesSettings
+  /**
+   * The LLM runtime captured at activation.
+   *
+   * Captured eagerly rather than resolved per call: by the time a settle pass
+   * runs the tree may already be disposing, and a late `ctx.get('llm')` then
+   * resolves to nothing — which is exactly the pass a one-shot run depends on.
+   */
+  private readonly llm: LlmRuntime | undefined
+  /** The subagent seam, read once; absent in a deployment without delegation. */
+  private readonly subagents: SubagentSeam | undefined
+  private readonly rootCache = new WeakMap<Session, Promise<string>>()
+  private readonly injection = new WeakMap<Session, InjectionState>()
+  private readonly idleTimers = new WeakMap<Agent, NodeJS.Timeout>()
+  private readonly extracting = new Set<string>()
+  private readonly lifecycle = new AbortController()
+
+  constructor(
+    private readonly ctx: Context,
+    config: MemoriesConfig,
+    settings?: () => MemoriesSettings,
+  ) {
+    this.deployment = resolveConfig(config)
+    this.settingsThunk = settings ?? (() => this.deployment.defaults)
+    this.store = new MemoryStore(this.deployment.memoriesDir)
+    this.store.entryLimit = () => this.settings.maxEntriesPerScope
+    this.state = new StateStore(statePath(this.deployment.memoriesDir))
+    this.llm = ctx.get('llm') as LlmRuntime | undefined
+    this.subagents = ctx.get('subagents') as SubagentSeam | undefined
+  }
+
+  /** The tunables in force right now. */
+  get settings(): MemoriesSettings {
+    return this.settingsThunk()
+  }
+
+  /** Abort every owned background activity and release the state store. */
+  dispose(): void {
+    this.lifecycle.abort(new Error('dsh-memories disposed'))
+    this.state.close()
+  }
+
+  /** Resolve (and cache) one session's workspace root. */
+  async projectRoot(session: Session): Promise<string> {
+    const cached = this.rootCache.get(session)
+    if (cached !== undefined) return cached
+    const cwd = session.header.cwd ?? process.cwd()
+    const pending = findProjectRoot(cwd, this.deployment.projectRootMarkers)
+    this.rootCache.set(session, pending)
+    return pending
+  }
+
+  /** Load one scope's entries plus its model-facing labels. */
+  async scopeState(scope: MemoryScope, session: Session): Promise<ScopeState> {
+    const root = scope === 'project' ? await this.projectRoot(session) : undefined
+    const entries = await this.store.list(scope, root)
+    const target = this.store.target(scope, root)
+    return {
+      scope,
+      label: target.label,
+      heading: scope === 'global' ? 'Global memories' : `Project memories (${target.label})`,
+      entries: rankForSummary(entries),
+    }
+  }
+
+  /** Load both scopes, broadest first. */
+  async allScopes(session: Session): Promise<readonly ScopeState[]> {
+    return [await this.scopeState('global', session), await this.scopeState('project', session)]
+  }
+
+  /** Convert loaded scopes into the search/browse input shape. */
+  private groups(states: readonly ScopeState[]): ScopeEntries[] {
+    return states.map((state) => ({ scope: state.scope, label: state.label, entries: state.entries }))
+  }
+
+  /** Search both scopes. */
+  async search(session: Session, query: string, options: { scopes?: readonly MemoryScope[]; tags?: readonly string[]; limit?: number }) {
+    const states = await this.allScopes(session)
+    return searchMemories(this.groups(states), query, options)
+  }
+
+  /** Browse both scopes without a query. */
+  async browse(session: Session, options: { scopes?: readonly MemoryScope[]; tags?: readonly string[]; limit?: number }) {
+    const states = await this.allScopes(session)
+    return browseMemories(this.groups(states), options)
+  }
+
+  /** Read one entry by scope and id, recording the hit. */
+  async read(session: Session, scope: MemoryScope, id: string, record = true): Promise<MemoryEntry | undefined> {
+    const root = scope === 'project' ? await this.projectRoot(session) : undefined
+    const entry = await this.store.read(scope, root, id)
+    if (entry === undefined || !record) return entry
+    return this.touchEntry(entry, root)
+  }
+
+  /**
+   * Record one read/search hit.
+   *
+   * The counter lives in the state database (atomic, concurrent-safe) and is
+   * mirrored back into the entry file so the markdown stays a complete picture
+   * for a human reader.
+   */
+  private async touchEntry(entry: MemoryEntry, root: string | undefined): Promise<MemoryEntry> {
+    const counters = this.state.bumpUsage(entry.scope, entry.id)
+    return this.store.writeCounters(entry, root, counters)
+  }
+
+  /** Record hits for a batch of search/browse results, best-effort. */
+  async recordUsage(session: Session, entries: readonly MemoryEntry[]): Promise<void> {
+    if (entries.length === 0) return
+    const root = await this.projectRoot(session)
+    await Promise.all(entries.map((entry) => this.touchEntry(entry, entry.scope === 'project' ? root : undefined)))
+  }
+
+  /** Write one entry, choosing the scope. */
+  async write(
+    session: Session,
+    draft: { scope: MemoryScope; title: string; body: string; tags: readonly string[] },
+    source: MemoryEntry['source'],
+  ) {
+    const root = draft.scope === 'project' ? await this.projectRoot(session) : undefined
+    const result = await this.store.upsert(draft, root, source)
+    this.bumpInjection(session)
+    return result
+  }
+
+  /** Delete one entry. */
+  async forget(session: Session, scope: MemoryScope, id: string): Promise<boolean> {
+    const root = scope === 'project' ? await this.projectRoot(session) : undefined
+    const removed = await this.store.remove(scope, root, id)
+    if (removed) this.bumpInjection(session)
+    return removed
+  }
+
+  /** Mark the injected summary stale so the next step refreshes it. */
+  private bumpInjection(session: Session): void {
+    const state = this.injection.get(session)
+    if (state !== undefined) this.injection.set(session, { ...state, dirty: true })
+  }
+
+  /**
+   * Build the injected summary block for one session, or `undefined` when the
+   * store is empty or injection is disabled.
+   *
+   * The digest covers the CONTENT only, never the intro sentence: the intro
+   * changes between the first and later injections, and hashing it would make an
+   * unchanged store look changed and re-inject on every step.
+   *
+   * @param session - session whose scopes to summarize.
+   * @param replacesEarlier - whether the block supersedes an earlier one.
+   * @returns the framed text plus the content digest.
+   */
+  async summary(session: Session, replacesEarlier: boolean): Promise<{ text: string; digest: string } | undefined> {
+    if (this.settings.maxSummaryBytes <= 0) return undefined
+    const states = await this.allScopes(session)
+    const scopes: SummaryScope[] = states.map((state) => ({
+      label: state.label,
+      heading: state.heading,
+      entries: state.entries,
+      total: state.entries.length,
+    }))
+    const text = renderMemorySummary(scopes, {
+      maxBytes: this.settings.maxSummaryBytes,
+      maxEntriesPerScope: this.settings.maxSummaryEntries,
+      replacesEarlier,
+    })
+    if (text === undefined) return undefined
+    const content = scopes
+      .filter((scope) => scope.total > 0)
+      .map((scope) => `${scope.heading}\u0000${scope.entries.slice(0, this.settings.maxSummaryEntries).map((entry) => `${entry.id}:${entry.updatedAt}:${entry.uses}`).join(',')}`)
+      .join('\n')
+    return { text, digest: createHash('sha1').update(content).digest('hex') }
+  }
+
+  /**
+   * Decide what the model should see at this step boundary.
+   *
+   * Injection is turn-scoped, mirroring Codex's re-injected developer policy:
+   * the block enters at the first step of a turn, and again inside that turn
+   * only when the store actually changed (a memory was written or forgotten, or
+   * another writer touched the files). A turn that changes nothing never
+   * re-injects, so the summary cannot crowd out the conversation.
+   *
+   * @param agent - the agent whose next step is being prepared.
+   * @param turn - the turn that will own the step.
+   * @returns the message to enter the conversation, or `undefined` when the
+   *   visible summary is already current for this step.
+   */
+  async injectionFor(agent: Agent, turn: number): Promise<UserMessage | undefined> {
+    const session = agent.session
+    const state = this.injection.get(session)
+    const dirty = state !== undefined && (state.dirty || state.turn !== turn)
+    const summary = await this.summary(session, state !== undefined)
+    if (summary === undefined) return undefined
+    if (state !== undefined && !dirty && state.digest === summary.digest) return undefined
+    this.injection.set(session, { turn, digest: summary.digest, seq: session.seq })
+    return createUserMessage({
+      content: [{ type: 'text', text: summary.text }],
+      source: { kind: 'plugin', plugin: name, form: 'recall' },
+    })
+  }
+
+  /** Reset one session's injection state (used on `clear`/`compact` restarts). */
+  resetInjection(session: Session): void {
+    this.injection.delete(session)
+  }
+
+  /** Whether one session is eligible for extraction (scope and configuration). */
+  private eligible(session: Session): boolean {
+    if (!this.settings.autoExtract) return false
+    if (session.header.origin === 'subagent') return false
+    if (session.header.delegationDepth !== undefined && session.header.delegationDepth > 0) return false
+    return this.withinAge(session)
+  }
+
+  /**
+   * Whether a session is still young enough to mine.
+   *
+   * `maxAgeDays` is the Codex gate that keeps a pass from resurrecting very old
+   * conversations: past that horizon a fact is more likely stale than useful,
+   * and mining it costs quota. A session with no recorded activity yet (a brand
+   * new one) is always in range.
+   */
+  private withinAge(session: Session, now = Date.now()): boolean {
+    const limit = this.settings.maxAgeDays
+    if (limit <= 0) return true
+    const activity = this.state.getSession(session.id)?.activityAt
+    if (activity === undefined || activity === 0) return true
+    return now - activity <= limit * 86_400_000
+  }
+
+  /**
+   * Schedule the idle-time extraction pass for a settled agent.
+   *
+   * The timer is unref'd, so a background pass never keeps an otherwise finished
+   * process alive. That means a one-shot run (a headless task, a script) is
+   * normally gone before the pass could fire; extraction is a feature of
+   * long-lived surfaces such as `dsh web`, where the session is still open long
+   * after the user stopped typing. {@link flushExit} covers the remaining case
+   * as far as the process lifecycle allows.
+   */
+  scheduleExtraction(agent: Agent): void {
+    if (!this.eligible(agent.session)) return
+    this.track(agent)
+    this.idleSince.set(agent, Date.now())
+    const existing = this.idleTimers.get(agent)
+    if (existing !== undefined) clearTimeout(existing)
+    const timer = setTimeout(() => {
+      this.idleTimers.delete(agent)
+      void this.mine(agent).then(
+        (stored) => {
+          // New material is what makes a consolidation pass worth running; the
+          // pass itself waits out its own cooldown.
+          if (stored > 0) this.enqueueConsolidation()
+          void this.consolidateIfDue(agent)
+        },
+        (error: unknown) => {
+          if (!this.lifecycle.signal.aborted) this.ctx.logger.warn('dsh-memories: extraction failed: %o', error)
+        },
+      )
+    }, this.settings.autoExtractIdleMs)
+    timer.unref?.()
+    this.idleTimers.set(agent, timer)
+  }
+
+  /**
+   * Run the consolidation pass when its cooldown has elapsed.
+   *
+   * The pass needs a parent agent for the subagent seam and is process-level, so
+   * any settled agent serves; a pass already in flight is skipped because the
+   * job lease is exclusive.
+   */
+  private async consolidateIfDue(agent: Agent): Promise<void> {
+    if (!this.settings.consolidate || this.subagents === undefined) return
+    const job = this.state.getJob(CONSOLIDATE_JOB)
+    if (job === undefined) return
+    if (job.notBefore > Date.now()) return
+    if (agent.status !== 'idle') return
+    await this.consolidateNow(agent)
+  }
+
+  /** When each agent last entered `idle`; cleared whenever it wakes. */
+  private readonly idleSince = new WeakMap<Agent, number>()
+
+  /**
+   * Whether a settled agent has been quiet long enough for `minIdleHours`.
+   *
+   * The idle timer already waits `autoExtractIdleMs`; this is the second,
+   * independent gate Codex applies — a session that keeps being resumed is not
+   * a finished conversation, so its facts are still moving.
+   */
+  private idleEnough(agent: Agent, now = Date.now()): boolean {
+    const hours = this.settings.minIdleHours
+    if (hours <= 0) return true
+    const since = this.idleSince.get(agent)
+    if (since === undefined) return false
+    return now - since >= hours * 3_600_000
+  }
+
+  /**
+   * Run one extraction as an agent maintenance task.
+   *
+   * `agent.runMaintenance` claims the true idle phase, so a wake that arrives
+   * while the pass runs is queued behind it instead of racing it, and the pass
+   * is cancelled if the agent is torn down. A pass that cannot claim the idle
+   * phase is skipped; the next settle pass tries again.
+   *
+   * @param agent - the settled agent to mine.
+   * @returns how many drafts were stored.
+   */
+  private async mine(agent: Agent): Promise<number> {
+    if (agent.status !== 'idle') return 0
+    if (!this.idleEnough(agent)) return 0
+    try {
+      return await agent.runMaintenance(async (signal) => this.runExtraction(agent, signal))
+    } catch {
+      return 0
+    }
+  }
+
+  /** Cancel a pending extraction timer. */
+  cancelExtraction(agent: Agent): void {
+    const timer = this.idleTimers.get(agent)
+    if (timer !== undefined) {
+      clearTimeout(timer)
+      this.idleTimers.delete(agent)
+    }
+    this.idleSince.delete(agent)
+  }
+
+  /** Remember an agent so a process exit can still mine it. */
+  private track(agent: Agent): void {
+    this.tracked.add(new WeakRef(agent))
+    this.installExitFlush()
+  }
+
+  /**
+   * Mine every tracked agent once, right now.
+   *
+   * Called at the disposal boundary and from `beforeExit`: a one-shot run (a
+   * headless task, a script) finishes long before the idle timer fires, and
+   * without this the session would never be mined — and its watermark would
+   * never advance, so every later run would re-read the same transcript.
+   *
+   * Each call is bounded, so it cannot hang a shutdown beyond the budget, and a
+   * session is mined at most once per process.
+   *
+   * @param timeoutMs - budget for the whole flush.
+   * @returns how many drafts were stored across every flushed session.
+   */
+  async flushExit(timeoutMs = EXIT_FLUSH_TIMEOUT_MS): Promise<number> {
+    if (!this.settings.autoExtract) return 0
+    const budget = AbortSignal.timeout(timeoutMs)
+    const limit = this.settings.maxSessionsPerPass
+    let stored = 0
+    let mined = 0
+    for (const reference of [...this.tracked]) {
+      const agent = reference.deref()
+      if (agent === undefined) {
+        this.tracked.delete(reference)
+        continue
+      }
+      if (this.mined.has(agent.session.id)) continue
+      if (budget.aborted || mined >= limit) break
+      mined += 1
+      try {
+        stored += await this.mine(agent)
+      } catch (error) {
+        if (!budget.aborted) this.ctx.logger.warn('dsh-memories: exit extraction failed: %o', error)
+      }
+    }
+    return stored
+  }
+
+  /** Whether an extraction has already run for this session in this process. */
+  private mined = new Set<string>()
+
+  /** Agents that have settled at least once and may need an exit flush. */
+  private readonly tracked = new Set<WeakRef<Agent>>()
+
+  /** Whether the process-exit flush hook is installed. */
+  private exitFlushInstalled = false
+
+  /**
+   * Best-effort flush of every tracked session.
+   *
+   * The primary pass is the settle timer; this exists as a safety net for a
+   * natural process exit, where the tree may already be disposed and the LLM
+   * service gone. Registered on the process rather than through `ctx.effect`,
+   * because an effect disposer runs during teardown — exactly when the flush
+   * must still be armed.
+   */
+  private installExitFlush(): void {
+    if (this.exitFlushInstalled) return
+    this.exitFlushInstalled = true
+    process.on('beforeExit', this.exitFlush)
+  }
+
+  /** Bound `beforeExit` handler. */
+  private readonly exitFlush = (): void => {
+    void this.flushExit().catch(() => undefined)
+  }
+
+  /**
+   * Mine one session's transcript tail and store what it yields.
+   *
+   * Marks the session as mined for this process even when there was nothing new
+   * to store, so the exit flush cannot repeat a call that already ran.
+   *
+   * @param agent - the settled agent to mine.
+   * @param budget - optional outer cancellation (a settle-window or shutdown deadline).
+   * @returns how many drafts were stored.
+   */
+  async runExtraction(agent: Agent, budget?: AbortSignal): Promise<number> {
+    if (!this.settings.autoExtract) return 0
+    if (agent.status !== 'idle') return 0
+    const session = agent.session
+    const key = session.id
+    if (this.extracting.has(key)) return 0
+    const llm = this.llm
+    if (llm === undefined) return 0
+    this.extracting.add(key)
+    this.mined.add(key)
+    // Keep the event loop alive for the duration: a one-shot run has nothing
+    // else scheduled, and Node would exit mid-request. Released in `finally`.
+    const hold = setTimeout(() => undefined, this.settings.extractTimeoutMs + 1_000)
+    try {
+      const watermark = this.state.getSession(key)
+      const afterSeq = watermark?.lastSeq ?? 0
+      const window = collectWindow(session, afterSeq, this.settings.extractWindowMessages, this.settings.extractMaxInputChars)
+      if (window.lastSeq === undefined || window.text.trim().length === 0) return 0
+      const root = await this.projectRoot(session)
+      const projectLabel = this.store.target('project', root).label
+      // A settle-window pass deliberately does NOT inherit the plugin lifecycle
+      // signal: the plugin is disposed as the process shuts down, and tying the
+      // pass to that signal would abort exactly the pass a one-shot run needs.
+      const signal = budget ?? this.lifecycle.signal
+      const outcome = await runExtraction(llm, {
+        session,
+        window,
+        projectLabel,
+        ...this.settings.extractProvider.length > 0 && this.settings.extractModel.length > 0
+          ? { provider: this.settings.extractProvider, model: this.settings.extractModel }
+          : {},
+        maxOutputTokens: this.settings.extractMaxOutputTokens,
+        maxMemories: this.settings.extractMaxMemories,
+        timeoutMs: this.settings.extractTimeoutMs,
+        signal,
+      })
+      if (outcome.kind === 'none') {
+        this.ctx.logger.debug?.('dsh-memories: extraction produced nothing (%s)', outcome.reason)
+      } else {
+        for (const draft of outcome.drafts) {
+          await this.store.upsert(draft, draft.scope === 'project' ? root : undefined, 'auto')
+        }
+        this.bumpInjection(session)
+        this.ctx.logger.info('dsh-memories: stored %d memories from session %s', outcome.drafts.length, key)
+      }
+      this.state.putSession(key, {
+        lastSeq: window.lastSeq,
+        at: Date.now(),
+        root,
+        activityAt: Date.now(),
+        ...outcome.kind === 'memories' ? { contributed: true } : {},
+      })
+      return outcome.kind === 'memories' ? outcome.drafts.length : 0
+    } finally {
+      clearTimeout(hold)
+      this.extracting.delete(key)
+    }
+  }
+
+  /** Force an extraction now, ignoring the idle timer (used by `/memories mine`). */
+  async mineNow(agent: Agent): Promise<number> {
+    this.cancelExtraction(agent)
+    const stored = await this.runExtraction(agent)
+    if (stored > 0) this.enqueueConsolidation()
+    return stored
+  }
+
+  /**
+   * Mark the global consolidation job dirty.
+   *
+   * Enqueueing is cheap and only sets a flag: the pass itself runs on the
+   * cooldown, so a burst of new memories produces one consolidation, not one
+   * per write.
+   */
+  enqueueConsolidation(now = Date.now()): void {
+    if (!this.settings.consolidate) return
+    const existing = this.state.getJob(CONSOLIDATE_JOB)
+    if (existing !== undefined) {
+      this.state.putJob({ ...existing, enqueuedAt: now })
+      return
+    }
+    this.state.putJob({ key: CONSOLIDATE_JOB, enqueuedAt: now, notBefore: now + this.settings.consolidateCooldownHours * 3_600_000, retries: 0 })
+  }
+
+  /**
+   * Run one consolidation pass if the cooldown has elapsed.
+   *
+   * The pass is a restricted sub-agent that returns a merged plan as JSON; this
+   * method is the only writer. Every failure is contained and backed off, so a
+   * broken pass never damages the store and never retries in a hot loop.
+   *
+   * @param parent - an agent whose subagent seam and lineage the pass uses.
+   * @returns a human-readable summary, or `undefined` when nothing ran.
+   */
+  async consolidateNow(parent: Agent): Promise<string | undefined> {
+    if (!this.settings.consolidate) return undefined
+    const seam = this.subagents
+    if (seam === undefined) return undefined
+    const token = `consolidate-${process.pid}-${Date.now().toString(36)}`
+    const job = this.state.claimJob(CONSOLIDATE_JOB, token, 600_000)
+    if (job === undefined) return undefined
+    const root = await this.projectRoot(parent.session)
+    try {
+      const global = await this.store.list('global', undefined, { fresh: true })
+      const project = await this.store.list('project', root, { fresh: true })
+      const entries = [...global, ...project]
+        .sort((left, right) => right.updatedAt - left.updatedAt)
+        .slice(0, this.settings.consolidateMaxEntries)
+      if (entries.length < 2) {
+        this.state.deleteJob(CONSOLIDATE_JOB)
+        return undefined
+      }
+      const plan = await runConsolidation(seam, {
+        parent,
+        ...this.settings.extractProvider.length > 0 && this.settings.extractModel.length > 0
+          ? { provider: this.settings.extractProvider, model: this.settings.extractModel }
+          : {},
+        entries,
+        projectLabel: this.store.target('project', root).label,
+        maxUpserts: this.settings.consolidateMaxEntries,
+        timeoutMs: this.settings.consolidateTimeoutMs,
+        signal: this.lifecycle.signal,
+      })
+      if (plan === undefined) {
+        this.state.deleteJob(CONSOLIDATE_JOB)
+        return undefined
+      }
+      const result = await applyPlan(plan, this.consolidationTarget(), root, { entries })
+      this.state.deleteJob(CONSOLIDATE_JOB)
+      this.bumpAllInjections()
+      this.ctx.logger.info('dsh-memories: consolidated %d written, %d retired', result.written, result.retired)
+      return `Consolidated ${entries.length} memories: ${result.written} written, ${result.retired} retired.${result.notes.length > 0 ? ` ${result.notes}` : ''}`
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      // Release the lease and back off, so a broken pass cannot spin.
+      const { lease: _lease, ...rest } = job
+      this.state.putJob({
+        ...rest,
+        leaseUntil: 0,
+        retries: job.retries + 1,
+        notBefore: Date.now() + Math.min(6, job.retries + 1) * 3_600_000,
+        lastError: message,
+      })
+      this.ctx.logger.warn('dsh-memories: consolidation failed: %s', message)
+      return undefined
+    }
+  }
+
+  /** Mark every session's injected summary stale (used after a consolidation). */
+  private bumpAllInjections(): void {
+    for (const reference of this.tracked) {
+      const agent = reference.deref()
+      if (agent === undefined) continue
+      this.bumpInjection(agent.session)
+    }
+  }
+
+  /**
+   * The store, narrowed to the write surface consolidation needs.
+   *
+   * The adapter drops `upsert`'s clock parameter so the target's `keepId` is the
+   * fourth argument, matching the consolidation contract.
+   */
+  private consolidationTarget(): ConsolidationTarget {
+    return {
+      upsert: (draft, projectRoot, source, keepId) => this.store.upsert(draft, projectRoot, source, Date.now(), keepId),
+      remove: (scope, projectRoot, id) => this.store.remove(scope, projectRoot, id),
+    }
+  }
+
+  /** A one-line status used by `/memories` and diagnostics. */
+  async stats(session: Session): Promise<string> {
+    const states = await this.allScopes(session)
+    const lines = [
+      `memory home: ${this.store.memoriesDir}`,
+      ...states.map((scope) => `${scope.label}: ${scope.entries.length} memories`),
+      `auto-extract: ${this.settings.autoExtract ? `on (idle ${Math.round(this.settings.autoExtractIdleMs / 1000)}s, ≥${this.settings.minIdleHours}h, ≤${this.settings.maxAgeDays}d)` : 'off'}`,
+      `sessions mined: ${this.state.sessionCount()}`,
+      `state store: ${this.state.durable ? 'sqlite' : `memory-only (${this.state.degradedReason ?? 'driver unavailable'})`}`,
+    ]
+    return lines.join('\n')
+  }
+
+  /** Render one scope's entries for a human-facing command. */
+  async list(session: Session, scope: MemoryScope): Promise<string> {
+    const state = await this.scopeState(scope, session)
+    return renderScopeListing({ scope: state.scope, label: state.label, entries: state.entries })
+  }
+}
+
+/** Narrow the `/memories` argument grammar. */
+function parseCommandInput(raw: string): { verb: string; rest: string } {
+  const trimmed = raw.trim()
+  if (trimmed.length === 0) return { verb: 'help', rest: '' }
+  const separator = trimmed.search(/\s/u)
+  if (separator < 0) return { verb: trimmed.toLowerCase(), rest: '' }
+  return { verb: trimmed.slice(0, separator).toLowerCase(), rest: trimmed.slice(separator + 1).trim() }
+}
+
+/** Render the `/memories` help text. */
+function helpText(): string {
+  return [
+    'Usage: /memories [subcommand]',
+    '  list [global|project]   list stored memories',
+    '  search <query>          search both scopes',
+    '  show <id>               show one memory (project first)',
+    '  add <global|project> <text>   store a memory by hand',
+    '  forget <id>             delete a memory',
+    '  mine                    extract memories from this session now',
+    '  consolidate             merge and reconcile all memories now',
+    '  stats                   store location and counters',
+  ].join('\n')
+}
+
+/**
+ * Register the memory tool, the injector, the idle extractor, and `/memories`.
+ *
+ * The tunables live in the `memories` settings namespace: registering it here
+ * is what puts them in `$DSH_HOME/settings.yaml` and in the DSH Settings shell,
+ * and every knob takes effect on the next read — no restart.
+ *
+ * @param ctx - the plugin context.
+ * @param config - deployment configuration (paths and workspace discovery).
+ */
+export function apply(ctx: Context, config: MemoriesConfig = {}): void {
+  const deployment = resolveConfig(config)
+  /**
+   * Authoritative tunables.
+   *
+   * The settings scope owns the lifecycle: `register` returns a scope whose
+   * `get()` is the resolved value (schema defaults, then the composition base,
+   * then the user's `settings.yaml` section) and whose `watch` fires on every
+   * commit. One source, so the settings document and the runtime can never
+   * disagree, and no restart is needed to change a knob.
+   */
+  let current: MemoriesSettings = deployment.defaults
+  const read = (): MemoriesSettings => current
+  /** Assigned once the live registrations exist; a no-op until then. */
+  let liveRegistrations = (): void => undefined
+
+  // The settings seam is optional: a deployment that composes no provider
+  // keeps the row-level defaults and simply has no settings document.
+  const settings = ctx.get('settings') as SettingsProvider | undefined
+  if (settings !== undefined) {
+    try {
+      const scope = settings.register(SETTINGS_NS, MemoriesSettingsSchema, { base: deployment.defaults, applies: 'live' })
+      current = normalizeSettings(scope.get())
+      ctx.effect(() => scope.watch((next) => {
+        current = normalizeSettings(next)
+        liveRegistrations()
+      }), 'dsh-memories.settingsWatch')
+    } catch (error) {
+      ctx.logger.warn('dsh-memories: settings registration failed, using row defaults: %o', error)
+    }
+  }
+
+  const runtime = new MemoriesRuntime(ctx, config, read)
+  ctx.effect(() => () => runtime.dispose(), 'dsh-memories.lifecycle')
+  ctx.logger.info(
+    'dsh-memories: store at %s autoExtract=%s idle=%d settings=%s',
+    runtime.store.memoriesDir,
+    String(runtime.settings.autoExtract),
+    runtime.settings.autoExtractIdleMs,
+    settings === undefined ? 'row-defaults' : SETTINGS_NS,
+  )
+
+  // `enableTool`/`enableCommand` are live: each registration is torn down and
+  // re-created when the toggle flips, so the model's catalog follows the
+  // settings document without a restart.
+  const registerTool = (): (() => void) => registerMemoryTool(ctx, runtime)
+  const registerCommand = (): (() => void) => ctx.commands.register({
+    name: 'memories',
+    description: 'Inspect and manage cross-session memories',
+    input: { hint: 'list | search <query> | show <id> | add <scope> <text> | forget <id> | mine | stats' },
+    handler: async (invocation: CommandInvocation) => handleCommand(runtime, invocation),
+  })
+  let toolDisposer: (() => void) | undefined
+  let commandDisposer: (() => void) | undefined
+  const syncRegistrations = (): void => {
+    const wantTool = runtime.settings.enableTool
+    if (wantTool && toolDisposer === undefined) toolDisposer = registerTool()
+    else if (!wantTool && toolDisposer !== undefined) {
+      toolDisposer()
+      toolDisposer = undefined
+    }
+    const wantCommand = runtime.settings.enableCommand
+    if (wantCommand && commandDisposer === undefined) commandDisposer = registerCommand()
+    else if (!wantCommand && commandDisposer !== undefined) {
+      commandDisposer()
+      commandDisposer = undefined
+    }
+  }
+  syncRegistrations()
+  liveRegistrations = syncRegistrations
+  ctx.effect(() => () => {
+    toolDisposer?.()
+    commandDisposer?.()
+  }, 'dsh-memories.registrations')
+
+  ctx.on('agent/status', ({ agent, status }) => {
+    if (status === 'idle') runtime.scheduleExtraction(agent)
+    else runtime.cancelExtraction(agent)
+  })
+
+  ctx.on('agent/disposed', ({ agent }) => {
+    runtime.cancelExtraction(agent)
+    // A short-lived process may exit before the idle timer ever fires; the
+    // disposal boundary is the last moment an extraction can still run.
+    void runtime.flushExit().catch(() => undefined)
+  })
+
+  ctx.on('agent/session-start', ({ agent, source }: { agent: Agent; source: SessionStartSource }) => {
+    // `clear`/`compact` replace the conversation, so the summary the model saw
+    // is gone: forget it and let the next pre-step re-inject. Fresh and resumed
+    // sessions need no work here — the first step of the first turn injects.
+    if (source === 'clear' || source === 'compact') runtime.resetInjection(agent.session)
+  })
+
+  ctx.on('agent/pre-step', async ({ agent, turn }, next) => {
+    const decision = await next()
+    if (decision.kind === 'reject') return decision
+    const message = await runtime.injectionFor(agent, turn)
+    if (message === undefined) return decision
+    if (decision.messages.some((existing) => existing.id === message.id)) return decision
+    return { ...decision, messages: [...decision.messages, message] }
+  })
+}
+
+/** Execute one `/memories` invocation. */
+async function handleCommand(runtime: MemoriesRuntime, invocation: CommandInvocation): Promise<{ kind: 'success' | 'error'; text: string }> {
+  const { verb, rest } = parseCommandInput(invocation.rawInput)
+  const session = invocation.agent.session
+  switch (verb) {
+    case 'help':
+      return { kind: 'success', text: helpText() }
+    case 'stats':
+      return { kind: 'success', text: await runtime.stats(session) }
+    case 'list': {
+      const scope = rest.trim().toLowerCase()
+      if (scope === 'global' || scope === 'project') return { kind: 'success', text: await runtime.list(session, scope) }
+      const [global, project] = await runtime.allScopes(session)
+      return {
+        kind: 'success',
+        text: [
+          renderScopeListing({ scope: 'global', label: global?.label ?? 'global', entries: global?.entries ?? [] }),
+          '',
+          renderScopeListing({ scope: 'project', label: project?.label ?? 'project', entries: project?.entries ?? [] }),
+        ].join('\n'),
+      }
+    }
+    case 'search': {
+      if (rest.length === 0) return { kind: 'error', text: 'Usage: /memories search <query>' }
+      const hits = await runtime.search(session, rest, { limit: 10 })
+      if (hits.length === 0) return { kind: 'success', text: `No memories match ${JSON.stringify(rest)}.` }
+      return { kind: 'success', text: hits.map((hit, index) => renderHit(hit, index)).join('\n') }
+    }
+    case 'show': {
+      if (rest.length === 0) return { kind: 'error', text: 'Usage: /memories show <id>' }
+      const entry = await runtime.read(session, 'project', rest) ?? await runtime.read(session, 'global', rest)
+      if (entry === undefined) return { kind: 'error', text: `No memory with id ${JSON.stringify(rest)}.` }
+      return { kind: 'success', text: renderEntry(entry) }
+    }
+    case 'add': {
+      const separator = rest.search(/\s/u)
+      const scope = (separator < 0 ? rest : rest.slice(0, separator)).trim().toLowerCase()
+      const text = separator < 0 ? '' : rest.slice(separator + 1).trim()
+      if ((scope !== 'global' && scope !== 'project') || text.length === 0) {
+        return { kind: 'error', text: 'Usage: /memories add <global|project> <text>' }
+      }
+      const title = text.length <= 80 ? text : `${text.slice(0, 77)}...`
+      const result = await runtime.write(session, { scope, title, body: text, tags: [] }, 'user')
+      return { kind: 'success', text: `${result.action === 'created' ? 'Stored' : 'Updated'} ${scope} memory ${result.entry.id}.` }
+    }
+    case 'forget': {
+      if (rest.length === 0) return { kind: 'error', text: 'Usage: /memories forget <id>' }
+      const project = await runtime.forget(session, 'project', rest)
+      const global = project ? false : await runtime.forget(session, 'global', rest)
+      if (!project && !global) return { kind: 'error', text: `No memory with id ${JSON.stringify(rest)}.` }
+      return { kind: 'success', text: `Forgot ${slugify(rest)}.` }
+    }
+    case 'consolidate': {
+      const summary = await runtime.consolidateNow(invocation.agent)
+      return { kind: 'success', text: summary ?? 'Nothing to consolidate (cooldown active, too few memories, or no subagent support).' }
+    }
+    case 'mine': {
+      const count = await runtime.mineNow(invocation.agent)
+      return { kind: 'success', text: count === 0 ? 'Nothing new worth remembering.' : `Stored ${count} memories.` }
+    }
+    default:
+      return { kind: 'error', text: helpText() }
+  }
+}
+
+/** Loader schema re-exported under the name the Cordis loader discovers. */
+export const Config = ConfigSchema
