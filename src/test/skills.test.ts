@@ -37,9 +37,26 @@ test('normalizeSkillName enforces the harness name grammar', () => {
 
 test('renderSkillFile emits the frontmatter the loader requires', () => {
   const text = renderSkillFile(DRAFT)
-  assert.match(text, /^---\nname: release-check\ndescription: Ship a release safely\n---\n/u)
+  assert.match(text, /^---\nname: release-check\ndescription: "Ship a release safely"\n---\n/u)
   assert.match(text, /1\. Run the tests\./u)
   assert.match(text, /3\. Publish\./u)
+})
+
+test('a description that would break a plain YAML scalar is quoted', () => {
+  // A mapping colon, a leading indicator, and a quote: all legal in a quoted
+  // scalar, all fatal in a plain one — and the loader skips an unparsable skill
+  // silently, so the promoted file would never reach the catalog.
+  const text = renderSkillFile({ ...DRAFT, description: 'Probe: proves "it" works — see #1' })
+  assert.match(text, /^description: "Probe: proves \\"it\\" works — see #1"$/mu)
+  assert.match(renderSkillFile({ ...DRAFT, description: 'line one\nline two' }), /^description: "line one\\nline two"$/mu)
+})
+
+test('a quoted description survives a write/list round trip', async (t) => {
+  const { memoriesDir } = await roots(t)
+  const description = 'Probe: proves a promoted draft reaches the catalog.'
+  await writeDraft(memoriesDir, { ...DRAFT, description })
+  const staged = await listDrafts(memoriesDir)
+  assert.equal(staged[0]?.description, description)
 })
 
 test('a draft is staged under the memory store, not the skill root', async (t) => {

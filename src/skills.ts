@@ -48,6 +48,27 @@ export function normalizeSkillName(value: string): string | undefined {
 }
 
 /**
+ * Encode one frontmatter value as a YAML double-quoted scalar.
+ *
+ * A plain scalar breaks the document as soon as the value contains a mapping
+ * colon, a leading indicator (`-`, `#`, `[`), or a newline — and the harness
+ * loader responds by SKIPPING the skill with a warning nobody sees, so the
+ * promoted file would sit in the skill root and never reach the catalog. Quoting
+ * makes every value safe, including the model-authored descriptions that
+ * consolidation produces.
+ *
+ * @param value - the raw text.
+ * @returns a double-quoted YAML scalar with the escapes YAML defines.
+ */
+function yamlScalar(value: string): string {
+  return `"${value
+    .replace(/\\/gu, '\\\\')
+    .replace(/"/gu, '\\"')
+    .replace(/\r\n|\r|\n/gu, '\\n')
+    .replace(/\t/gu, '\\t')}"`
+}
+
+/**
  * Render one draft as the markdown the harness loader reads.
  * @param draft - the proposed skill.
  * @returns a `SKILL.md` body with the required frontmatter.
@@ -56,7 +77,7 @@ export function renderSkillFile(draft: SkillDraft): string {
   return [
     '---',
     `name: ${draft.name}`,
-    `description: ${draft.description}`,
+    `description: ${yamlScalar(draft.description)}`,
     '---',
     '',
     ...draft.steps.map((step, index) => `${index + 1}. ${step}`),
@@ -132,7 +153,13 @@ export async function listDrafts(memoriesDir: string): Promise<StagedSkill[]> {
   return staged
 }
 
-/** Read the description out of one `SKILL.md` frontmatter block. */
+/**
+ * Read the description out of one `SKILL.md` frontmatter block.
+ *
+ * Drafts written by this module carry a double-quoted scalar (see
+ * {@link yamlScalar}); a hand-edited file may carry a plain one, so both are
+ * accepted and the quotes are stripped only when they wrap the whole value.
+ */
 function descriptionOf(text: string): string {
   const end = text.indexOf('\n---', 3)
   const header = end < 0 ? '' : text.slice(3, end)
@@ -140,7 +167,15 @@ function descriptionOf(text: string): string {
     const separator = line.indexOf(':')
     if (separator < 0) continue
     if (line.slice(0, separator).trim().toLowerCase() !== 'description') continue
-    return line.slice(separator + 1).trim()
+    const raw = line.slice(separator + 1).trim()
+    if (raw.length >= 2 && raw.startsWith('"') && raw.endsWith('"')) {
+      return raw.slice(1, -1)
+        .replace(/\\n/gu, '\n')
+        .replace(/\\t/gu, '\t')
+        .replace(/\\"/gu, '"')
+        .replace(/\\\\/gu, '\\')
+    }
+    return raw
   }
   return ''
 }
