@@ -16,7 +16,8 @@
  * @module dsh-memories/consolidate
  */
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { MemoryEntry, MemoryDraft, MemoryScope } from './types.js'
+import { toMemoryKind } from './types.js'
+import type { MemoryEntry, MemoryDraft, MemoryKind, MemoryScope } from './types.js'
 
 /** System instruction for the consolidation sub-agent. */
 export const CONSOLIDATE_SYSTEM = [
@@ -32,11 +33,14 @@ export const CONSOLIDATE_SYSTEM = [
   '- Preserve every id you keep. A returned memory with an existing id REPLACES that memory; a new id ADDS one.',
   '- Prefer fewer, sharper memories. Never invent facts that are not in the input.',
   '- Keep scope honest: a fact that is only true in one workspace stays "project"; a durable user preference or general tooling fact is "global".',
+  '- Keep the kind honest: "preference" for how the user wants work done, "failure" for something that went wrong, "procedure" for an ordered recipe, "knowledge" for a non-obvious technique, "fact" for background.',
   '- Do not record secrets, credentials, transient task state, or restatements of code.',
   '- Write each body as 1-4 self-contained sentences. Titles are short and imperative.',
   '',
+  'When two or more memories together describe a repeatable procedure that would be worth running again, also return it as a skill: a short kebab-case name, a one-line description, and the ordered steps. Skills are drafts a human promotes; return at most 2.',
+  '',
   'Reply with JSON only, no prose and no code fence:',
-  '{"memories":[{"id":string|null,"scope":"global"|"project","title":string,"body":string,"tags":string[]}],"retire":[string],"notes":string}',
+  '{"memories":[{"id":string|null,"scope":"global"|"project","kind":string,"title":string,"body":string,"tags":string[],"appliesTo":string}],"retire":[string],"skills":[{"name":string,"description":string,"steps":string[]}],"notes":string}',
   'Use null for the id of a new memory. "retire" lists ids to delete. "notes" is one short sentence about what you changed.',
 ].join('\n')
 
@@ -55,23 +59,50 @@ export const CONSOLIDATE_JSON_SCHEMA = {
         properties: {
           id: { type: ['string', 'null'] },
           scope: { type: 'string', enum: ['global', 'project'] },
+          kind: { type: 'string', enum: ['fact', 'preference', 'knowledge', 'failure', 'procedure'] },
           title: { type: 'string' },
           body: { type: 'string' },
           tags: { type: 'array', items: { type: 'string' } },
+          appliesTo: { type: 'string' },
         },
       },
     },
     retire: { type: 'array', items: { type: 'string' } },
+    skills: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['name', 'description', 'steps'],
+        properties: {
+          name: { type: 'string' },
+          description: { type: 'string' },
+          steps: { type: 'array', items: { type: 'string' } },
+        },
+      },
+    },
     notes: { type: 'string' },
   },
 } as const
 
+/** One skill draft proposed by a consolidation pass. */
+export interface SkillDraft {
+  /** Kebab-case skill name. */
+  readonly name: string
+  /** One-line description. */
+  readonly description: string
+  /** Ordered steps. */
+  readonly steps: readonly string[]
+}
+
 /** One consolidation proposal, already validated against the input. */
 export interface ConsolidationPlan {
   /** Memories to add or replace, keyed by the id they replace (or `undefined` to add). */
-  readonly upserts: readonly { id: string | null; scope: MemoryScope; title: string; body: string; tags: readonly string[] }[]
+  readonly upserts: readonly { id: string | null; scope: MemoryScope; kind: MemoryKind; title: string; body: string; tags: readonly string[]; appliesTo?: string }[]
   /** Ids to delete. */
   readonly retire: readonly string[]
+  /** Skill drafts extracted from the memory set. */
+  readonly skills: readonly SkillDraft[]
   /** The sub-agent's one-line account of what it changed. */
   readonly notes: string
 }
@@ -136,7 +167,16 @@ export function parsePlan(text: string, knownIds: ReadonlySet<string>, maxUpsert
     if (id !== null && seen.has(id)) continue
     if (id !== null) seen.add(id)
     const tags = Array.isArray(entry['tags']) ? entry['tags'].filter((tag): tag is string => typeof tag === 'string') : []
-    upserts.push({ id, scope, title: cleanTitle, body: cleanBody, tags })
+    const appliesTo = typeof entry['appliesTo'] === 'string' ? entry['appliesTo'].replace(/\s+/gu, ' ').trim().slice(0, 160) : ''
+    upserts.push({
+      id,
+      scope,
+      kind: toMemoryKind(entry['kind']),
+      title: cleanTitle,
+      body: cleanBody,
+      tags,
+      ...appliesTo.length > 0 ? { appliesTo } : {},
+    })
   }
   const rawRetire = Array.isArray(record['retire']) ? record['retire'] : []
   const retired = new Set<string>()
@@ -146,12 +186,45 @@ export function parsePlan(text: string, knownIds: ReadonlySet<string>, maxUpsert
     if (!knownIds.has(value) || seen.has(value)) continue
     retired.add(value)
   }
-  if (upserts.length === 0 && retired.size === 0) return undefined
+  const skills = parseSkills(record['skills'])
+  if (upserts.length === 0 && retired.size === 0 && skills.length === 0) return undefined
   return {
     upserts,
     retire: [...retired],
+    skills,
     notes: typeof record['notes'] === 'string' ? record['notes'].slice(0, 300) : '',
   }
+}
+
+/**
+ * Parse the skill drafts of one reply.
+ *
+ * A name is forced into the kebab-case grammar DSH's skill loader accepts, and
+ * a draft without a usable name, description, or any step is dropped: a skill
+ * that cannot be loaded is worse than no skill.
+ * @param value - the raw `skills` field.
+ * @returns the validated drafts, at most two.
+ */
+function parseSkills(value: unknown): SkillDraft[] {
+  if (!Array.isArray(value)) return []
+  const drafts: SkillDraft[] = []
+  const seen = new Set<string>()
+  for (const item of value) {
+    if (drafts.length >= MAX_SKILL_DRAFTS) break
+    if (typeof item !== 'object' || item === null) continue
+    const record = item as Record<string, unknown>
+    const rawName = typeof record['name'] === 'string' ? record['name'] : ''
+    const name = rawName.toLowerCase().replace(/[^a-z0-9]+/gu, '-').replace(/^-+|-+$/gu, '').slice(0, 64)
+    const description = typeof record['description'] === 'string' ? record['description'].replace(/\s+/gu, ' ').trim().slice(0, 300) : ''
+    const steps = Array.isArray(record['steps'])
+      ? record['steps'].filter((step): step is string => typeof step === 'string').map((step) => step.trim()).filter((step) => step.length > 0).slice(0, 20)
+      : []
+    if (name.length === 0 || description.length === 0 || steps.length === 0) continue
+    if (seen.has(name)) continue
+    seen.add(name)
+    drafts.push({ name, description, steps })
+  }
+  return drafts
 }
 
 /** Everything one consolidation run needs. */
@@ -187,6 +260,9 @@ export interface SubagentSeam {
 }
 
 /** Tools the consolidation child must not have: it reads and proposes, nothing else. */
+/** Cap on skill drafts one pass may propose. */
+const MAX_SKILL_DRAFTS = 2
+
 export const CONSOLIDATE_DENY_TOOLS = [
   'write', 'edit', 'str_replace_editor', 'pwsh', 'bash', 'terminal',
   'web_search', 'web_fetch', 'subagent', 'subagent_fork', 'workflow', 'ralph',

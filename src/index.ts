@@ -40,6 +40,7 @@ import type { SummaryScope } from './render.js'
 import { findProjectRoot } from './workspace.js'
 import { collectWindow, runExtraction } from './extract.js'
 import { applyPlan, runConsolidation } from './consolidate.js'
+import { discardDraft, listDrafts, promote, writeDraft } from './skills.js'
 import type { ConsolidationTarget, SubagentSeam } from './consolidate.js'
 import type { MemoryEntry, MemoryScope } from './types.js'
 import { registerMemoryTool } from './tool.js'
@@ -642,10 +643,25 @@ export class MemoriesRuntime {
         return undefined
       }
       const result = await applyPlan(plan, this.consolidationTarget(), root, { entries })
+      // Skill drafts are staged, not installed: a background pass must not
+      // silently grow the model's skill catalog.
+      const staged: string[] = []
+      for (const draft of plan.skills) {
+        try {
+          await writeDraft(this.store.memoriesDir, draft)
+          staged.push(draft.name)
+        } catch (error) {
+          this.ctx.logger.warn('dsh-memories: could not stage skill draft %s: %o', draft.name, error)
+        }
+      }
       this.state.deleteJob(CONSOLIDATE_JOB)
       this.bumpAllInjections()
-      this.ctx.logger.info('dsh-memories: consolidated %d written, %d retired', result.written, result.retired)
-      return `Consolidated ${entries.length} memories: ${result.written} written, ${result.retired} retired.${result.notes.length > 0 ? ` ${result.notes}` : ''}`
+      this.ctx.logger.info('dsh-memories: consolidated %d written, %d retired, %d skill drafts', result.written, result.retired, staged.length)
+      return [
+        `Consolidated ${entries.length} memories: ${result.written} written, ${result.retired} retired.`,
+        staged.length > 0 ? `Staged skill drafts: ${staged.join(', ')} (promote with /memories promote <name>).` : '',
+        result.notes,
+      ].filter((line) => line.length > 0).join(' ')
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       // Release the lease and back off, so a broken pass cannot spin.
@@ -702,6 +718,32 @@ export class MemoriesRuntime {
     const state = await this.scopeState(scope, session)
     return renderScopeListing({ scope: state.scope, label: state.label, entries: state.entries })
   }
+
+  /** List the staged skill drafts. */
+  async skills(): Promise<string> {
+    const drafts = await listDrafts(this.store.memoriesDir)
+    if (drafts.length === 0) return 'No skill drafts staged.'
+    return [
+      `${drafts.length} staged skill ${drafts.length === 1 ? 'draft' : 'drafts'}:`,
+      ...drafts.map((draft) => `- ${draft.name} — ${draft.description || '(no description)'}`),
+      '',
+      'Promote one with /memories promote <name>; discard with /memories discard <name>.',
+    ].join('\n')
+  }
+
+  /** Copy one staged draft into the harness skill root. */
+  async promoteSkill(name: string): Promise<string> {
+    const target = await promote(this.store.memoriesDir, this.deployment.dshHome, name)
+    if (target === undefined) return `No staged skill draft named ${JSON.stringify(name)}.`
+    return `Promoted ${JSON.stringify(name)} to ${target}. It joins the skill catalog on the next catalog refresh.`
+  }
+
+  /** Delete one staged draft. */
+  async discardSkill(name: string): Promise<string> {
+    return await discardDraft(this.store.memoriesDir, name)
+      ? `Discarded staged skill draft ${JSON.stringify(name)}.`
+      : `No staged skill draft named ${JSON.stringify(name)}.`
+  }
 }
 
 /** Narrow the `/memories` argument grammar. */
@@ -724,6 +766,9 @@ function helpText(): string {
     '  forget <id>             delete a memory',
     '  mine                    extract memories from this session now',
     '  consolidate             merge and reconcile all memories now',
+    '  skills                  list staged skill drafts',
+    '  promote <name>          copy a staged draft into \/skills',
+    '  discard <name>          delete a staged draft',
     '  stats                   store location and counters',
   ].join('\n')
 }
@@ -893,6 +938,16 @@ async function handleCommand(runtime: MemoriesRuntime, invocation: CommandInvoca
       const global = project ? false : await runtime.forget(session, 'global', rest)
       if (!project && !global) return { kind: 'error', text: `No memory with id ${JSON.stringify(rest)}.` }
       return { kind: 'success', text: `Forgot ${slugify(rest)}.` }
+    }
+    case 'skills':
+      return { kind: 'success', text: await runtime.skills() }
+    case 'promote': {
+      if (rest.length === 0) return { kind: 'error', text: 'Usage: /memories promote <name>' }
+      return { kind: 'success', text: await runtime.promoteSkill(rest) }
+    }
+    case 'discard': {
+      if (rest.length === 0) return { kind: 'error', text: 'Usage: /memories discard <name>' }
+      return { kind: 'success', text: await runtime.discardSkill(rest) }
     }
     case 'consolidate': {
       const summary = await runtime.consolidateNow(invocation.agent)

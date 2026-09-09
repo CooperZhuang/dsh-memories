@@ -23,6 +23,7 @@ import { createHash } from 'node:crypto'
 import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import type { MemoryDraft, MemoryEntry, MemoryScope, ScopeTarget, UpsertResult } from './types.js'
+import { toMemoryKind } from './types.js'
 
 /** Frontmatter fence used by every entry file. */
 const FENCE = '---'
@@ -119,8 +120,11 @@ export function formatEntry(entry: MemoryEntry): string {
     FENCE,
     `id: ${entry.id}`,
     `scope: ${entry.scope}`,
+    `kind: ${entry.kind}`,
     `title: ${entry.title}`,
     tags,
+    ...entry.appliesTo !== undefined && entry.appliesTo.length > 0 ? [`appliesTo: ${entry.appliesTo}`] : [],
+    ...entry.supersedes !== undefined && entry.supersedes.length > 0 ? [`supersedes: ${entry.supersedes}`] : [],
     `created: ${new Date(entry.createdAt).toISOString()}`,
     `updated: ${new Date(entry.updatedAt).toISOString()}`,
     `source: ${entry.source}`,
@@ -171,12 +175,19 @@ export function parseEntry(text: string, scope: MemoryScope, fallbackId: string)
     : 'system'
   const updatedAt = parseTime(fields.get('updated'), Date.now())
   const rawUses = Number(fields.get('uses') ?? '0')
+  const appliesTo = fields.get('appliesto')
+  const supersedes = fields.get('supersedes')
   return {
     id: fields.get('id') ?? fallbackId,
     scope,
+    // An entry written before kinds existed is a plain fact; the schema grew
+    // without a migration because the default is the old behaviour.
+    kind: toMemoryKind(fields.get('kind')),
     title,
     body,
     tags: (fields.get('tags') ?? '').split(',').map(normalizeTag).filter((tag) => tag.length > 0),
+    ...appliesTo !== undefined && appliesTo.length > 0 ? { appliesTo } : {},
+    ...supersedes !== undefined && supersedes.length > 0 ? { supersedes } : {},
     createdAt: parseTime(fields.get('created'), updatedAt),
     updatedAt,
     uses: Number.isFinite(rawUses) && rawUses > 0 ? Math.trunc(rawUses) : 0,
@@ -397,8 +408,11 @@ export class MemoryStore {
       count: entries.length,
       entries: entries.map((entry) => ({
         id: entry.id,
+        kind: entry.kind,
         title: entry.title,
         tags: entry.tags,
+        ...entry.appliesTo === undefined ? {} : { appliesTo: entry.appliesTo },
+        ...entry.supersedes === undefined ? {} : { supersedes: entry.supersedes },
         createdAt: entry.createdAt,
         updatedAt: entry.updatedAt,
         uses: entry.uses,
@@ -465,12 +479,19 @@ export class MemoryStore {
     const id = slugify(keepId ?? draft.title)
     const existing = await this.read(draft.scope, projectRoot, id)
     const tags = [...new Set(draft.tags.map(normalizeTag).filter((tag) => tag.length > 0))].slice(0, 12)
+    const appliesTo = draft.appliesTo?.trim()
+    const supersedes = draft.supersedes?.trim()
     const entry: MemoryEntry = {
       id,
       scope: draft.scope,
+      // A rewrite that omits the kind keeps the existing one rather than
+      // silently demoting a preference to a fact.
+      kind: draft.kind ?? existing?.kind ?? 'fact',
       title: draft.title.trim(),
       body: draft.body.trim(),
       tags,
+      ...appliesTo !== undefined && appliesTo.length > 0 ? { appliesTo } : {},
+      ...supersedes !== undefined && supersedes.length > 0 ? { supersedes } : {},
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
       uses: existing?.uses ?? 0,

@@ -37,7 +37,7 @@ test('projectSlug is stable per root and distinct across roots', () => {
 
 /** Build a complete entry from the fields a test cares about. */
 function entry(partial: Partial<MemoryEntry> & Pick<MemoryEntry, 'id' | 'scope' | 'title' | 'body'>): MemoryEntry {
-  return { tags: [], createdAt: 1, updatedAt: 1, uses: 0, lastUsedAt: 0, source: 'tool', ...partial }
+  return { kind: 'fact', tags: [], createdAt: 1, updatedAt: 1, uses: 0, lastUsedAt: 0, source: 'tool', ...partial }
 }
 
 test('entry files round-trip through format and parse', () => {
@@ -61,6 +61,56 @@ test('an entry with no recorded use round-trips its zero counters', () => {
   const parsed = parseEntry(formatEntry(value), 'global', 'fallback')
   assert.equal(parsed?.uses, 0)
   assert.equal(parsed?.lastUsedAt, 0)
+})
+
+test('kind and appliesTo round-trip, and an entry without them defaults to a fact', () => {
+  const value = entry({
+    id: 'never-force-push',
+    scope: 'global',
+    kind: 'preference',
+    title: 'Never force-push',
+    body: 'Ask before any force-push.',
+    appliesTo: 'before running any git push',
+  })
+  assert.deepEqual(parseEntry(formatEntry(value), 'global', 'fallback'), value)
+
+  // A file written before kinds existed has no `kind:` line: it must parse as a
+  // fact rather than being rejected or losing the entry.
+  const legacy = [
+    '---',
+    'id: legacy',
+    'scope: global',
+    'title: Legacy entry',
+    'tags:',
+    'created: 2026-01-01T00:00:00.000Z',
+    'updated: 2026-01-01T00:00:00.000Z',
+    'source: tool',
+    'uses: 0',
+    'lastUsed: never',
+    '---',
+    '',
+    'Written before kinds existed.',
+  ].join('\n')
+  const parsed = parseEntry(legacy, 'global', 'legacy')
+  assert.equal(parsed?.kind, 'fact')
+  assert.equal(parsed?.appliesTo, undefined)
+  assert.equal(parsed?.supersedes, undefined)
+})
+
+test('an unknown kind value degrades to a fact instead of failing the entry', () => {
+  const parsed = parseEntry(formatEntry(entry({ id: 'x', scope: 'global', title: 'X', body: 'y' })).replace('kind: fact', 'kind: nonsense'), 'global', 'x')
+  assert.equal(parsed?.kind, 'fact')
+})
+
+test('a rewrite that omits the kind keeps the stored one', async () => {
+  const { store, dir } = await tempStore()
+  try {
+    await store.upsert({ scope: 'global', kind: 'preference', title: 'Use pnpm', body: 'Use pnpm.', tags: [] }, undefined, 'tool', 1_000)
+    const updated = await store.upsert({ scope: 'global', title: 'Use pnpm', body: 'Use pnpm everywhere.', tags: [] }, undefined, 'auto', 2_000)
+    assert.equal(updated.entry.kind, 'preference')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
 })
 
 test('parseEntry rejects a non-entry file instead of throwing', () => {
@@ -179,6 +229,26 @@ test('the per-scope cap evicts the least recently updated entries', async () => 
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
+})
+
+test('the summary groups a scope by kind, actionable kinds first', () => {
+  const scopes = [{
+    label: 'global',
+    heading: 'Global memories',
+    total: 3,
+    entries: [
+      entry({ id: 'f', scope: 'global', kind: 'fact', title: 'A fact', body: 'background' }),
+      entry({ id: 'p', scope: 'global', kind: 'preference', title: 'A preference', body: 'follow this' }),
+      entry({ id: 'x', scope: 'global', kind: 'failure', title: 'A failure', body: 'avoid this' }),
+    ],
+  }]
+  const text = renderMemorySummary(scopes, { maxBytes: 4_000, maxEntriesPerScope: 10 })
+  assert.ok(text !== undefined)
+  const preferenceAt = text.indexOf('### Preferences')
+  const failureAt = text.indexOf('### Failures to avoid')
+  const factAt = text.indexOf('### Facts')
+  assert.ok(preferenceAt > 0 && failureAt > 0 && factAt > 0, 'every populated kind gets a heading')
+  assert.ok(preferenceAt < failureAt && failureAt < factAt, 'actionable kinds render before plain facts')
 })
 
 test('search ranks a title hit above a body hit and honours filters', () => {

@@ -14,6 +14,7 @@ import type { ContentBlock, GenerateOptions, LlmRuntime } from '@deepseek-ai/dsh
 import { deriveEventMessage } from '@deepseek-ai/dsh-session/surface'
 import type { Session } from '@deepseek-ai/dsh-session'
 import { SessionSeq } from '@deepseek-ai/dsh-session'
+import { toMemoryKind } from './types.js'
 import type { MemoryDraft, MemoryScope } from './types.js'
 
 /** Model-facing transcript line budget for one extraction window. */
@@ -39,8 +40,15 @@ export const EXTRACT_SYSTEM = [
   '- "project": true only for this workspace (its architecture, commands, conventions, gotchas).',
   '',
   'Each memory has a short imperative title (max 80 characters), a 1-3 sentence body, and up to 5 lowercase keyword tags.',
+  'Give each memory a kind, because the kinds are recalled differently:',
+  '- "preference": how the user wants work done, or a correction they issued.',
+  '- "failure": something that went wrong and how to avoid repeating it.',
+  '- "procedure": an ordered recipe for a recurring task.',
+  '- "knowledge": a non-obvious technique worth reusing.',
+  '- "fact": durable background that is none of the above.',
+  'Add "appliesTo" (a short phrase saying when the memory matters) when the title does not make it obvious.',
   'Prefer few high-value memories over many trivial ones. Return at most the requested number.',
-  'Reply with JSON only, no prose and no code fence: {"memories":[{"scope":"global"|"project","title":string,"body":string,"tags":string[]}]}',
+  'Reply with JSON only, no prose and no code fence: {"memories":[{"scope":"global"|"project","kind":string,"title":string,"body":string,"tags":string[],"appliesTo":string}]}',
   'When nothing is worth remembering, reply exactly {"memories":[]}.',
 ].join('\n')
 
@@ -58,9 +66,11 @@ export const EXTRACT_JSON_SCHEMA = {
         required: ['scope', 'title', 'body'],
         properties: {
           scope: { type: 'string', enum: ['global', 'project'] },
+          kind: { type: 'string', enum: ['fact', 'preference', 'knowledge', 'failure', 'procedure'] },
           title: { type: 'string' },
           body: { type: 'string' },
           tags: { type: 'array', items: { type: 'string' } },
+          appliesTo: { type: 'string' },
         },
       },
     },
@@ -196,7 +206,17 @@ export function parseDrafts(text: string, maxMemories: number): MemoryDraft[] {
     const tags = Array.isArray(record['tags'])
       ? record['tags'].filter((tag): tag is string => typeof tag === 'string')
       : []
-    drafts.push({ scope: scope as MemoryScope, title: cleanTitle, body: cleanBody, tags })
+    const appliesTo = typeof record['appliesTo'] === 'string'
+      ? redactSecrets(record['appliesTo'].replace(/\s+/gu, ' ').trim()).slice(0, 160)
+      : ''
+    drafts.push({
+      scope: scope as MemoryScope,
+      kind: toMemoryKind(record['kind']),
+      title: cleanTitle,
+      body: cleanBody,
+      tags,
+      ...appliesTo.length > 0 ? { appliesTo } : {},
+    })
   }
   return drafts
 }

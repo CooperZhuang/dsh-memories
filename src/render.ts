@@ -7,6 +7,7 @@
  *
  * @module dsh-memories/render
  */
+import { MEMORY_KIND_HEADINGS, MEMORY_KINDS } from './types.js'
 import type { MemoryEntry, MemoryHit } from './types.js'
 import type { ScopeEntries } from './search.js'
 
@@ -111,7 +112,15 @@ export function renderMemorySummary(scopes: readonly SummaryScope[], options: Su
     const sections = populated.map((scope) => {
       const listed = scope.entries.slice(0, perScope)
       const omitted = scope.total - listed.length
-      const lines = [`## ${scope.heading} (${scope.total})`, ...listed.map((entry) => bullet(entry, maxChars))]
+      const lines = [`## ${scope.heading} (${scope.total})`]
+      // Within a scope, group by kind so the actionable memories (a preference
+      // to follow, a failure to avoid) are not buried among background facts.
+      for (const kind of MEMORY_KINDS) {
+        const group = listed.filter((entry) => entry.kind === kind)
+        if (group.length === 0) continue
+        lines.push(`### ${MEMORY_KIND_HEADINGS[kind]}`)
+        for (const entry of group) lines.push(bullet(entry, maxChars))
+      }
       if (omitted > 0) lines.push(`- … ${omitted} more not shown`)
       return lines.join('\n')
     })
@@ -124,7 +133,18 @@ export function renderMemorySummary(scopes: readonly SummaryScope[], options: Su
       attempts.push(render(maxChars, perScope))
     }
   }
-  attempts.push([MEMORY_OPEN, intro, guidance, '', ...populated.map((scope) => `## ${scope.heading} (${scope.total})`), MEMORY_CLOSE].join('\n'))
+  // Last resort: scope headings only, still inside the budget.
+  attempts.push([
+    MEMORY_OPEN,
+    intro,
+    guidance,
+    '',
+    ...populated.flatMap((scope) => MEMORY_KINDS
+      .map((kind) => ({ kind, count: scope.entries.filter((entry) => entry.kind === kind).length }))
+      .filter((group) => group.count > 0)
+      .map((group) => `## ${scope.heading} — ${MEMORY_KIND_HEADINGS[group.kind]} (${group.count})`)),
+    MEMORY_CLOSE,
+  ].join('\n'))
   for (const candidate of attempts) {
     if (bytes(candidate) <= options.maxBytes) return candidate
   }

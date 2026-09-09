@@ -21,7 +21,7 @@ import type { MemoryDraft, MemoryEntry, MemoryScope } from '../types.js'
 
 /** Build one entry. */
 function entry(partial: Partial<MemoryEntry> & Pick<MemoryEntry, 'id' | 'title' | 'body'>): MemoryEntry {
-  return { scope: 'global', tags: [], createdAt: 1, updatedAt: 1, uses: 0, lastUsedAt: 0, source: 'auto', ...partial }
+  return { scope: 'global', kind: 'fact', tags: [], createdAt: 1, updatedAt: 1, uses: 0, lastUsedAt: 0, source: 'auto', ...partial }
 }
 
 /** A stub subagent seam recording the request and replaying one reply. */
@@ -47,6 +47,7 @@ function target(initial: MemoryEntry[], failOn?: string) {
       const next: MemoryEntry = {
         id,
         scope: draft.scope,
+        kind: draft.kind ?? 'fact',
         title: draft.title,
         body: draft.body,
         tags: draft.tags,
@@ -155,8 +156,9 @@ test('applyPlan merges and retires through the target', async () => {
   const second = entry({ id: 'b', title: 'B', body: 'b' })
   const store = target([first, second])
   const result = await applyPlan({
-    upserts: [{ id: 'a', scope: 'global', title: 'A merged', body: 'merged', tags: [] }, { id: null, scope: 'project', title: 'New', body: 'new', tags: [] }],
+    upserts: [{ id: 'a', scope: 'global', kind: 'preference', title: 'A merged', body: 'merged', tags: [] }, { id: null, scope: 'project', kind: 'fact', title: 'New', body: 'new', tags: [] }],
     retire: ['b'],
+    skills: [],
     notes: 'merged',
   }, store.api, undefined, { entries: [first, second] })
   assert.deepEqual(result, { written: 2, retired: 1, notes: 'merged' })
@@ -170,10 +172,11 @@ test('applyPlan restores what it changed when a write fails', async () => {
   const store = target([first], 'b')
   await assert.rejects(() => applyPlan({
     upserts: [
-      { id: 'a', scope: 'global', title: 'A changed', body: 'changed', tags: [] },
-      { id: 'b', scope: 'global', title: 'B', body: 'b', tags: [] },
+      { id: 'a', scope: 'global', kind: 'fact', title: 'A changed', body: 'changed', tags: [] },
+      { id: 'b', scope: 'global', kind: 'fact', title: 'B', body: 'b', tags: [] },
     ],
     retire: [],
+    skills: [],
     notes: '',
   }, store.api, undefined, { entries: [first] }), /write exploded/u)
   // The first write is rolled back to the snapshot's content.

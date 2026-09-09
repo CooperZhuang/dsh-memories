@@ -17,6 +17,9 @@ import type { MemoryScope } from './types.js'
 /** The scopes the model may name. */
 const SCOPES = ['global', 'project'] as const
 
+/** The kinds the model may name. */
+const KINDS = ['fact', 'preference', 'knowledge', 'failure', 'procedure'] as const
+
 /** The actions the model may take. */
 const ACTIONS = ['write', 'search', 'read', 'forget'] as const
 
@@ -96,6 +99,15 @@ export function registerMemoryTool(ctx: Context, runtime: MemoriesRuntime): () =
         items: { type: 'string' },
         description: 'write/search: lowercase keyword tags.',
       },
+      kind: {
+        type: 'string',
+        enum: [...KINDS],
+        description: 'write: what kind of memory this is — preference (how the user wants work done), failure (what went wrong), procedure (an ordered recipe), knowledge (a non-obvious technique), fact (background). Defaults to fact.',
+      },
+      appliesTo: {
+        type: 'string',
+        description: 'write: a short phrase saying when this memory matters, when the title does not make it obvious.',
+      },
       query: {
         type: 'string',
         description: 'search: what to look for. Empty lists the most recent memories.',
@@ -131,6 +143,8 @@ export function registerMemoryTool(ctx: Context, runtime: MemoriesRuntime): () =
             title: title.slice(0, 120),
             body,
             tags: args.tags ?? [],
+            ...args.kind === undefined ? {} : { kind: args.kind },
+            ...args.appliesTo === undefined ? {} : { appliesTo: args.appliesTo },
           }, 'tool')
           const hint = args.scope === 'project'
             ? ' If this fact also applies to unrelated projects, write a global copy of it too.'
