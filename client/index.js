@@ -6,15 +6,11 @@
  * `factory(require)`, and mounts the exported plugin (`apply` + `inject`) into
  * the browser Cordis tree.
  *
- * It contributes two surfaces, both keyed to state the host already owns:
- *
- * - a **Memories page** (`settings.section`) that lists, searches, adds, and
- *   deletes memories through the Remote namespace the host registers;
- * - a **tunables card** (`settings.plugin.item`) keyed by the `memories`
- *   settings namespace, bound through `ctx.settingsScope` — the settings
- *   domain's own browser transport — so reads and writes ride the shared
- *   describe mirror and revision-fenced write path every shipped settings page
- *   uses, with no bespoke HTTP route.
+ * It contributes one surface, the **Memories page** (`settings.section`): it
+ * lists, searches, adds, and deletes memories through the Remote namespace the
+ * host registers, and it embeds the tunables card at its foot. The card is not
+ * also registered under `settings.plugin.item` — everything about this plugin
+ * lives on its own page, not in the crowded host-plugin configuration list.
  *
  * Written as plain CJS with `createElement` instead of JSX so the package needs
  * no bundler: the bundle only requires modules the browser already provides
@@ -52,11 +48,6 @@ function createPlugin(require) {
       React.useEffect(() => scope.subscribe(() => setValue(select(scope.getSnapshot()))), [scope])
       return value
     }
-    ctx.slots.inject('settings.plugin.item', () => ctx.slots.register({
-      name: 'settings.plugin.item',
-      key: NS,
-      inject: () => ({ scope, useSnapshot }),
-    }, Card))
 
     // The page is useless without the host API, but the tunables card is not, so
     // a missing gateway degrades this surface instead of failing the plugin.
