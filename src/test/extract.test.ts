@@ -15,7 +15,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { MemoriesRuntime } from '../index.js'
-import { EXTRACT_JSON_SCHEMA, collectWindow, extractionDelayMs, formatDelay, parseExtraction, redactSecrets, runExtraction } from '../extract.js'
+import { EXTRACT_JSON_SCHEMA, collectWindow, parseExtraction, redactSecrets, runExtraction } from '../extract.js'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Session } from '@deepseek-ai/dsh-session'
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
@@ -386,19 +386,6 @@ test('the settle timer actually runs a pass once its wait elapses', async (t) =>
   t.after(() => rm(dir, { recursive: true, force: true }))
 })
 
-test('the extraction delay is the larger of the two configured waits', () => {
-  // Scheduling for `autoExtractIdleMs` alone produced a pass that could never
-  // satisfy `minIdleHours`, and the timer is never re-armed — so with the shipped
-  // defaults (5 minutes against 6 hours) stage 1 never ran at all.
-  assert.equal(extractionDelayMs({ autoExtractIdleMs: 300_000, minIdleHours: 6 }), 6 * 3_600_000)
-  assert.equal(extractionDelayMs({ autoExtractIdleMs: 300_000, minIdleHours: 0 }), 300_000)
-  assert.equal(extractionDelayMs({ autoExtractIdleMs: 8 * 3_600_000, minIdleHours: 6 }), 8 * 3_600_000)
-  assert.equal(formatDelay(45_000), '45s')
-  assert.equal(formatDelay(300_000), '5m')
-  assert.equal(formatDelay(6 * 3_600_000), '6h')
-  assert.equal(formatDelay(6.5 * 3_600_000), '6h30m')
-})
-
 test('the exit flush mines a session that never had its quiet window', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-flush-'))
   const session = stubSession(process.cwd(), [{ seq: 1, role: 'user', text: 'We always ship with pnpm run ship.' }])
@@ -420,5 +407,34 @@ test('the exit flush mines a session that never had its quiet window', async (t)
   assert.equal(await runtime.flushExit(5_000), 1, 'the exit boundary ignores the quiet window')
   // The watermark is keyed by the session, not by the agent id.
   assert.equal(runtime.state.getSession('extract-session')?.lastSeq, 1)
+  t.after(() => rm(dir, { recursive: true, force: true }))
+})
+
+test('peak hours hold back the automatic passes but not an explicit one', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-peak-'))
+  const session = stubSession(process.cwd(), [{ seq: 1, role: 'user', text: 'We always ship with pnpm run ship.' }])
+  const reply = '{"memories":[{"scope":"project","title":"Deploy with pnpm run ship","body":"Ship this project with `pnpm run ship`.","tags":["deploy"]}]}'
+  // `* 00:00-24:00` is peak forever, which makes the gate deterministic to test;
+  // a real timetable would only be in or out depending on when the suite runs.
+  const runtime = new MemoriesRuntime(stubContext(fakeLlm(reply)), {
+    memoriesDir: dir,
+    autoExtract: true,
+    minIdleHours: 0,
+    peakHours: '* 00:00-24:00',
+    extractTimeoutMs: 5_000,
+  })
+  t.after(() => runtime.dispose())
+  const agent = {
+    id: 'peak-session',
+    session,
+    status: 'idle',
+    runMaintenance: async (task: (signal: AbortSignal) => Promise<number>) => await task(new AbortController().signal),
+  } as unknown as Agent
+
+  runtime.scheduleExtraction(agent)
+  await new Promise((settle) => setTimeout(settle, 1_300))
+  assert.equal(runtime.state.getSession('extract-session'), undefined, 'the settle timer waits the window out')
+  assert.equal(await runtime.flushExit(5_000), 0, 'the exit flush is an automatic spend, so it defers too')
+  assert.equal(await runtime.mineNow(agent), 1, 'an explicit /memories mine ignores the window')
   t.after(() => rm(dir, { recursive: true, force: true }))
 })

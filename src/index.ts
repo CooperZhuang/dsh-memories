@@ -39,7 +39,8 @@ import type { SummaryScope } from './render.js'
 import { findProjectRoot } from './workspace.js'
 import { planRetention, retentionKey } from './retention.js'
 import { MemoryLog, createFileSink, createLogExporter, pluginLogger } from './log.js'
-import { collectWindow, extractionDelayMs, formatDelay, runExtraction } from './extract.js'
+import { collectWindow, runExtraction } from './extract.js'
+import { backgroundDelayMs, extractionDelayMs, formatDelay, parsePeakHours, peakDelayMs } from './schedule.js'
 import { applyPlan, denyToolsFor, runConsolidation, selectForConsolidation } from './consolidate.js'
 import { discardDraft, listDrafts, promote, writeDraft } from './skills.js'
 import type { ConsolidationTarget, SubagentSeam } from './consolidate.js'
@@ -586,10 +587,32 @@ export class MemoriesRuntime {
     if (!this.eligible(agent.session)) return
     this.track(agent)
     this.idleSince.set(agent, Date.now())
+    this.armTimer(agent, backgroundDelayMs(this.settings, new Date()))
+  }
+
+  /**
+   * Arm (or re-arm) one agent's settle timer.
+   *
+   * Kept separate from {@link scheduleExtraction} because a re-arm must not touch
+   * `idleSince`: deferring a pass out of the peak window and then resetting the
+   * quiet-window clock would push the pass back by the full window every time.
+   *
+   * @param agent - the agent whose pass is being waited for.
+   * @param delayMs - how long to wait.
+   */
+  private armTimer(agent: Agent, delayMs: number): void {
     const existing = this.idleTimers.get(agent)
     if (existing !== undefined) clearTimeout(existing)
     const timer = setTimeout(() => {
       this.idleTimers.delete(agent)
+      // Still inside a peak window? Wait for it to end rather than spending now —
+      // the settle clock keeps running, so the pass runs as soon as it is cheap.
+      const penalty = peakDelayMs(this.settings.peakHours, new Date())
+      if (penalty > 0) {
+        this.log.decision('dsh-memories: session %s deferred for %s of peak hours', agent.session.id, formatDelay(penalty))
+        this.armTimer(agent, penalty)
+        return
+      }
       void this.mine(agent).then(
         async (stored) => {
           // New material is what makes a consolidation pass worth running; the
@@ -605,7 +628,7 @@ export class MemoriesRuntime {
           if (!this.lifecycle.signal.aborted) this.log.warn('dsh-memories: extraction failed for session %s: %o', agent.session.id, error)
         },
       )
-    }, extractionDelayMs(this.settings))
+    }, delayMs)
     timer.unref?.()
     this.idleTimers.set(agent, timer)
   }
@@ -623,6 +646,13 @@ export class MemoriesRuntime {
     if (job === undefined) return
     if (job.notBefore > Date.now()) return
     if (agent.status !== 'idle') return
+    // The job stays queued: the settle timer re-arms for the end of the window,
+    // so a pass skipped here gets its turn as soon as tokens are cheap again.
+    const penalty = peakDelayMs(this.settings.peakHours, new Date())
+    if (penalty > 0) {
+      this.log.decision('dsh-memories: consolidation deferred for %s of peak hours', formatDelay(penalty))
+      return
+    }
     await this.consolidateNow(agent)
   }
 
@@ -653,14 +683,22 @@ export class MemoriesRuntime {
    * phase is skipped; the next settle pass tries again.
    *
    * @param agent - the settled agent to mine.
-   * @param force - mine even without a quiet window; the exit flush passes it,
-   *   because a session being torn down is finished by definition and would
-   *   otherwise never be mined by a process that exits before `minIdleHours`.
+   * @param options - which gates to ignore. The exit flush passes
+   *   `ignoreIdleWindow` (a session being torn down is finished by definition)
+   *   but still respects peak hours, because it is an automatic spend.
    * @returns how many drafts were stored.
    */
-  private async mine(agent: Agent, force = false): Promise<number> {
+  private async mine(agent: Agent, options: { ignoreIdleWindow?: boolean; ignorePeakHours?: boolean } = {}): Promise<number> {
     if (this.sessionOff(agent.session)) return 0
-    if (!force) {
+    if (options.ignorePeakHours !== true) {
+      const penalty = peakDelayMs(this.settings.peakHours, new Date())
+      if (penalty > 0) {
+        this.log.decision('dsh-memories: not mining session %s, %s of peak hours remain',
+          agent.session.id, formatDelay(penalty))
+        return 0
+      }
+    }
+    if (options.ignoreIdleWindow !== true) {
       if (agent.status !== 'idle') return 0
       if (!this.idleEnough(agent)) {
         this.log.decision('dsh-memories: session %s is not quiet enough yet, still inside the %sh window',
@@ -669,7 +707,7 @@ export class MemoriesRuntime {
       }
     }
     try {
-      return await agent.runMaintenance(async (signal) => this.runExtraction(agent, signal, force))
+      return await agent.runMaintenance(async (signal) => this.runExtraction(agent, signal, true))
     } catch (error) {
       // Claiming the idle phase can be refused (a wake arrived first), and a
       // broken seam should not be silent: the pass is skipped either way.
@@ -724,10 +762,10 @@ export class MemoriesRuntime {
       if (budget.aborted || mined >= limit) break
       mined += 1
       try {
-        // Forced: at this boundary the session is over, so the quiet-window gate
-        // would only guarantee that a process which exits before `minIdleHours`
-        // never mines anything.
-        stored += await this.mine(agent, true)
+        // Forced past the quiet window: at this boundary the session is over, so
+        // that gate would only guarantee a process which exits before
+        // `minIdleHours` never mines anything. Peak hours still apply.
+        stored += await this.mine(agent, { ignoreIdleWindow: true })
       } catch (error) {
         if (!budget.aborted) this.log.warn('dsh-memories: exit extraction failed for session %s: %o', agent.session.id, error)
       }
@@ -1074,10 +1112,41 @@ export class MemoriesRuntime {
     return `, sweep every ${this.settings.sweepIntervalHours}h (last ${when})`
   }
 
+  /**
+   * Warn about tunables whose text did not parse.
+   *
+   * A `peakHours` typo silently disables the whole restriction — exactly the kind
+   * of quiet failure this plugin keeps working to avoid — so the settings watcher
+   * calls this and a bad edit says so immediately.
+   */
+  reportSettingsIssues(): void {
+    const spec = this.settings.peakHours
+    if (spec.length === 0) return
+    const { invalid } = parsePeakHours(spec)
+    if (invalid.length === 0) return
+    this.log.warn('dsh-memories: peakHours entries not understood, so they are ignored: %s', invalid.join('; '))
+  }
+
   /** Where this plugin's log is going, or why it is not. */
   private logDestination(): string {
     if (this.deployment.logFile.length === 0) return 'off'
     return this.logSinkError ?? this.deployment.logFile
+  }
+
+  /**
+   * One line describing the peak-hours rule, for `/memories stats`.
+   *
+   * It reports whether a pass would be deferred *right now*, because that is the
+   * question somebody reading the line is actually asking ("why isn't it
+   * mining?").
+   */
+  private peakLine(now = new Date()): string {
+    const spec = this.settings.peakHours
+    if (spec.length === 0) return 'off'
+    const { invalid } = parsePeakHours(spec)
+    const penalty = peakDelayMs(spec, now)
+    const state = penalty > 0 ? `deferring for ${formatDelay(penalty)}` : 'clear now'
+    return `${spec} (${state})${invalid.length > 0 ? ` — unparsed: ${invalid.join('; ')}` : ''}`
   }
 
   /** This session's memory switch. */
@@ -1145,7 +1214,8 @@ export class MemoriesRuntime {
     const lines = [
       `memory home: ${this.store.memoriesDir}`,
       ...states.map((scope) => `${scope.label}: ${scope.entries.length} memories`),
-      `auto-extract: ${this.settings.autoExtract ? `on (mine after ${formatDelay(extractionDelayMs(this.settings))} idle, ≤${this.settings.maxAgeDays}d old)` : 'off'}`,
+      `auto-extract: ${this.settings.autoExtract ? `on (wait ${formatDelay(extractionDelayMs(this.settings))} idle, ≤${this.settings.maxAgeDays}d old)` : 'off'}`,
+      `peak-hours: ${this.peakLine()}`,
       `recall: ${this.settings.recallMode} (score ≥${this.settings.recallMinScore}, ≤${this.settings.recallMaxPerConversation} per conversation)`,
       `retention: ${this.settings.maxUnusedDays > 0 ? `archive after ${this.settings.maxUnusedDays}d unused` : 'off'}${this.sweepLine()}`,
       `session mode: ${this.sessionMode(session)}`,
@@ -1268,6 +1338,8 @@ export function apply(ctx: Context, config: MemoriesConfig = {}): void {
   const read = (): MemoriesSettings => current
   /** Assigned once the live registrations exist; a no-op until then. */
   let liveRegistrations = (): void => undefined
+  /** Assigned once the runtime exists, so a settings commit can report a bad value. */
+  let reportIssues = (): void => undefined
 
   // The settings seam is optional: a deployment that composes no provider
   // keeps the row-level defaults and simply has no settings document.
@@ -1279,6 +1351,7 @@ export function apply(ctx: Context, config: MemoriesConfig = {}): void {
       ctx.effect(() => scope.watch((next) => {
         current = normalizeSettings(next)
         liveRegistrations()
+        reportIssues()
       }), 'dsh-memories.settingsWatch')
     } catch (error) {
       log.warn('dsh-memories: settings registration failed, using row defaults: %o', error)
@@ -1287,6 +1360,8 @@ export function apply(ctx: Context, config: MemoriesConfig = {}): void {
 
   const runtime = new MemoriesRuntime(ctx, config, read)
   ctx.effect(() => () => runtime.dispose(), 'dsh-memories.lifecycle')
+  reportIssues = () => runtime.reportSettingsIssues()
+  runtime.reportSettingsIssues()
 
   // The host logger drops `warn` and `debug` before any sink sees them: the only
   // exporter a stock composition installs declares no level, so the threshold

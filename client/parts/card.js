@@ -117,9 +117,9 @@ const FIELDS = [
     hint: { zh: '一次抽取最多写入多少条记忆。', en: 'Maximum memories one extraction pass may store.' },
   },
   {
-    field: 'minIdleHours', kind: 'number', min: 0, step: 1,
+    field: 'minIdleHours', kind: 'number', min: 0, step: 0.5,
     label: { zh: '挖掘前最短空闲（小时）', en: 'Minimum idle before mining (hours)' },
-    hint: { zh: '会话至少要空闲这么久才会被挖掘，0 关闭该闸门。', en: 'A session must have been idle at least this long before it is mined. 0 disables the gate.' },
+    hint: { zh: '会话至少要空闲这么久才会被挖掘，可填小数（0.5 = 半小时）；实际等待取它与「抽取前空闲时长」的较大者。0 关闭该闸门。', en: 'A session must have been idle at least this long before it is mined. Fractions are allowed (0.5 = half an hour); the effective wait is the larger of this and the idle delay above. 0 disables the gate.' },
   },
   {
     field: 'maxAgeDays', kind: 'number', min: 0, step: 1,
@@ -212,6 +212,11 @@ const FIELDS = [
     field: 'traceMaintenance', kind: 'boolean',
     label: { zh: '记录维护决策明细', en: 'Trace maintenance decisions' },
     hint: { zh: '把归档、按需补注、复审选择等决策提升到 info，默认等级就能看到；关闭时它们只在 debug 等级出现。', en: 'Log retention, recall, and selection decisions at info so a stock log level records them; off keeps them at debug.' },
+  },
+  {
+    field: 'peakHours', kind: 'text',
+    label: { zh: '错峰时段（避开高峰）', en: 'Peak hours to avoid' },
+    hint: { zh: '本地时间的「高价时段」，后台抽取与合并会推迟到窗口之外；留空不限制。DeepSeek 用 "Mon-Fri 09:00-12:00, Mon-Fri 14:00-18:00"（北京时间，峰价是谷价 2 倍；周末与夜间全为谷时）。手动 /memories mine 与 consolidate 不受此限制。', en: 'Local-time windows whose tokens cost more; background extraction and consolidation are deferred out of them. Empty means no restriction. For DeepSeek use "Mon-Fri 09:00-12:00, Mon-Fri 14:00-18:00" (Beijing time; peak is double price and weekends are always off-peak). /memories mine and consolidate ignore this.' },
   },
 ]
 

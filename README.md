@@ -75,12 +75,28 @@
 
 **有效等待时间是 `max(autoExtractIdleMs, minIdleHours)`**，这一条容易看漏：定时器只在会话转入空闲时
 武装一次、触发后不重排，所以若按 `autoExtractIdleMs`（默认 5 分钟）定闹钟、却要求空闲满 `minIdleHours`
-（默认 6 小时）才放行，那次触发必然被拒，之后再也不会有第二次——默认配置下阶段 1/2 等于从不执行。
-现在定时器直接等到两个闸门都满足的时刻。`/memories mine` 与**进程退出兜底**不受空闲窗口限制：
-会话都要结束了，「它还在动」这个理由不再成立。
+才放行，那次触发必然被拒，之后再也不会有第二次——默认配置下阶段 1/2 等于从不执行。
+现在定时器直接等到两个闸门都满足的时刻。两个值都支持小数（`minIdleHours: 0.5` = 半小时）。
+`/memories mine` 与**进程退出兜底**不受空闲窗口限制：会话都要结束了，「它还在动」这个理由不再成立。
 
-`/memories stats` 里的 `auto-extract` 一行显示的就是这个**有效等待**，`sessions: N mined / M tracked`
-则区分「真正抽取完成的会话」与「只是留下过活动记录的会话」——两者差得很多时，说明抽取根本没跑起来。
+**错峰（`peakHours`）**：阶段 1 抽取与阶段 2 合并是全插件仅有的两处模型调用，也就是仅有的花钱处。
+`peakHours` 按**本地时间**列出「高价时段」，两个 pass 都会被推迟到窗口之外；留空则不限制。
+定时器重排时**不会重置空闲计时**，所以谷时一到就立刻补跑，而不是再等一整个窗口。
+手动 `/memories mine` 与 `/memories consolidate` 不受限制——那是你明确要求的调用，代价自己承担。
+DeepSeek 的现价（2026-09-10 起）是**工作日 09:00-12:00 与 14:00-18:00 为峰时、峰价 = 谷价 ×2**，
+其余（含整个周末、工作日午休与夜间）都是谷时，所以推荐值就是我们给的那一档：
+
+```yaml
+memories:
+  peakHours: "Mon-Fri 09:00-12:00, Mon-Fri 14:00-18:00"
+```
+
+语法：`[星期] HH:MM-HH:MM`，逗号分隔多条；星期可写 `Mon-Fri`、`Mon+Wed`、`sat` 或 `*`（省略 = 每天），
+窗口跨午夜也支持（`Sat 22:00-02:00`）。解析不了的条目会被忽略，并在 `/memories stats` 与日志里报出来。
+
+`/memories stats` 里的 `auto-extract` 一行显示**有效空闲等待**，`peak-hours` 一行显示当前是否正在避峰
+（`deferring for 2h` / `clear now`），`sessions: N mined / M tracked` 则区分「真正抽取完成的会话」
+与「只是留下过活动记录的会话」——两者差得很多时，说明抽取根本没跑起来。
 
 摘要内容按**统一打分**排序：`相关度 × 重要度 × 新近度衰减`。重要度来自被 `memory_search` 命中的次数，新近度按 90 天半衰期衰减但**不降到 0.25 以下**——久远但精确的记忆仍然排得进有界摘要。同一个公式也用于工具检索和按需补注，所以「值得回忆」在三处是同一个意思。
 
@@ -148,7 +164,8 @@ memories:
 | `extractMaxOutputTokens` | `2048` | 抽取调用的输出上限 |
 | `extractTimeoutMs` | `120000` | 抽取调用超时 |
 | `extractMaxMemories` | `5` | 一次抽取最多产出多少条记忆 |
-| `minIdleHours` | `6` | 会话至少空闲这么久才可被抽取；实际等待取它与 `autoExtractIdleMs` 的较大者 |
+| `minIdleHours` | `6` | 会话至少空闲这么久才可被抽取，支持小数（`0.5` = 半小时）；实际等待取它与 `autoExtractIdleMs` 的较大者 |
+| `peakHours` | 空 | 本地时间的错峰规则，后台抽取/合并会推迟到窗口外；留空不限制。DeepSeek 用 `"Mon-Fri 09:00-12:00, Mon-Fri 14:00-18:00"` |
 | `maxAgeDays` | `10` | 最后活动早于此天数的会话永不被抽取 |
 | `maxSessionsPerPass` | `2` | 一次抽取最多处理多少个会话（新的优先） |
 | `consolidate` | `true` | 是否启用阶段 2 合并重整 |
@@ -267,7 +284,8 @@ grep '\[warn\]' ~/.dsh/logs/dsh-memories.log   # 只看警告
 ```
 
 `/memories stats` 会打印当前等级与文件路径，同时也是最快的一眼诊断：store 位置、两作用域条数、
-抽取/补注/保留配置与**有效抽取等待**、`sessions: N mined / M tracked`、后台是否被额度暂停、
+抽取/补注/保留配置与**有效抽取等待**、当前是否在**避峰**、`sessions: N mined / M tracked`、
+后台是否被额度暂停、
 状态库是不是降级成了纯内存、以及日志文件写不出来时的原因。
 
 等级含义是「该级别及以上」，所以 `off` < `error` < `warn` < `info` < `debug`。默认 `info` =
@@ -431,9 +449,14 @@ dsh --profile web --patch ./fast.yml
 ## 已知取舍
 
 - 抽取是**事后**的，而且只在长驻进程里按空闲时间触发：会话要空闲到
-  `max(autoExtractIdleMs, minIdleHours)`（默认 6 小时）才会被抽取。进程退出时还有一次
-  **兜底抽取**（不受空闲窗口限制，预算 8 秒），所以「聊完就关」通常也能被抽到；真正确保抽到的
-  手段仍是 `/memories mine`。
+  `max(autoExtractIdleMs, minIdleHours)` 才会被抽取（配了 `peakHours` 时还要等出谷时）。
+  进程退出时还有一次
+  **兜底抽取**（不受空闲窗口限制、预算 8 秒，但同样遵守 `peakHours`），所以「聊完就关」通常也能被
+  抽到；真正确保抽到的
+  手段仍是 `/memories mine`（它不受任何时间限制）。
+- **避峰会让记忆晚一点落盘**，换来的是这些调用打对折。如果一次会话的尾巴正好赶上峰时结束前就被
+  挤出抽取窗口（`extractWindowMessages`，默认 30 条），那段内容可能轮不到——想立刻落盘就
+  `/memories mine`。
 - 检索是**词法匹配**（标题/正文/tag 加权 + 使用频次 + 新近度），不是向量检索。
 - 项目记忆按工作区根划分，**同一仓库的多个 clone 是两份独立记忆**（因为路径不同）。
 - 摘要有字节预算，记忆很多时只会列出最相关的一部分，其余靠 `memory_search` 取。
@@ -467,7 +490,8 @@ dsh --profile web --patch ./fast.yml
 | 重启后不重复注入 | ✅ 真实 API + 真实日志：`Session.deriveMessages()` 对注入的 recall 消息返回 `source={kind:'plugin',plugin:'memories',form:'recall'}`（判据成立），且该消息在会话日志里是普通持久事件（重启后随历史恢复） |
 | 保留/归档/定期整理/按需补注/键扩展（本轮新增） | ⏳ 单元测试覆盖：保留判定、归档往返、状态列迁移、按需补注三道闸门、检索 eval 语料（hit@3 100%）与抽取 eval fixture；真机行为待下一轮复核 |
 | 日志落盘（本轮新增） | ✅ 真实 cordis 激活（真服务 + 真 exporter）：`logLevel: info` 下文件里写出了启动行、`archiving global/ancient, unused for 9750 days`、`archived 1 unused memories`，归档文件带 `archived:` 时间戳；`warn`/`debug` 不再被宿主阈值丢弃由 `src/test/log.test.ts` 的真实 Context 测试钉住 |
-| 抽取定时器 / 退出兜底 / 日志名过滤 / sessions 计数（缺陷修复） | ✅ 现场证据：真实库 `sessions_total=59` 而 `last_seq>0` **为 0**（阶段 1/2 从未执行），根因是 5 分钟定时器配 6 小时静默闸门且不重排；修复后定时器等到 `max(autoExtractIdleMs, minIdleHours)`、退出兜底与 `/memories mine` 绕过该闸门（均由新单测钉住）。真实 cordis 探针确认日志文件**只含本插件的行**（web-server / auto-thinking-effort 的噪音被排除）、stats 输出 `auto-extract: on (mine after 6h idle …)` 与 `sessions: N mined / M tracked` |
+| 抽取定时器 / 退出兜底 / 日志名过滤 / sessions 计数（缺陷修复） | ✅ 现场证据：真实库 `sessions_total=59` 而 `last_seq>0` **为 0**（阶段 1/2 从未执行），根因是 5 分钟定时器配 6 小时静默闸门且不重排；修复后定时器等到 `max(autoExtractIdleMs, minIdleHours)`、退出兜底与 `/memories mine` 绕过该闸门（均由新单测钉住）。真实 cordis 探针确认日志文件**只含本插件的行**（web-server / auto-thinking-effort 的噪音被排除）、stats 输出 `auto-extract: on (wait 6h idle …)` 与 `sessions: N mined / M tracked` |
+| 错峰调度 `peakHours`（本轮新增） | ✅ 单元测试覆盖星期几/跨午夜/非法条目/延迟计算与「自动 pass 让路、手动命令不让路」（19 项 schedule 测试）。价格口径来自官方 2026-09-10 起的峰谷规则（工作日 09:00-12:00 + 14:00-18:00 峰时，峰价 = 谷价 ×2，周末全谷时）。真机行为待下一轮复核 |
 
 > 「多轮不重注入」这一条目前是**单元测试 + 单轮真机进程**两重证据：本轮想用浏览器复核时，web
 > profile 里另外几个插件把 GUI 挡住了（`dsh-message-edit` 缺 `@deepseek-ai/dsh-client-runtime/client`、

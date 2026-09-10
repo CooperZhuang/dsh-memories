@@ -118,6 +118,16 @@ export const DEFAULT_LOG_LEVEL = 'info' as const
 
 /** Default for logging every maintenance decision rather than only pass summaries. */
 export const DEFAULT_TRACE_MAINTENANCE = false
+
+/**
+ * Default peak-hours spec: none.
+ *
+ * Deliberately empty rather than pre-filled with one provider's timetable: this
+ * plugin can run on any route, and silently refusing to work at certain hours
+ * would be a surprising default. The description names a value that suits
+ * DeepSeek.
+ */
+export const DEFAULT_PEAK_HOURS = ''
 /**
  * The tunable settings section: one schema shared by the settings seam, the
  * GUI form, and the runtime. Every field carries its default, so an absent
@@ -189,6 +199,8 @@ export const MemoriesSettingsSchema = z.object({
   logLevel: z.string().default(DEFAULT_LOG_LEVEL).description('How much dsh-memories writes to its log file: off, error, warn, info, or debug. info keeps errors, warnings, and pass summaries; debug adds per-entry decisions.'),
   /** Whether maintenance decisions are logged at info, where a stock logLevel keeps them. */
   traceMaintenance: z.boolean().default(DEFAULT_TRACE_MAINTENANCE).description('Log every retention, recall, and selection decision at info instead of debug. Off keeps the file to one line per pass.'),
+  /** Local-time windows whose tokens are the expensive ones. */
+  peakHours: z.string().default(DEFAULT_PEAK_HOURS).description('Local-time peak windows to keep the plugin\'s model calls out of, for example "Mon-Fri 09:00-12:00, Mon-Fri 14:00-18:00" (DeepSeek charges double then, Beijing time). Background extraction and consolidation are deferred to the next off-peak moment; /memories mine and /memories consolidate ignore this. Empty disables the restriction.'),
 })
 
 /** The tunable section's value type, inferred from the settings schema. */
@@ -230,6 +242,7 @@ export const MEMORIES_SETTINGS_DEFAULTS: MemoriesSettings = {
   enableCommand: true,
   logLevel: DEFAULT_LOG_LEVEL,
   traceMaintenance: DEFAULT_TRACE_MAINTENANCE,
+  peakHours: DEFAULT_PEAK_HOURS,
 }
 
 /** Deployment-layer configuration: paths and workspace discovery. */
@@ -286,6 +299,7 @@ export interface MemoriesConfig {
   enableCommand?: boolean
   logLevel?: string
   traceMaintenance?: boolean
+  peakHours?: string
 }
 
 /** Fully resolved deployment configuration. */
@@ -317,6 +331,17 @@ function clampUnit(value: number | undefined, fallback: number): number {
   return value >= 1 ? 1 : value
 }
 
+/**
+ * Clamp one tunable that accepts fractions, such as a wait in hours.
+ *
+ * `positive` truncates, which would turn `minIdleHours: 0.5` — half an hour —
+ * into `0`, silently disabling the gate it configures.
+ */
+function decimal(value: number | undefined, fallback: number, min = 0): number {
+  if (value === undefined || !Number.isFinite(value)) return fallback
+  return value < min ? min : value
+}
+
 /** Coerce one possibly-absent tunable set into a complete, clamped section. */
 export function normalizeSettings(input: Partial<MemoriesSettings> | undefined): MemoriesSettings {
   const value = input ?? {}
@@ -341,7 +366,7 @@ export function normalizeSettings(input: Partial<MemoriesSettings> | undefined):
     maxEntriesPerScope: positive(value.maxEntriesPerScope, DEFAULT_MAX_ENTRIES_PER_SCOPE),
     maxUnusedDays: positive(value.maxUnusedDays, DEFAULT_MAX_UNUSED_DAYS, 0),
     dedupeSimilarity: clampUnit(value.dedupeSimilarity, DEFAULT_DEDUPE_SIMILARITY),
-    sweepIntervalHours: positive(value.sweepIntervalHours, DEFAULT_SWEEP_INTERVAL_HOURS, 0),
+    sweepIntervalHours: decimal(value.sweepIntervalHours, DEFAULT_SWEEP_INTERVAL_HOURS),
     autoExtract: value.autoExtract ?? true,
     autoExtractIdleMs: positive(value.autoExtractIdleMs, DEFAULT_AUTO_EXTRACT_IDLE_MS, 1000),
     extractWindowMessages: positive(value.extractWindowMessages, DEFAULT_EXTRACT_WINDOW_MESSAGES),
@@ -349,11 +374,11 @@ export function normalizeSettings(input: Partial<MemoriesSettings> | undefined):
     extractMaxOutputTokens: positive(value.extractMaxOutputTokens, DEFAULT_EXTRACT_MAX_OUTPUT_TOKENS),
     extractTimeoutMs: positive(value.extractTimeoutMs, DEFAULT_EXTRACT_TIMEOUT_MS),
     extractMaxMemories: positive(value.extractMaxMemories, DEFAULT_EXTRACT_MAX_MEMORIES),
-    minIdleHours: positive(value.minIdleHours, DEFAULT_MIN_IDLE_HOURS, 0),
+    minIdleHours: decimal(value.minIdleHours, DEFAULT_MIN_IDLE_HOURS),
     maxAgeDays: positive(value.maxAgeDays, DEFAULT_MAX_AGE_DAYS, 0),
     maxSessionsPerPass: positive(value.maxSessionsPerPass, DEFAULT_MAX_SESSIONS_PER_PASS),
     consolidate: value.consolidate ?? true,
-    consolidateCooldownHours: positive(value.consolidateCooldownHours, DEFAULT_CONSOLIDATE_COOLDOWN_HOURS, 0),
+    consolidateCooldownHours: decimal(value.consolidateCooldownHours, DEFAULT_CONSOLIDATE_COOLDOWN_HOURS),
     consolidateMaxEntries: positive(value.consolidateMaxEntries, DEFAULT_CONSOLIDATE_MAX_ENTRIES),
     consolidateTimeoutMs: positive(value.consolidateTimeoutMs, DEFAULT_CONSOLIDATE_TIMEOUT_MS),
     pauseOnQuotaError: value.pauseOnQuotaError ?? true,
@@ -365,6 +390,7 @@ export function normalizeSettings(input: Partial<MemoriesSettings> | undefined):
     enableCommand: value.enableCommand ?? true,
     logLevel: toLogLevel(value.logLevel, DEFAULT_LOG_LEVEL),
     traceMaintenance: value.traceMaintenance ?? false,
+    peakHours: (value.peakHours ?? '').replace(/\s+/gu, ' ').trim(),
   }
 }
 
