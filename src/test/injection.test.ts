@@ -23,14 +23,15 @@ const stubContext = {
   logger: { info: () => undefined, warn: () => undefined, debug: () => undefined },
 } as never
 
-/** A session stand-in: the runtime only reads the header, id, and header fold. */
-function stubSession(cwd: string): Session {
+/** A session stand-in: header, id, header fold, and a controllable history. */
+function stubSession(cwd: string, history: readonly unknown[] = []): Session {
   let seq = 1
   return {
     id: 'test-session',
     header: { version: 0, id: 'test-session', createdAt: 0, cwd, isSeeded: false },
     get seq() { return seq += 1 },
     requestHeader: () => undefined,
+    deriveMessages: () => [...history],
   } as unknown as Session
 }
 
@@ -62,13 +63,36 @@ test('injection is once per conversation, not once per turn', async (t) => {
   await runtime.write(agent.session, { scope: 'global', title: 'Answer in Chinese', body: 'The user writes Chinese.', tags: [] }, 'tool')
   assert.equal(await runtime.injectionFor(agent), undefined, 'a write never re-injects')
 
-  // `clear`/`compact` replace the conversation, so the block must come back.
+  // `clear`/`compact` replace the conversation, so a session that carries
+  // nothing (the stub's empty history) gets the block again.
   runtime.resetInjection(agent.session)
   const second = await runtime.injectionFor(agent)
   assert.ok(second !== undefined, 'a reset re-arms injection')
   assert.notEqual(second.id, first.id)
   assert.match(JSON.stringify(second.content), /Answer in Chinese/u)
 
+  t.after(() => rm(dir, { recursive: true, force: true }))
+})
+test('a restarted harness does not re-inject into a conversation that already carries the block', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-restart-'))
+  const first = new MemoriesRuntime(stubContext, { memoriesDir: dir, autoExtract: false })
+  t.after(() => first.dispose())
+  const session = stubSession(dir)
+  await first.write(session, { scope: 'global', title: 'Prefer pnpm', body: 'Use pnpm, not npm.', tags: ['tooling'] }, 'tool')
+  const block = await first.injectionFor(stubAgent(session))
+  assert.ok(block !== undefined, 'the first process injects once')
+
+  // A fresh runtime models a restarted process. The block travelled with the
+  // durable history, so resuming that conversation must not add a second copy —
+  // which is exactly what an in-memory-only marker could not see.
+  const second = new MemoriesRuntime(stubContext, { memoriesDir: dir, autoExtract: false })
+  t.after(() => second.dispose())
+  assert.equal(await second.injectionFor(stubAgent(stubSession(dir, [block]))), undefined, 'a restored history already carries the block')
+
+  // A cleared conversation carries nothing, so the block legitimately returns.
+  assert.ok(await second.injectionFor(stubAgent(stubSession(dir))) !== undefined, 'a cleared conversation gets the block again')
+
+  // Both stores must be closed before the temp directory goes.
   t.after(() => rm(dir, { recursive: true, force: true }))
 })
 

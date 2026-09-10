@@ -252,12 +252,17 @@ export class MemoriesRuntime {
    * The block enters exactly ONCE per conversation: at the first step where the
    * store has something to say. Nothing re-injects afterwards, so a long session
    * pays for its memories once instead of once per turn, and every later recall
-   * goes through `memory_search`. `clear`/`compact` replace the conversation and
-   * therefore drop the block with it, which is why {@link resetInjection} re-arms
-   * this state there.
+   * goes through `memory_search`.
    *
-   * An empty store deliberately leaves the state unset: the block should still
-   * appear later if the first memory arrives after the session started.
+   * "Once" is decided by the CONVERSATION, not by this process: the block is a
+   * durable user message, so {@link carriesRecall} answers whether the model can
+   * already see one. A restarted harness restores that message with the rest of
+   * the history, so it does not inject a second copy; `clear` and `compact`
+   * replace the history and therefore legitimately bring the block back (which is
+   * why {@link resetInjection} drops this process's cache there).
+   *
+   * An empty store deliberately leaves the session unmarked: the block should
+   * still appear later if the first memory arrives after the session started.
    *
    * @param agent - the agent whose next step is being prepared.
    * @returns the message to enter the conversation, or `undefined` when this
@@ -265,7 +270,12 @@ export class MemoriesRuntime {
    */
   async injectionFor(agent: Agent): Promise<UserMessage | undefined> {
     const session = agent.session
+    // The cache only avoids re-reading the history on every step of a turn.
     if (this.injected.has(session)) return undefined
+    if (this.carriesRecall(session)) {
+      this.injected.add(session)
+      return undefined
+    }
     const text = await this.summary(session)
     if (text === undefined) return undefined
     this.injected.add(session)
@@ -273,6 +283,24 @@ export class MemoriesRuntime {
       content: [{ type: 'text', text }],
       source: { kind: 'plugin', plugin: name, form: 'recall' },
     })
+  }
+
+  /**
+   * Whether the model-visible history already carries a memory block.
+   *
+   * `deriveMessages` projects each surface node exactly once and caches the
+   * result, so asking is cheap even on a long session. Any failure reads as "no
+   * block", whose worst case is one redundant injection — never a failed turn.
+   */
+  private carriesRecall(session: Session): boolean {
+    try {
+      return session.deriveMessages().some((message) => {
+        const source = message.source
+        return source.kind === 'plugin' && source.plugin === name && source.form === 'recall'
+      })
+    } catch {
+      return false
+    }
   }
 
   /** Re-arm injection for one session (used on `clear`/`compact` restarts). */
