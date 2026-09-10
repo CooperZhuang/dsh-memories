@@ -32,17 +32,20 @@ import type { MemoriesConfig, MemoriesSettings, ResolvedConfig } from './config.
 import type { SettingsProvider } from '@deepseek-ai/dsh-settings'
 import { MemoryStore, slugify } from './storage.js'
 import { StateStore, importLegacyState, statePath } from './state.js'
-import { browseMemories, searchMemories } from './search.js'
+import { browseMemories, relevanceOf, scoreEntry, searchMemories } from './search.js'
 import type { ScopeEntries } from './search.js'
-import { rankForSummary, renderEntry, renderHit, renderMemorySummary, renderScopeListing } from './render.js'
+import { MEMORY_OPEN, rankForSummary, renderEntry, renderHit, renderMemorySummary, renderRecall, renderScopeListing } from './render.js'
 import type { SummaryScope } from './render.js'
 import { findProjectRoot } from './workspace.js'
+import { planRetention, retentionKey } from './retention.js'
+import { MemoryLog, createFileSink, createLogExporter } from './log.js'
+import type { LoggerLike } from './log.js'
 import { collectWindow, runExtraction } from './extract.js'
-import { applyPlan, denyToolsFor, runConsolidation } from './consolidate.js'
+import { applyPlan, denyToolsFor, runConsolidation, selectForConsolidation } from './consolidate.js'
 import { discardDraft, listDrafts, promote, writeDraft } from './skills.js'
 import type { ConsolidationTarget, SubagentSeam } from './consolidate.js'
 import { MEMORY_KINDS } from './types.js'
-import type { MemoryEntry, MemoryKind, MemoryScope } from './types.js'
+import type { MemoryEntry, MemoryKind, MemoryScope, SessionMode } from './types.js'
 import { registerMemoryTool } from './tool.js'
 import { REMOTE_CONTRIBUTION, REMOTE_SERVICE, createRemoteService } from './remote.js'
 import type { TypertRegistryLike } from './remote.js'
@@ -52,6 +55,12 @@ export const name = 'memories'
 
 /** Budget for the extraction a shutdown is allowed to wait for. */
 const EXIT_FLUSH_TIMEOUT_MS = 8_000
+
+/** State key holding the last periodic sweep, so it survives a restart. */
+const SWEEP_META_KEY = 'sweep-at'
+
+/** Hard byte budget for one on-demand recall block. */
+const RECALL_MAX_BYTES = 400
 
 /**
  * Services this plugin requires at activation: the tool registry (for the
@@ -107,9 +116,15 @@ export class MemoriesRuntime {
   private readonly rootCache = new WeakMap<Session, Promise<string>>()
   /** Sessions whose conversation already carries the memory block. */
   private readonly injected = new WeakSet<Session>()
+  /** Recall deltas already injected into each conversation. */
+  private readonly recallCounts = new WeakMap<Session, number>()
+  /** Entry ids each conversation has already been shown. */
+  private readonly surfacedIds = new WeakMap<Session, Set<string>>()
   private readonly idleTimers = new WeakMap<Agent, NodeJS.Timeout>()
   private readonly extracting = new Set<string>()
   private readonly lifecycle = new AbortController()
+  /** The plugin's own logger: the host logger, plus the decision facade. */
+  private readonly log: MemoryLog
 
   constructor(
     private readonly ctx: Context,
@@ -120,9 +135,11 @@ export class MemoriesRuntime {
     this.settingsThunk = settings ?? (() => this.deployment.defaults)
     this.store = new MemoryStore(this.deployment.memoriesDir)
     this.store.entryLimit = () => this.settings.maxEntriesPerScope
+    this.store.similarityLimit = () => this.settings.dedupeSimilarity
     this.state = new StateStore(statePath(this.deployment.memoriesDir))
     this.llm = ctx.get('llm') as LlmRuntime | undefined
     this.subagents = ctx.get('subagents') as SubagentSeam | undefined
+    this.log = new MemoryLog(ctx.logger as unknown as LoggerLike, () => this.settings.traceMaintenance)
   }
 
   /** The tunables in force right now. */
@@ -232,7 +249,22 @@ export class MemoriesRuntime {
    * @returns the framed block, or `undefined` when there is nothing to say.
    */
   async summary(session: Session): Promise<string | undefined> {
+    return (await this.summaryWithSurfaced(session))?.text
+  }
+
+  /**
+   * Build the injected block and name the entries it lists.
+   *
+   * The caller needs both: the text enters the conversation, and the entries it
+   * names are marked as surfaced, which is what keeps retention from archiving a
+   * memory that works so well it never needs a search.
+   *
+   * @param session - session whose scopes to summarize.
+   * @returns the framed block plus the entries it lists, or `undefined`.
+   */
+  private async summaryWithSurfaced(session: Session): Promise<{ text: string; surfaced: readonly MemoryEntry[] } | undefined> {
     if (this.settings.maxSummaryBytes <= 0) return undefined
+    if (this.settings.recallMode === 'off') return undefined
     const states = await this.allScopes(session)
     const scopes: SummaryScope[] = states.map((state) => ({
       label: state.label,
@@ -240,10 +272,39 @@ export class MemoriesRuntime {
       entries: state.entries,
       total: state.entries.length,
     }))
-    return renderMemorySummary(scopes, {
+    const text = renderMemorySummary(scopes, {
       maxBytes: this.settings.maxSummaryBytes,
       maxEntriesPerScope: this.settings.maxSummaryEntries,
     })
+    if (text === undefined) return undefined
+    const surfaced = states.flatMap((state) => state.entries.slice(0, this.settings.maxSummaryEntries))
+    return { text, surfaced }
+  }
+
+  /**
+   * Record that these entries entered a conversation.
+   *
+   * The state database is authoritative and the entry file is only a mirror for
+   * a human reader, refreshed at most hourly: rewriting a dozen markdown files
+   * on every injection would cost more than the mark is worth.
+   *
+   * @param session - conversation the entries appeared in.
+   * @param entries - the entries shown.
+   */
+  private async markSurfaced(session: Session, entries: readonly MemoryEntry[]): Promise<void> {
+    if (entries.length === 0) return
+    const seen = this.seenIds(session)
+    const root = await this.projectRoot(session)
+    await Promise.all(entries.map(async (entry) => {
+      seen.add(entry.id)
+      const at = this.state.bumpSurfaced(entry.scope, entry.id)
+      if (entry.lastSurfacedAt >= at - 3_600_000) return
+      await this.store.writeCounters(entry, entry.scope === 'project' ? root : undefined, {
+        uses: entry.uses,
+        lastUsedAt: entry.lastUsedAt,
+        surfacedAt: at,
+      }).catch(() => undefined)
+    }))
   }
 
   /**
@@ -270,17 +331,22 @@ export class MemoriesRuntime {
    */
   async injectionFor(agent: Agent): Promise<UserMessage | undefined> {
     const session = agent.session
-    // The cache only avoids re-reading the history on every step of a turn.
+    // The cache only avoids re-reading the history on every step of a turn;
+    // checking it first also keeps the common case free of a state-database read.
     if (this.injected.has(session)) return undefined
+    if (this.sessionOff(session)) return undefined
     if (this.carriesRecall(session)) {
       this.injected.add(session)
       return undefined
     }
-    const text = await this.summary(session)
-    if (text === undefined) return undefined
+    const summary = await this.summaryWithSurfaced(session)
+    if (summary === undefined) return undefined
     this.injected.add(session)
+    await this.markSurfaced(session, summary.surfaced)
+    this.log.info('dsh-memories: injected the summary into session %s (%d bytes, %d entries)',
+      session.id, Buffer.byteLength(summary.text, 'utf8'), summary.surfaced.length)
     return createUserMessage({
-      content: [{ type: 'text', text }],
+      content: [{ type: 'text', text: summary.text }],
       source: { kind: 'plugin', plugin: name, form: 'recall' },
     })
   }
@@ -296,7 +362,12 @@ export class MemoriesRuntime {
     try {
       return session.deriveMessages().some((message) => {
         const source = message.source
-        return source.kind === 'plugin' && source.plugin === name && source.form === 'recall'
+        if (source.kind !== 'plugin' || source.plugin !== name || source.form !== 'recall') return false
+        // Both blocks carry this form, so the SUMMARY is the one whose frame
+        // says so: an on-demand delta must not count as the once-per-
+        // conversation block, or the summary would never be injected.
+        const blocks = message.content as readonly { type: string; text?: string }[]
+        return blocks.some((block) => block.type === 'text' && (block.text ?? '').includes(MEMORY_OPEN))
       })
     } catch {
       return false
@@ -306,6 +377,118 @@ export class MemoriesRuntime {
   /** Re-arm injection for one session (used on `clear`/`compact` restarts). */
   resetInjection(session: Session): void {
     this.injected.delete(session)
+    this.recallCounts.delete(session)
+    this.surfacedIds.delete(session)
+  }
+
+  /**
+   * The on-demand recall delta for this step, or `undefined` when nothing is
+   * worth adding.
+   *
+   * `recallMode: 'on-demand'` answers the one real weakness of injecting once:
+   * the summary is a snapshot from the start of the conversation, so a memory
+   * that only becomes relevant ten turns later stays invisible unless the model
+   * thinks to search for it. The delta is deterministic — the same scorer the
+   * tool uses, with no extra model call — and bounded three ways: a score
+   * threshold, a per-conversation cap, and one entry per block. Every entry it
+   * shows is recorded, so a delta never repeats what the summary listed.
+   *
+   * @param agent - the agent whose next step is being prepared.
+   * @returns the message to enter the conversation, or `undefined`.
+   */
+  async recallFor(agent: Agent): Promise<UserMessage | undefined> {
+    if (this.settings.recallMode !== 'on-demand') return undefined
+    const session = agent.session
+    // The budget is checked before the session switch because it lives in memory:
+    // once the cap is reached, no step pays for a state-database read again.
+    const used = this.recallCounts.get(session) ?? 0
+    if (used >= this.settings.recallMaxPerConversation) return undefined
+    if (this.sessionOff(session)) return undefined
+    const query = this.latestUserText(session)
+    if (query === undefined) return undefined
+    const seen = this.seenIds(session)
+    const states = await this.allScopes(session)
+    let best: { entry: MemoryEntry; score: number; relevance: number } | undefined
+    let near: { id: string; relevance: number } | undefined
+    for (const state of states) {
+      for (const entry of state.entries) {
+        if (seen.has(entry.id)) continue
+        const score = scoreEntry(entry, query)
+        const relevance = relevanceOf(entry, query)
+        // The gate is a RELEVANCE floor, not the decayed score: a title, key, or
+        // tag hit. Recency then decides which eligible memory wins, so an old
+        // but exact memory is still reachable in conversation.
+        if (relevance < this.settings.recallMinScore) {
+          // Remember the closest miss, so "why was nothing recalled?" has an
+          // answer in the log instead of being a silence.
+          if (relevance > 0 && (near === undefined || relevance > near.relevance)) near = { id: entry.id, relevance }
+          continue
+        }
+        if (best === undefined || score > best.score) best = { entry, score, relevance }
+      }
+    }
+    if (best === undefined) {
+      this.log.decision('dsh-memories: session %s recalled nothing (closest: %s at relevance %.1f, gate %.0f)',
+        session.id, near?.id ?? 'none', near?.relevance ?? 0, this.settings.recallMinScore)
+      return undefined
+    }
+    const text = renderRecall([best.entry], RECALL_MAX_BYTES)
+    if (text === undefined) return undefined
+    this.log.decision('dsh-memories: session %s recalled %s (relevance %.1f, score %.1f)',
+      session.id, best.entry.id, best.relevance, best.score)
+    this.recallCounts.set(session, used + 1)
+    await this.markSurfaced(session, [best.entry])
+    return createUserMessage({
+      content: [{ type: 'text', text }],
+      // The same form as the summary block; `carriesRecall` tells them apart by
+      // the frame, so a delta never suppresses the once-per-conversation block.
+      source: { kind: 'plugin', plugin: name, form: 'recall' },
+    })
+  }
+
+  /**
+   * The newest user-authored message, which is what the current turn is about.
+   *
+   * Tool results and this plugin's own injected blocks are skipped: a recall
+   * decision must be driven by the human, not by the assistant's output or by
+   * the memory block itself.
+   *
+   * @param session - session to read.
+   * @returns the text, or `undefined` when no user message is on the surface.
+   */
+  private latestUserText(session: Session): string | undefined {
+    try {
+      const messages = session.deriveMessages()
+      for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const message = messages[index]
+        if (message === undefined || message.role !== 'user') continue
+        if (message.source.kind !== 'user') continue
+        const blocks = message.content as readonly { type: string; text?: string }[]
+        const text = blocks
+          .filter((block) => block.type === 'text' && typeof block.text === 'string')
+          .map((block) => block.text ?? '')
+          .join('\n')
+          .trim()
+        if (text.length > 0) return text.slice(0, 2_000)
+      }
+    } catch {
+      return undefined
+    }
+    return undefined
+  }
+
+  /** Whether memory is switched off for one session. */
+  private sessionOff(session: Session): boolean {
+    return this.state.getSessionMode(session.id) === 'off'
+  }
+
+  /** Entry ids already shown to one conversation, created on first use. */
+  private seenIds(session: Session): Set<string> {
+    const existing = this.surfacedIds.get(session)
+    if (existing !== undefined) return existing
+    const created = new Set<string>()
+    this.surfacedIds.set(session, created)
+    return created
   }
 
   /**
@@ -409,10 +592,13 @@ export class MemoriesRuntime {
           // pass itself waits out its own cooldown. The workspace root is
           // recorded so the pass covers THIS session's project scope.
           if (stored > 0) this.enqueueConsolidation(Date.now(), false, await this.projectRoot(agent.session))
+          // Retention costs no quota and needs no new material, so it runs on
+          // its own interval; consolidation still needs a dirty job.
+          void this.sweepIfDue()
           void this.consolidateIfDue(agent)
         },
         (error: unknown) => {
-          if (!this.lifecycle.signal.aborted) this.ctx.logger.warn('dsh-memories: extraction failed: %o', error)
+          if (!this.lifecycle.signal.aborted) this.log.warn('dsh-memories: extraction failed for session %s: %o', agent.session.id, error)
         },
       )
     }, this.settings.autoExtractIdleMs)
@@ -466,6 +652,7 @@ export class MemoriesRuntime {
    * @returns how many drafts were stored.
    */
   private async mine(agent: Agent): Promise<number> {
+    if (this.sessionOff(agent.session)) return 0
     if (agent.status !== 'idle') return 0
     if (!this.idleEnough(agent)) return 0
     try {
@@ -523,7 +710,7 @@ export class MemoriesRuntime {
       try {
         stored += await this.mine(agent)
       } catch (error) {
-        if (!budget.aborted) this.ctx.logger.warn('dsh-memories: exit extraction failed: %o', error)
+        if (!budget.aborted) this.log.warn('dsh-memories: exit extraction failed for session %s: %o', agent.session.id, error)
       }
     }
     return stored
@@ -620,7 +807,7 @@ export class MemoriesRuntime {
       // Reaching the provider proves quota is available again.
       this.state.clearLimit()
       if (outcome.kind === 'none') {
-        this.ctx.logger.debug?.('dsh-memories: extraction produced nothing (%s)', outcome.reason)
+        this.log.decision('dsh-memories: session %s produced no memories (%s)', key, outcome.reason)
       } else {
         const stored: string[] = []
         for (const draft of outcome.drafts) {
@@ -638,7 +825,7 @@ export class MemoriesRuntime {
         }).catch((error: unknown) => {
           this.ctx.logger.warn('dsh-memories: could not write the evidence note for %s: %o', key, error)
         })
-        this.ctx.logger.info('dsh-memories: stored %d memories from session %s', outcome.drafts.length, key)
+        this.log.info('dsh-memories: stored %d memories from session %s (%s)', outcome.drafts.length, key, stored.join(', '))
       }
       this.state.putSession(key, {
         lastSeq: window.lastSeq,
@@ -719,9 +906,11 @@ export class MemoriesRuntime {
     try {
       const global = await this.store.list('global', undefined, { fresh: true })
       const project = await this.store.list('project', root, { fresh: true })
-      const entries = [...global, ...project]
-        .sort((left, right) => right.updatedAt - left.updatedAt)
-        .slice(0, this.settings.consolidateMaxEntries)
+      const reviewed = new Map(this.state.retentionRows().map((row) => [`${row.scope}\u0000${row.id}`, row.consolidatedAt]))
+      const entries = selectForConsolidation([...global, ...project], reviewed, this.settings.consolidateMaxEntries)
+      const unreviewed = entries.filter((entry) => (reviewed.get(retentionKey(entry.scope, entry.id)) ?? 0) === 0).length
+      this.log.decision('dsh-memories: reviewing %d memories (%d never reviewed) for session %s: %s',
+        entries.length, unreviewed, parent.session.id, entries.map((entry) => entry.id).join(', '))
       if (entries.length < 2) {
         this.state.deleteJob(CONSOLIDATE_JOB)
         return undefined
@@ -743,6 +932,9 @@ export class MemoriesRuntime {
         return undefined
       }
       const result = await applyPlan(plan, this.consolidationTarget(), root, { entries })
+      // Record the review, so the next pass starts from whatever has waited
+      // longest instead of from the same newest page again.
+      this.state.markConsolidated(entries.map((entry) => ({ scope: entry.scope, id: entry.id })))
       // Skill drafts are staged, not installed: a background pass must not
       // silently grow the model's skill catalog.
       const staged: string[] = []
@@ -756,7 +948,8 @@ export class MemoriesRuntime {
       }
       this.state.deleteJob(CONSOLIDATE_JOB)
       this.state.clearLimit()
-      this.ctx.logger.info('dsh-memories: consolidated %d written, %d retired, %d skill drafts', result.written, result.retired, staged.length)
+      this.log.info('dsh-memories: consolidated %d written, %d retired, %d skill drafts for session %s',
+        result.written, result.retired, staged.length, parent.session.id)
       return [
         `Consolidated ${entries.length} memories: ${result.written} written, ${result.retired} retired.`,
         staged.length > 0 ? `Staged skill drafts: ${staged.join(', ')} (promote with /memories promote <name>).` : '',
@@ -774,7 +967,7 @@ export class MemoriesRuntime {
         lastError: message,
       })
       this.noteLimitRefusal(error)
-      this.ctx.logger.warn('dsh-memories: consolidation failed: %s', message)
+      this.log.warn('dsh-memories: consolidation failed for session %s: %s', parent.session.id, message)
       return undefined
     }
   }
@@ -788,8 +981,127 @@ export class MemoriesRuntime {
   private consolidationTarget(): ConsolidationTarget {
     return {
       upsert: (draft, projectRoot, source, keepId) => this.store.upsert(draft, projectRoot, source, Date.now(), keepId),
-      remove: (scope, projectRoot, id) => this.store.remove(scope, projectRoot, id),
+      // Retirements are archival, so a wrong judgement stays recoverable.
+      archive: (scope, projectRoot, id) => this.store.archive(scope, projectRoot, id),
+      restore: (scope, projectRoot, id) => this.store.restore(scope, projectRoot, id),
     }
+  }
+
+  /**
+   * Run the periodic maintenance sweep when its interval has elapsed.
+   *
+   * Retention is deterministic and costs no quota, so unlike extraction it needs
+   * no live conversation — just a store and a clock. Running it here, and once
+   * at startup before any session exists, is what makes "unused memories
+   * eventually archive" true in a workspace that never happens to produce a new
+   * memory: the pass stops being a side effect of extraction succeeding.
+   *
+   * @param now - injected clock.
+   * @returns how many entries were archived.
+   */
+  async sweepIfDue(now = Date.now()): Promise<number> {
+    if (this.settings.sweepIntervalHours <= 0 && this.settings.maxUnusedDays <= 0) return 0
+    const last = Number(this.state.getMeta(SWEEP_META_KEY) ?? '0')
+    if (this.settings.sweepIntervalHours > 0 && Number.isFinite(last) && last > 0
+      && now - last < this.settings.sweepIntervalHours * 3_600_000) {
+      this.log.decision('dsh-memories: sweep not due yet (next after %s)',
+        new Date(last + this.settings.sweepIntervalHours * 3_600_000).toISOString())
+      return 0
+    }
+    return await this.sweepNow(now)
+  }
+
+  /** Run retention now, ignoring the interval (used by `/memories sweep`). */
+  async sweepNow(now = Date.now()): Promise<number> {
+    this.state.putMeta(SWEEP_META_KEY, String(now))
+    let archived = await this.retain('global', undefined, now)
+    for (const slug of await this.store.listProjects()) {
+      const descriptor = await this.store.readProjectDescriptor(slug)
+      if (descriptor === undefined) continue
+      archived += await this.retain('project', descriptor.root, now)
+    }
+    if (archived > 0) this.ctx.logger.info('dsh-memories: archived %d unused memories', archived)
+    return archived
+  }
+
+  /**
+   * Apply retention to one scope.
+   *
+   * @param scope - scope to sweep.
+   * @param root - workspace root for a project scope.
+   * @param now - injected clock.
+   * @returns how many entries were archived.
+   */
+  private async retain(scope: MemoryScope, root: string | undefined, now: number): Promise<number> {
+    const days = this.settings.maxUnusedDays
+    if (days <= 0) return 0
+    const entries = await this.store.list(scope, root, { fresh: true })
+    const expired = planRetention(entries, this.state.retentionRows(), { maxUnusedDays: days, now })
+    let archived = 0
+    for (const decision of expired) {
+      this.log.decision('dsh-memories: archiving %s/%s, unused for %d days', decision.scope, decision.id, Math.round(decision.ageDays))
+      if (await this.store.archive(scope, root, decision.id, now)) archived += 1
+    }
+    return archived
+  }
+
+  /** One line describing the sweep schedule, for `/memories stats`. */
+  private sweepLine(): string {
+    if (this.settings.sweepIntervalHours <= 0) return ', sweep off'
+    const last = Number(this.state.getMeta(SWEEP_META_KEY) ?? '0')
+    const when = Number.isFinite(last) && last > 0 ? new Date(last).toISOString() : 'never'
+    return `, sweep every ${this.settings.sweepIntervalHours}h (last ${when})`
+  }
+
+  /** This session's memory switch. */
+  sessionMode(session: Session): SessionMode {
+    return this.state.getSessionMode(session.id)
+  }
+
+  /**
+   * Turn memory off or on for one session.
+   *
+   * Per session rather than global: the useful case is "this repository is full
+   * of credentials, remember nothing from it", and a switch that silenced every
+   * other project too would be the wrong shape.
+   *
+   * @param session - session to change.
+   * @param value - `on`, `off`, or anything else to report the current state.
+   * @returns a human-readable confirmation.
+   */
+  setSessionMode(session: Session, value: string): string {
+    if (value !== 'on' && value !== 'off') {
+      return `Memory is ${this.sessionMode(session)} for this session. Usage: /memories mode [on|off]`
+    }
+    this.state.setSessionMode(session.id, value)
+    if (value === 'off') this.resetInjection(session)
+    return value === 'off'
+      ? 'Memory is off for this session: nothing injected and nothing mined. The memory tool still works.'
+      : 'Memory is on for this session.'
+  }
+
+  /** List one scope's archived entries. */
+  async archived(session: Session, scope: MemoryScope): Promise<string> {
+    const root = scope === 'project' ? await this.projectRoot(session) : undefined
+    const entries = await this.store.listArchived(scope, root)
+    return renderScopeListing({ scope, label: `${this.store.target(scope, root).label} archive`, entries })
+  }
+
+  /**
+   * Restore one archived entry, project scope first.
+   *
+   * @param session - session whose workspace to search.
+   * @param id - entry id.
+   * @returns a human-readable outcome.
+   */
+  async restore(session: Session, id: string): Promise<string> {
+    for (const scope of ['project', 'global'] as const) {
+      const root = scope === 'project' ? await this.projectRoot(session) : undefined
+      if (await this.store.restore(scope, root, id)) {
+        return `Restored ${slugify(id)} into ${this.store.target(scope, root).label}.`
+      }
+    }
+    return `No archived memory with id ${JSON.stringify(id)}, or it is live again already.`
   }
 
   /** One line describing whether background passes are running, for `/memories stats`. */
@@ -807,6 +1119,10 @@ export class MemoriesRuntime {
       `memory home: ${this.store.memoriesDir}`,
       ...states.map((scope) => `${scope.label}: ${scope.entries.length} memories`),
       `auto-extract: ${this.settings.autoExtract ? `on (idle ${Math.round(this.settings.autoExtractIdleMs / 1000)}s, ≥${this.settings.minIdleHours}h, ≤${this.settings.maxAgeDays}d)` : 'off'}`,
+      `recall: ${this.settings.recallMode} (score ≥${this.settings.recallMinScore}, ≤${this.settings.recallMaxPerConversation} per conversation)`,
+      `retention: ${this.settings.maxUnusedDays > 0 ? `archive after ${this.settings.maxUnusedDays}d unused` : 'off'}${this.sweepLine()}`,
+      `session mode: ${this.sessionMode(session)}`,
+      `logging: ${this.settings.logLevel}${this.settings.traceMaintenance ? ' + maintenance trace' : ''} → ${this.deployment.logFile.length > 0 ? this.deployment.logFile : 'off'}`,
       `sessions mined: ${this.state.sessionCount()}`,
       `background: ${this.backgroundLine()}`,
       `state store: ${this.state.durable ? 'sqlite' : `memory-only (${this.state.degradedReason ?? 'driver unavailable'})`}`,
@@ -882,9 +1198,13 @@ function helpText(): string {
     '  search <query> [--kind <kind>]   search both scopes',
     '  show <id>               show one memory (project first)',
     '  add <global|project> <text> [--kind <kind>]   store a memory by hand',
-    '  forget <id>             delete a memory',
+    '  forget <id>             delete a memory for good',
+    '  archive [global|project]   list archived (retired) memories',
+    '  restore <id>            bring an archived memory back',
+    '  mode [on|off]           switch memory off or on for this session',
     '  mine                    extract memories from this session now',
     '  consolidate             merge and reconcile all memories now',
+    '  sweep                   archive unused memories now',
     '  skills                  list staged skill drafts',
     '  promote <name>          copy a staged draft into the harness skill root',
     '  discard <name>          delete a staged draft',
@@ -934,6 +1254,19 @@ export function apply(ctx: Context, config: MemoriesConfig = {}): void {
     }
   }
 
+  // The host logger drops `warn` and `debug` before any sink sees them: the only
+  // exporter a stock composition installs declares no level, so the threshold
+  // falls back to 1 and `warn` (2) is filtered out. Registering our own exporter
+  // with `levels.default = 3` overrides that, and the file then records whatever
+  // `logLevel` allows — which is what makes a failed extraction, a quota refusal,
+  // or a retention decision observable at all.
+  const sink = createFileSink(deployment.logFile)
+  if (sink !== undefined) {
+    ctx.logger.exporter(createLogExporter(sink, () => current.logLevel))
+  } else if (deployment.logFile.trim().length > 0) {
+    ctx.logger.warn('dsh-memories: could not open the log file %s', deployment.logFile)
+  }
+
   const runtime = new MemoriesRuntime(ctx, config, read)
   ctx.effect(() => () => runtime.dispose(), 'dsh-memories.lifecycle')
   // The Settings page reads and edits memories through the Typert gateway, so
@@ -960,12 +1293,19 @@ export function apply(ctx: Context, config: MemoriesConfig = {}): void {
   }).catch((error: unknown) => {
     ctx.logger.warn('dsh-memories: legacy state import failed: %o', error)
   })
+  // The first sweep runs here rather than waiting for a session to settle: a
+  // process that starts and stops (a script, a one-shot task) then still gets
+  // the periodic cleanup it would otherwise never reach.
+  void runtime.sweepIfDue().catch((error: unknown) => {
+    ctx.logger.warn('dsh-memories: startup sweep failed: %o', error)
+  })
   ctx.logger.info(
-    'dsh-memories: store at %s autoExtract=%s idle=%d settings=%s',
+    'dsh-memories: store at %s autoExtract=%s idle=%d settings=%s log=%s',
     runtime.store.memoriesDir,
     String(runtime.settings.autoExtract),
     runtime.settings.autoExtractIdleMs,
     settings === undefined ? 'row-defaults' : SETTINGS_NS,
+    deployment.logFile.length > 0 ? `${deployment.logFile} (${runtime.settings.logLevel})` : 'off',
   )
 
   // `enableTool`/`enableCommand` are live: each registration is torn down and
@@ -975,7 +1315,7 @@ export function apply(ctx: Context, config: MemoriesConfig = {}): void {
   const registerCommand = (): (() => void) => ctx.commands.register({
     name: 'memories',
     description: 'Inspect and manage cross-session memories',
-    input: { hint: 'list | search <query> [--kind <k>] | show <id> | add <scope> <text> [--kind <k>] | forget <id> | mine | consolidate | skills | stats' },
+    input: { hint: 'list | search <query> [--kind <k>] | show <id> | add <scope> <text> [--kind <k>] | forget <id> | archive | restore <id> | mode [on|off] | mine | consolidate | sweep | skills | stats' },
     handler: async (invocation: CommandInvocation) => handleCommand(runtime, invocation),
   })
   let toolDisposer: (() => void) | undefined
@@ -1027,10 +1367,16 @@ export function apply(ctx: Context, config: MemoriesConfig = {}): void {
   ctx.on('agent/pre-step', async ({ agent }, next) => {
     const decision = await next()
     if (decision.kind === 'reject') return decision
-    const message = await runtime.injectionFor(agent)
-    if (message === undefined) return decision
-    if (decision.messages.some((existing) => existing.id === message.id)) return decision
-    return { ...decision, messages: [...decision.messages, message] }
+    const addition: UserMessage[] = []
+    const summary = await runtime.injectionFor(agent)
+    if (summary !== undefined) addition.push(summary)
+    // The on-demand delta is a second, independent decision: a conversation can
+    // already carry the summary and still meet a memory that only matters now.
+    const delta = await runtime.recallFor(agent)
+    if (delta !== undefined) addition.push(delta)
+    const fresh = addition.filter((message) => !decision.messages.some((existing) => existing.id === message.id))
+    if (fresh.length === 0) return decision
+    return { ...decision, messages: [...decision.messages, ...fresh] }
   })
 }
 
@@ -1105,6 +1451,26 @@ async function handleCommand(runtime: MemoriesRuntime, invocation: CommandInvoca
       if (rest.length === 0) return { kind: 'error', text: 'Usage: /memories discard <name>' }
       return { kind: 'success', text: await runtime.discardSkill(rest) }
     }
+    case 'archive': {
+      const scope = rest.trim().toLowerCase()
+      if (scope === 'global' || scope === 'project') return { kind: 'success', text: await runtime.archived(session, scope) }
+      return { kind: 'success', text: `${await runtime.archived(session, 'global')}\n\n${await runtime.archived(session, 'project')}` }
+    }
+    case 'restore': {
+      if (rest.length === 0) return { kind: 'error', text: 'Usage: /memories restore <id>' }
+      return { kind: 'success', text: await runtime.restore(session, rest) }
+    }
+    case 'sweep': {
+      const archived = await runtime.sweepNow()
+      return { kind: 'success', text: archived === 0 ? 'Nothing to archive.' : `Archived ${archived} unused memories.` }
+    }
+    case 'mode': {
+      return { kind: 'success', text: runtime.setSessionMode(session, rest.trim().toLowerCase()) }
+    }
+    case 'on':
+      return { kind: 'success', text: runtime.setSessionMode(session, 'on') }
+    case 'off':
+      return { kind: 'success', text: runtime.setSessionMode(session, 'off') }
     case 'consolidate': {
       const summary = await runtime.consolidateNow(invocation.agent)
       return { kind: 'success', text: summary ?? 'Nothing to consolidate (cooldown active, too few memories, or no subagent support).' }

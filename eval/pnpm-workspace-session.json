@@ -1,0 +1,12 @@
+{
+  "name": "pnpm-workspace-session",
+  "maxMemories": 5,
+  "transcript": "USER: 我们这个仓库用 pnpm workspace，别用 npm install。\nASSISTANT: 明白。测试用 node --test 跑。\nUSER: 顺便记一下，发布前必须先跑 tsc。",
+  "reply": "{\"summary\":\"The user set the repository's package manager, test command, and release order.\",\"memories\":[{\"scope\":\"project\",\"kind\":\"preference\",\"title\":\"Prefer pnpm workspaces\",\"body\":\"The repository is one pnpm workspace; do not run npm install.\",\"tags\":[\"tooling\"],\"keys\":[\"monorepo\"],\"appliesTo\":\"before installing dependencies\"},{\"scope\":\"project\",\"kind\":\"procedure\",\"title\":\"Run the test suite\",\"body\":\"Use node --test for the unit suite.\",\"tags\":[\"testing\"],\"keys\":[],\"appliesTo\":\"\"},{\"scope\":\"project\",\"kind\":\"procedure\",\"title\":\"Typecheck before publishing\",\"body\":\"Run tsc before a release, or the published types drift.\",\"tags\":[\"release\",\"build\"],\"keys\":[\"npm publish\"],\"appliesTo\":\"before publishing\"}]}",
+  "expected": [
+    { "scope": "project", "title": "Prefer pnpm workspaces" },
+    { "scope": "project", "title": "Run the test suite" },
+    { "scope": "project", "title": "Typecheck before publishing" }
+  ],
+  "forbidden": ["sk-", "ghp_"]
+}

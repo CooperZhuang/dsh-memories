@@ -15,7 +15,7 @@ import type { MemoryEntry, MemoryKind } from '../types.js'
 
 /** Build one entry. */
 function entry(id: string, kind: MemoryKind, title: string, body: string, tags: string[] = []): MemoryEntry {
-  return { id, scope: 'global', kind, title, body, tags, createdAt: 1, updatedAt: 1, uses: 0, lastUsedAt: 0, source: 'tool' }
+  return { id, scope: 'global', kind, title, body, tags, keys: [], createdAt: 1, updatedAt: 1, uses: 0, lastUsedAt: 0, lastSurfacedAt: 0, source: 'tool' }
 }
 
 const GROUPS: ScopeEntries[] = [{

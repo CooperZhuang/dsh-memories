@@ -143,3 +143,77 @@ test('closing twice is safe and a closed store degrades instead of throwing', as
   store.putSession('after-close', { lastSeq: 1, at: 1 })
   assert.equal(store.getSession('after-close')?.lastSeq, 1)
 })
+
+test('surfaced marks are recorded without touching the read counters', async (t) => {
+  const { store } = await tempStore(t)
+  store.bumpUsage('global', 'x', 10)
+  store.bumpSurfaced('global', 'x', 20)
+  store.bumpSurfaced('global', 'x', 30)
+  // Surfacing is a weaker signal than a read: it must not inflate `uses`.
+  assert.deepEqual(store.getUsage('global', 'x'), { uses: 1, lastUsedAt: 10 })
+  const row = store.retentionRows().find((candidate) => candidate.id === 'x')
+  assert.equal(row?.surfacedAt, 30)
+  assert.equal(row?.consolidatedAt, 0)
+})
+
+test('a review mark is per entry and survives alongside usage', async (t) => {
+  const { store } = await tempStore(t)
+  store.bumpUsage('global', 'a', 5)
+  store.bumpSurfaced('global', 'a', 7)
+  store.markConsolidated([{ scope: 'global', id: 'a' }, { scope: 'project', id: 'b' }], 99)
+  const rows = store.retentionRows()
+  const global = rows.find((candidate) => candidate.scope === 'global' && candidate.id === 'a')
+  const project = rows.find((candidate) => candidate.scope === 'project' && candidate.id === 'b')
+  assert.deepEqual(
+    { uses: global?.uses, lastUsedAt: global?.lastUsedAt, surfacedAt: global?.surfacedAt, consolidatedAt: global?.consolidatedAt },
+    { uses: 1, lastUsedAt: 5, surfacedAt: 7, consolidatedAt: 99 },
+  )
+  assert.equal(project?.consolidatedAt, 99)
+})
+
+test('bookkeeping values and per-session switches survive a reopen', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-state-meta-'))
+  const first = new StateStore(statePath(dir))
+  first.putMeta('sweep-at', '1234')
+  first.setSessionMode('session-a', 'off')
+  first.close()
+
+  const second = new StateStore(statePath(dir))
+  t.after(() => {
+    second.close()
+    first.close()
+    return rm(dir, { recursive: true, force: true })
+  })
+  assert.equal(second.getMeta('sweep-at'), '1234')
+  assert.equal(second.getMeta('never-written'), undefined)
+  assert.equal(second.getSessionMode('session-a'), 'off')
+  assert.equal(second.getSessionMode('session-b'), 'on', 'memory is on unless it was turned off')
+  second.setSessionMode('session-a', 'on')
+  assert.equal(second.getSessionMode('session-a'), 'on')
+  // The switch is a column on the watermark row, so it must not disturb it.
+  assert.equal(second.getSession('session-a')?.lastSeq, 0)
+})
+
+test('a store created before the retention columns migrates on open', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-state-usage-migrate-'))
+  const legacy = new StateStore(statePath(dir))
+  legacy.close()
+  const { DatabaseSync } = await import('node:sqlite')
+  const raw = new DatabaseSync(statePath(dir))
+  raw.exec('DROP TABLE usage')
+  raw.exec('DROP TABLE sessions')
+  raw.exec('CREATE TABLE usage (scope TEXT NOT NULL, id TEXT NOT NULL, uses INTEGER NOT NULL DEFAULT 0, last_used_at INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (scope, id))')
+  raw.exec('CREATE TABLE sessions (id TEXT PRIMARY KEY, last_seq INTEGER NOT NULL DEFAULT 0, at INTEGER NOT NULL DEFAULT 0, root TEXT, contributed INTEGER NOT NULL DEFAULT 0, activity_at INTEGER NOT NULL DEFAULT 0)')
+  raw.close()
+
+  const reopened = new StateStore(statePath(dir))
+  t.after(() => {
+    reopened.close()
+    return rm(dir, { recursive: true, force: true })
+  })
+  // Each of these names a column the old table did not have.
+  reopened.bumpSurfaced('global', 'x', 1)
+  reopened.markConsolidated([{ scope: 'global', id: 'x' }], 2)
+  assert.equal(reopened.retentionRows()[0]?.consolidatedAt, 2)
+  assert.equal(reopened.getSessionMode('nobody'), 'on')
+})

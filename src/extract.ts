@@ -39,7 +39,7 @@ export const EXTRACT_SYSTEM = [
   '- "global": true across every project (how the user likes to work, general preferences, machine/tooling facts).',
   '- "project": true only for this workspace (its architecture, commands, conventions, gotchas).',
   '',
-  'Each memory has a short imperative title (max 80 characters), a 1-3 sentence body, and up to 5 lowercase keyword tags.',
+  'Each memory has a short imperative title (max 80 characters), a 1-3 sentence body, up to 5 lowercase keyword tags, and 1-5 search keys: the aliases and keyphrases a future session would actually type (for example "monorepo" for a pnpm-workspace fact).',
   'Give each memory a kind, because the kinds are recalled differently:',
   '- "preference": how the user wants work done, or a correction they issued.',
   '- "failure": something that went wrong and how to avoid repeating it.',
@@ -72,6 +72,7 @@ export const EXTRACT_JSON_SCHEMA = {
           title: { type: 'string' },
           body: { type: 'string' },
           tags: { type: 'array', items: { type: 'string' } },
+          keys: { type: 'array', items: { type: 'string' } },
           appliesTo: { type: 'string' },
         },
       },
@@ -220,6 +221,7 @@ export function parseExtraction(text: string, maxMemories: number, sessionId: st
     const tags = Array.isArray(record['tags'])
       ? record['tags'].filter((tag): tag is string => typeof tag === 'string')
       : []
+    const keys = Array.isArray(record['keys']) ? record['keys'].filter((key): key is string => typeof key === 'string') : []
     const appliesTo = typeof record['appliesTo'] === 'string'
       ? redactSecrets(record['appliesTo'].replace(/\s+/gu, ' ').trim()).slice(0, 160)
       : ''
@@ -229,6 +231,7 @@ export function parseExtraction(text: string, maxMemories: number, sessionId: st
       title: cleanTitle,
       body: cleanBody,
       tags,
+      keys,
       ...appliesTo.length > 0 ? { appliesTo } : {},
       sourceSession: sessionId,
     })

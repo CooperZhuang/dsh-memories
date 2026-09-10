@@ -117,6 +117,7 @@ export function projectSlug(root: string): string {
 /** Serialize one entry as a markdown file with frontmatter. */
 export function formatEntry(entry: MemoryEntry): string {
   const tags = entry.tags.length > 0 ? `tags: ${entry.tags.join(', ')}` : 'tags:'
+  const keys = entry.keys.length > 0 ? `keys: ${entry.keys.join(', ')}` : undefined
   return [
     FENCE,
     `id: ${entry.id}`,
@@ -124,6 +125,7 @@ export function formatEntry(entry: MemoryEntry): string {
     `kind: ${entry.kind}`,
     `title: ${entry.title}`,
     tags,
+    ...keys === undefined ? [] : [keys],
     ...entry.appliesTo !== undefined && entry.appliesTo.length > 0 ? [`appliesTo: ${entry.appliesTo}`] : [],
     ...entry.supersedes !== undefined && entry.supersedes.length > 0 ? [`supersedes: ${entry.supersedes}`] : [],
     ...entry.sourceSession !== undefined && entry.sourceSession.length > 0 ? [`session: ${entry.sourceSession}`] : [],
@@ -132,6 +134,7 @@ export function formatEntry(entry: MemoryEntry): string {
     `source: ${entry.source}`,
     `uses: ${entry.uses}`,
     `lastUsed: ${entry.lastUsedAt > 0 ? new Date(entry.lastUsedAt).toISOString() : 'never'}`,
+    `lastSurfaced: ${entry.lastSurfacedAt > 0 ? new Date(entry.lastSurfacedAt).toISOString() : 'never'}`,
     FENCE,
     '',
     entry.body,
@@ -180,6 +183,7 @@ export function parseEntry(text: string, scope: MemoryScope, fallbackId: string)
   const appliesTo = fields.get('appliesto')
   const supersedes = fields.get('supersedes')
   const sourceSession = fields.get('session')
+  const keys = (fields.get('keys') ?? '').split(',').map(normalizeKey).filter((key) => key.length > 0)
   return {
     id: fields.get('id') ?? fallbackId,
     scope,
@@ -189,6 +193,7 @@ export function parseEntry(text: string, scope: MemoryScope, fallbackId: string)
     title,
     body,
     tags: (fields.get('tags') ?? '').split(',').map(normalizeTag).filter((tag) => tag.length > 0),
+    keys,
     ...appliesTo !== undefined && appliesTo.length > 0 ? { appliesTo } : {},
     ...supersedes !== undefined && supersedes.length > 0 ? { supersedes } : {},
     ...sourceSession !== undefined && sourceSession.length > 0 ? { sourceSession } : {},
@@ -196,8 +201,51 @@ export function parseEntry(text: string, scope: MemoryScope, fallbackId: string)
     updatedAt,
     uses: Number.isFinite(rawUses) && rawUses > 0 ? Math.trunc(rawUses) : 0,
     lastUsedAt: parseTime(fields.get('lastused'), 0),
+    lastSurfacedAt: parseTime(fields.get('lastsurfaced'), 0),
     source,
   }
+}
+
+/**
+ * Normalize one search key: lowercase, comma-free, length-capped.
+ *
+ * Keys are the aliases and keyphrases a memory should also be found by, so they
+ * are stored comma-separated beside the tags and matched by the same scorer.
+ * @param value - the raw key.
+ * @returns the normalized key.
+ */
+export function normalizeKey(value: string): string {
+  return value.trim().toLowerCase().replace(/[,\s]+/gu, ' ').trim().slice(0, 48)
+}
+
+/** Split text into a token set for similarity comparison. */
+function tokenSet(value: string): Set<string> {
+  return new Set(value.toLowerCase().split(/[^\p{L}\p{N}_]+/u).filter((token) => token.length > 1))
+}
+
+/** Jaccard overlap of two token sets; `0` when either side is empty. */
+export function overlap(left: ReadonlySet<string>, right: ReadonlySet<string>): number {
+  if (left.size === 0 || right.size === 0) return 0
+  let shared = 0
+  for (const token of left) if (right.has(token)) shared += 1
+  return shared / (left.size + right.size - shared)
+}
+
+/**
+ * Whether two memories are close enough to be one memory re-worded.
+ *
+ * Both halves must agree. Titles that overlap while bodies do not are two
+ * different lessons that happen to be named alike, and collapsing those loses
+ * what no later pass can recover.
+ * @param left - one memory, or a draft.
+ * @param right - the other.
+ * @param threshold - minimum title overlap; the body must reach half of it.
+ * @returns true when the two should be treated as the same memory.
+ */
+export function isNearDuplicate(left: { title: string; body: string }, right: { title: string; body: string }, threshold: number): boolean {
+  if (threshold <= 0) return false
+  if (overlap(tokenSet(left.title), tokenSet(right.title)) < threshold) return false
+  return overlap(tokenSet(left.body), tokenSet(right.body)) >= Math.min(0.5, threshold)
 }
 
 /** Normalize text for duplicate detection: case- and whitespace-insensitive. */
@@ -221,6 +269,7 @@ function fingerprint(value: string): string {
  * @param scope - the scope being deduplicated.
  * @param projectRoot - workspace root for a project scope.
  * @param keep - ids that must survive regardless of collisions.
+ * @param similarity - title/body token overlap above which two entries collide.
  * @returns the surviving entries, newest first.
  */
 async function dedupeEntries(
@@ -229,6 +278,7 @@ async function dedupeEntries(
   scope: MemoryScope,
   projectRoot: string | undefined,
   keep: ReadonlySet<string>,
+  similarity: number,
 ): Promise<MemoryEntry[]> {
   const winners: { title: string; body: string; entry: MemoryEntry }[] = []
   const losers: MemoryEntry[] = []
@@ -238,7 +288,8 @@ async function dedupeEntries(
     const clash = winners.find((candidate) =>
       (candidate.title === title && candidate.body === body)
       || (candidate.title.length > 0 && title.includes(candidate.title) && body.includes(candidate.body))
-      || (title.length > 0 && candidate.title.includes(title) && candidate.body.includes(body)))
+      || (title.length > 0 && candidate.title.includes(title) && candidate.body.includes(body))
+      || (similarity > 0 && isNearDuplicate(entry, candidate.entry, similarity)))
     if (clash === undefined) {
       winners.push({ title, body, entry })
       continue
@@ -487,7 +538,7 @@ export class MemoryStore {
       if (entry !== undefined) entries.push(entry)
     }
     entries.sort((left, right) => right.updatedAt - left.updatedAt || left.id.localeCompare(right.id))
-    const deduped = await dedupeEntries(entries, this, scope, projectRoot, this.keepIds)
+    const deduped = await dedupeEntries(entries, this, scope, projectRoot, this.keepIds, this.similarityLimit())
     this.cache.set(dir, { entries: deduped, loadedAt: Date.now() })
     await this.writeIndex(scope, projectRoot, deduped).catch(() => undefined)
     return deduped
@@ -540,9 +591,16 @@ export class MemoryStore {
   async writeCounters(
     entry: MemoryEntry,
     projectRoot: string | undefined,
-    counters: { uses: number; lastUsedAt: number },
+    counters: { uses: number; lastUsedAt: number; surfacedAt?: number },
   ): Promise<MemoryEntry> {
-    const updated: MemoryEntry = { ...entry, uses: counters.uses, lastUsedAt: counters.lastUsedAt }
+    const updated: MemoryEntry = {
+      ...entry,
+      uses: counters.uses,
+      lastUsedAt: counters.lastUsedAt,
+      // A caller that mirrors only read counters must not erase a newer
+      // surfaced mark.
+      lastSurfacedAt: counters.surfacedAt ?? entry.lastSurfacedAt,
+    }
     try {
       await writeAtomic(join(this.entriesDir(entry.scope, projectRoot), `${entry.id}.md`), formatEntry(updated))
       this.invalidate(entry.scope, projectRoot)
@@ -573,9 +631,16 @@ export class MemoryStore {
     const id = slugify(keepId ?? draft.title)
     const existing = await this.read(draft.scope, projectRoot, id)
     const tags = [...new Set(draft.tags.map(normalizeTag).filter((tag) => tag.length > 0))].slice(0, 12)
+    const keys = [...new Set((draft.keys ?? existing?.keys ?? []).map(normalizeKey).filter((key) => key.length > 0))].slice(0, 12)
     const appliesTo = draft.appliesTo?.trim()
-    const supersedes = draft.supersedes?.trim()
     const sourceSession = draft.sourceSession?.trim() ?? existing?.sourceSession
+    // An explicit `supersedes` always wins; otherwise a near-identical memory
+    // already in the scope is treated as the thing this one rewrites, so a
+    // re-worded lesson replaces its predecessor instead of joining it.
+    const explicit = draft.supersedes?.trim()
+    const supersedes = explicit !== undefined && explicit.length > 0
+      ? explicit
+      : existing === undefined ? await this.findSimilar(draft, projectRoot, id) : undefined
     const entry: MemoryEntry = {
       id,
       scope: draft.scope,
@@ -585,6 +650,7 @@ export class MemoryStore {
       title: draft.title.trim(),
       body: draft.body.trim(),
       tags,
+      keys,
       ...appliesTo !== undefined && appliesTo.length > 0 ? { appliesTo } : {},
       ...supersedes !== undefined && supersedes.length > 0 ? { supersedes } : {},
       // Provenance survives a rewrite: a consolidation that re-words an entry
@@ -594,6 +660,7 @@ export class MemoryStore {
       updatedAt: now,
       uses: existing?.uses ?? 0,
       lastUsedAt: existing?.lastUsedAt ?? 0,
+      lastSurfacedAt: existing?.lastSurfacedAt ?? 0,
       source,
     }
     await writeAtomic(join(this.entriesDir(draft.scope, projectRoot), `${id}.md`), formatEntry(entry))
@@ -621,20 +688,136 @@ export class MemoryStore {
     const path = join(this.entriesDir(scope, projectRoot), `${slugify(id)}.md`)
     if (!(await exists(path))) return false
     await rm(path, { force: true })
-    this.invalidate(scope, projectRoot)
-    const entries = await this.list(scope, projectRoot, { fresh: true })
-    await this.writeIndex(scope, projectRoot, entries).catch(() => undefined)
+    await this.reindex(scope, projectRoot)
     return true
   }
 
-  /** Enforce the per-scope cap by dropping the least recently updated entries. */
+  /**
+   * Move one entry out of the live store without destroying it.
+   *
+   * Consolidation retires memories it judges stale and the per-scope cap
+   * evicts the least recently updated; either judgement can be wrong. Deleting
+   * the file would make a wrong judgement irreversible, so the entry is stamped
+   * and moved to `archive/` beside its scope, where {@link restore} can bring it
+   * back. The archive is bounded, so this is not an unbounded second store.
+   *
+   * @param scope - owning scope.
+   * @param projectRoot - workspace root for a project scope.
+   * @param id - entry id.
+   * @param now - clock recorded in the archive stamp.
+   * @returns whether an entry was archived.
+   */
+  async archive(scope: MemoryScope, projectRoot: string | undefined, id: string, now = Date.now()): Promise<boolean> {
+    const source = join(this.entriesDir(scope, projectRoot), `${slugify(id)}.md`)
+    const text = await readText(source)
+    if (text === undefined) return false
+    const stamped = text.replace(/^---\r?\n/u, `---\narchived: ${new Date(now).toISOString()}\n`)
+    await writeAtomic(join(this.archiveDir(scope, projectRoot), `${slugify(id)}.md`), stamped)
+    await rm(source, { force: true })
+    await this.reindex(scope, projectRoot)
+    await this.evictArchive(scope, projectRoot)
+    return true
+  }
+
+  /** Move one archived entry back into the live store. */
+  async restore(scope: MemoryScope, projectRoot: string | undefined, id: string): Promise<boolean> {
+    const archived = join(this.archiveDir(scope, projectRoot), `${slugify(id)}.md`)
+    const text = await readText(archived)
+    if (text === undefined) return false
+    const target = join(this.entriesDir(scope, projectRoot), `${slugify(id)}.md`)
+    if (await exists(target)) return false
+    await writeAtomic(target, text.replace(/^(---\n)archived: [^\n]*\n/u, '$1'))
+    await rm(archived, { force: true })
+    await this.reindex(scope, projectRoot)
+    return true
+  }
+
+  /** Every archived entry in one scope, for the human-facing commands. */
+  async listArchived(scope: MemoryScope, projectRoot: string | undefined): Promise<readonly MemoryEntry[]> {
+    const dir = this.archiveDir(scope, projectRoot)
+    let names: string[]
+    try {
+      const dirents = await readdir(dir, { withFileTypes: true })
+      names = dirents.filter((dirent) => dirent.isFile() && dirent.name.endsWith('.md')).map((dirent) => dirent.name)
+    } catch (error) {
+      if (isMissing(error)) return []
+      throw error
+    }
+    const entries: MemoryEntry[] = []
+    for (const name of names.sort()) {
+      const text = await readText(join(dir, name))
+      if (text === undefined) continue
+      const entry = parseEntry(text, scope, name.replace(/\.md$/u, ''))
+      if (entry !== undefined) entries.push(entry)
+    }
+    return entries.sort((left, right) => left.id.localeCompare(right.id))
+  }
+
+  /** Rebuild one scope's cache and index after its entries directory changed. */
+  private async reindex(scope: MemoryScope, projectRoot: string | undefined): Promise<void> {
+    this.invalidate(scope, projectRoot)
+    const entries = await this.list(scope, projectRoot, { fresh: true })
+    await this.writeIndex(scope, projectRoot, entries).catch(() => undefined)
+  }
+
+  /** Directory holding one scope's archived entries. */
+  private archiveDir(scope: MemoryScope, projectRoot: string | undefined): string {
+    return join(this.scopeDir(scope, projectRoot), 'archive')
+  }
+
+  /** Keep one scope's archive bounded: the newest 500 files survive. */
+  private async evictArchive(scope: MemoryScope, projectRoot: string | undefined, limit = 500): Promise<void> {
+    const dir = this.archiveDir(scope, projectRoot)
+    let names: string[]
+    try {
+      const dirents = await readdir(dir, { withFileTypes: true })
+      names = dirents.filter((dirent) => dirent.isFile() && dirent.name.endsWith('.md')).map((dirent) => dirent.name)
+    } catch (error) {
+      if (isMissing(error)) return
+      throw error
+    }
+    if (names.length <= limit) return
+    const stamped: { name: string; at: number }[] = []
+    for (const name of names) {
+      const stat_ = await stat(join(dir, name)).catch(() => undefined)
+      stamped.push({ name, at: stat_?.mtimeMs ?? 0 })
+    }
+    for (const row of stamped.sort((left, right) => right.at - left.at).slice(limit)) {
+      await rm(join(dir, row.name), { force: true })
+    }
+  }
+
+  /** Enforce the per-scope cap, archiving the least recently updated entries. */
   private async evict(scope: MemoryScope, projectRoot: string | undefined, limit: number): Promise<void> {
     const entries = await this.list(scope, projectRoot, { fresh: true })
     if (entries.length <= limit) return
     for (const entry of entries.slice(limit)) {
-      await rm(join(this.entriesDir(scope, projectRoot), `${entry.id}.md`), { force: true })
+      await this.archive(scope, projectRoot, entry.id)
     }
-    this.invalidate(scope, projectRoot)
+  }
+
+  /**
+   * Find an existing memory the draft appears to rewrite.
+   *
+   * The id comes from the title, so a re-worded title creates a second file and
+   * the store slowly fills with near-copies. The rule stays deliberately narrow
+   * — see {@link isNearDuplicate} — because merging two genuinely distinct
+   * memories loses information no later pass can recover.
+   *
+   * @param draft - the incoming memory.
+   * @param projectRoot - workspace root for a project draft.
+   * @param exclude - id to ignore, so a draft can never supersede itself.
+   * @returns the id to supersede, or `undefined` when the draft is new.
+   */
+  private async findSimilar(draft: MemoryDraft, projectRoot: string | undefined, exclude: string): Promise<string | undefined> {
+    if (this.similarityLimit() <= 0) return undefined
+    const threshold = this.similarityLimit()
+    const entries = await this.list(draft.scope, projectRoot)
+    for (const entry of entries) {
+      if (entry.id === exclude) continue
+      if (isNearDuplicate(draft, entry, threshold)) return entry.id
+    }
+    return undefined
   }
 
   /**
@@ -703,6 +886,12 @@ export class MemoryStore {
    * very next write. The plugin installs its live settings thunk here.
    */
   entryLimit: () => number = () => 0
+
+  /**
+   * Near-duplicate threshold, read at load and write time so a settings change
+   * applies to the very next operation. `0` keeps only the exact-match rule.
+   */
+  similarityLimit: () => number = () => 0
 
   /** Ids that must survive the next dedupe pass (the entry just written). */
   private keepIds: ReadonlySet<string> = new Set()

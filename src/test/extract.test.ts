@@ -92,6 +92,13 @@ test('redactSecrets removes credential-shaped text and keeps prose', () => {
   assert.equal(redactSecrets('plain prose about pnpm'), 'plain prose about pnpm')
 })
 
+test('parseExtraction keeps the string keys and drops the rest', () => {
+  const parsed = parseExtraction('{"memories":[{"scope":"global","title":"Prefer pnpm","body":"Use pnpm.","keys":["monorepo",7]}]}', 5, 'session-1')
+  assert.deepEqual([...parsed.drafts[0]?.keys ?? []], ['monorepo'])
+  // A reply that omits keys is normal: they are an optimization, not a contract.
+  assert.deepEqual([...parseExtraction('{"memories":[{"scope":"global","title":"x","body":"y"}]}', 5, 's').drafts[0]?.keys ?? []], [])
+})
+
 test('parseExtraction accepts a bare object, a fenced object, and rejects junk', () => {
   const payload = '{"summary":"The user set up a pnpm workflow.","memories":[{"scope":"global","title":"Prefer pnpm","body":"Use pnpm.","tags":["tooling"]}]}'
   const parsed = parseExtraction(payload, 5, 'session-1')

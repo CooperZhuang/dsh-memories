@@ -54,6 +54,7 @@
     "test": "tsc -p tsconfig.json && node scripts/build-client.mjs && node --test lib/test/*.test.js",
     "smoke": "node scripts/activation-smoke.mjs .",
     "seed": "node scripts/seed.mjs",
+    "eval": "node scripts/eval-extract.mjs",
     "prepare": "npm run build"
   },
   "peerDependencies": {

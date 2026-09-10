@@ -115,7 +115,11 @@ export class StateStore {
   /** Fallback when `node:sqlite` is unavailable: watermarks survive only in-process. */
   private readonly sessions = new Map<string, SessionState>()
   private readonly jobs = new Map<string, ConsolidateJob>()
-  private readonly usage = new Map<string, { uses: number; lastUsedAt: number }>()
+  private readonly usage = new Map<string, { uses: number; lastUsedAt: number; surfacedAt: number; consolidatedAt: number }>()
+  /** Bookkeeping scalars: when the last sweep ran, and anything else a pass must remember. */
+  private readonly meta = new Map<string, string>()
+  /** Per-session memory switches, when the SQL driver is unavailable. */
+  private readonly sessionModes = new Map<string, 'on' | 'off'>()
   private readonly limits = new Map<string, LimitState>()
   /** Why the SQL driver is absent, for one diagnostic line. */
   readonly degradedReason: string | undefined
@@ -137,7 +141,8 @@ export class StateStore {
           at INTEGER NOT NULL DEFAULT 0,
           root TEXT,
           contributed INTEGER NOT NULL DEFAULT 0,
-          activity_at INTEGER NOT NULL DEFAULT 0
+          activity_at INTEGER NOT NULL DEFAULT 0,
+          memory_mode TEXT
         );
         CREATE TABLE IF NOT EXISTS jobs (
           key TEXT PRIMARY KEY,
@@ -154,6 +159,8 @@ export class StateStore {
           id TEXT NOT NULL,
           uses INTEGER NOT NULL DEFAULT 0,
           last_used_at INTEGER NOT NULL DEFAULT 0,
+          surfaced_at INTEGER NOT NULL DEFAULT 0,
+          consolidated_at INTEGER NOT NULL DEFAULT 0,
           PRIMARY KEY (scope, id)
         );
         CREATE TABLE IF NOT EXISTS limits (
@@ -162,6 +169,10 @@ export class StateStore {
           until INTEGER NOT NULL DEFAULT 0,
           at INTEGER NOT NULL DEFAULT 0,
           reason TEXT
+        );
+        CREATE TABLE IF NOT EXISTS meta (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
         );
       `)
       this.migrate()
@@ -189,6 +200,11 @@ export class StateStore {
     }
     // jobs.root: which workspace a consolidation pass covers (added after v1).
     if (!columns('jobs').has('root')) db.exec('ALTER TABLE jobs ADD COLUMN root TEXT')
+    // usage.surfaced_at / usage.consolidated_at: retention and review bookkeeping.
+    if (!columns('usage').has('surfaced_at')) db.exec('ALTER TABLE usage ADD COLUMN surfaced_at INTEGER NOT NULL DEFAULT 0')
+    if (!columns('usage').has('consolidated_at')) db.exec('ALTER TABLE usage ADD COLUMN consolidated_at INTEGER NOT NULL DEFAULT 0')
+    // sessions.memory_mode: per-session memory switch (`off` suspends it).
+    if (!columns('sessions').has('memory_mode')) db.exec('ALTER TABLE sessions ADD COLUMN memory_mode TEXT')
   }
 
   /** Whether SQLite is backing this store. */
@@ -344,9 +360,14 @@ export class StateStore {
   bumpUsage(scope: string, id: string, now = Date.now()): { uses: number; lastUsedAt: number } {
     if (this.db === undefined) {
       const key = `${scope}\u0000${id}`
-      const next = { uses: (this.usage.get(key)?.uses ?? 0) + 1, lastUsedAt: now }
-      this.usage.set(key, next)
-      return next
+      const previous = this.usage.get(key)
+      this.usage.set(key, {
+        uses: (previous?.uses ?? 0) + 1,
+        lastUsedAt: now,
+        surfacedAt: previous?.surfacedAt ?? 0,
+        consolidatedAt: previous?.consolidatedAt ?? 0,
+      })
+      return { uses: (previous?.uses ?? 0) + 1, lastUsedAt: now }
     }
     this.db.prepare(`
       INSERT INTO usage (scope, id, uses, last_used_at) VALUES (?, ?, 1, ?)
@@ -358,7 +379,10 @@ export class StateStore {
 
   /** Read one entry's usage counters. */
   getUsage(scope: string, id: string): { uses: number; lastUsedAt: number } {
-    if (this.db === undefined) return this.usage.get(`${scope}\u0000${id}`) ?? { uses: 0, lastUsedAt: 0 }
+    if (this.db === undefined) {
+      const row = this.usage.get(`${scope}\u0000${id}`)
+      return row === undefined ? { uses: 0, lastUsedAt: 0 } : { uses: row.uses, lastUsedAt: row.lastUsedAt }
+    }
     const row = this.db.prepare('SELECT uses, last_used_at FROM usage WHERE scope = ? AND id = ?').get(scope, id) as
       | { uses: number; last_used_at: number }
       | undefined
@@ -370,12 +394,134 @@ export class StateStore {
     if (this.db === undefined) {
       return [...this.usage.entries()].map(([key, value]) => {
         const [scope, id] = key.split('\u0000')
-        return { scope: scope ?? '', id: id ?? '', ...value }
+        return { scope: scope ?? '', id: id ?? '', uses: value.uses, lastUsedAt: value.lastUsedAt }
       })
     }
     const rows = this.db.prepare('SELECT scope, id, uses, last_used_at FROM usage').all() as
       { scope: string; id: string; uses: number; last_used_at: number }[]
     return rows.map((row) => ({ scope: row.scope, id: row.id, uses: Number(row.uses), lastUsedAt: Number(row.last_used_at) }))
+  }
+
+  /**
+   * Record that an entry was listed in an injected block.
+   *
+   * Surfacing is a weaker signal than a read — the model saw the memory but did
+   * not open it — so it deliberately does not inflate `uses`. It exists because
+   * retention would otherwise evict the memories that work too well to need a
+   * search: an entry the model read straight out of the summary would look
+   * unused, and the better it is, the faster it would expire.
+   *
+   * @param scope - the entry's scope.
+   * @param id - the entry's id.
+   * @param now - injected clock.
+   * @returns the recorded timestamp.
+   */
+  bumpSurfaced(scope: string, id: string, now = Date.now()): number {
+    if (this.db === undefined) {
+      const key = `${scope}\u0000${id}`
+      const previous = this.usage.get(key)
+      this.usage.set(key, {
+        uses: previous?.uses ?? 0,
+        lastUsedAt: previous?.lastUsedAt ?? 0,
+        surfacedAt: now,
+        consolidatedAt: previous?.consolidatedAt ?? 0,
+      })
+      return now
+    }
+    this.db.prepare(`
+      INSERT INTO usage (scope, id, uses, last_used_at, surfaced_at) VALUES (?, ?, 0, 0, ?)
+      ON CONFLICT(scope, id) DO UPDATE SET surfaced_at = excluded.surfaced_at
+    `).run(scope, id, now)
+    return now
+  }
+
+  /**
+   * Record that a consolidation pass reviewed these entries.
+   *
+   * The mark is what stops a review from starving: selection prefers entries it
+   * has never reviewed, then the ones reviewed longest ago, so a memory cannot
+   * sit unseen forever behind a permanently-newest first page.
+   *
+   * @param refs - the scope/id pairs the pass considered.
+   * @param now - clock to record.
+   */
+  markConsolidated(refs: readonly { scope: string; id: string }[], now = Date.now()): void {
+    for (const ref of refs) {
+      if (this.db === undefined) {
+        const key = `${ref.scope}\u0000${ref.id}`
+        const previous = this.usage.get(key)
+        this.usage.set(key, {
+          uses: previous?.uses ?? 0,
+          lastUsedAt: previous?.lastUsedAt ?? 0,
+          surfacedAt: previous?.surfacedAt ?? 0,
+          consolidatedAt: now,
+        })
+        continue
+      }
+      this.db.prepare(`
+        INSERT INTO usage (scope, id, uses, last_used_at, consolidated_at) VALUES (?, ?, 0, 0, ?)
+        ON CONFLICT(scope, id) DO UPDATE SET consolidated_at = excluded.consolidated_at
+      `).run(ref.scope, ref.id, now)
+    }
+  }
+
+  /** Every usage row with all four timestamps, for the retention pass. */
+  retentionRows(): { scope: string; id: string; uses: number; lastUsedAt: number; surfacedAt: number; consolidatedAt: number }[] {
+    if (this.db === undefined) {
+      return [...this.usage.entries()].map(([key, value]) => {
+        const [scope, id] = key.split('\u0000')
+        return { scope: scope ?? '', id: id ?? '', ...value }
+      })
+    }
+    const rows = this.db.prepare('SELECT scope, id, uses, last_used_at, surfaced_at, consolidated_at FROM usage').all() as
+      { scope: string; id: string; uses: number; last_used_at: number; surfaced_at: number; consolidated_at: number }[]
+    return rows.map((row) => ({
+      scope: row.scope,
+      id: row.id,
+      uses: Number(row.uses),
+      lastUsedAt: Number(row.last_used_at),
+      surfacedAt: Number(row.surfaced_at),
+      consolidatedAt: Number(row.consolidated_at),
+    }))
+  }
+
+  /** Read one bookkeeping value, if it was ever written. */
+  getMeta(key: string): string | undefined {
+    if (this.db === undefined) return this.meta.get(key)
+    const row = this.db.prepare('SELECT value FROM meta WHERE key = ?').get(key) as { value: string } | undefined
+    return row?.value
+  }
+
+  /** Write one bookkeeping value. */
+  putMeta(key: string, value: string): void {
+    if (this.db === undefined) {
+      this.meta.set(key, value)
+      return
+    }
+    this.db.prepare(`
+      INSERT INTO meta (key, value) VALUES (?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run(key, value)
+  }
+
+  /** One session's memory switch; `on` unless it was turned off. */
+  getSessionMode(id: string): 'on' | 'off' {
+    if (this.db === undefined) return this.sessionModes.get(id) ?? 'on'
+    const row = this.db.prepare('SELECT memory_mode FROM sessions WHERE id = ?').get(id) as { memory_mode: string | null } | undefined
+    return row?.memory_mode === 'off' ? 'off' : 'on'
+  }
+
+  /** Turn one session's memory off, or back on. */
+  setSessionMode(id: string, mode: 'on' | 'off', at = Date.now()): void {
+    if (this.db === undefined) {
+      if (!this.sessions.has(id)) this.sessions.set(id, { lastSeq: 0, at: 0, activityAt: at })
+      this.sessionModes.set(id, mode)
+      return
+    }
+    this.db.prepare(`
+      INSERT INTO sessions (id, last_seq, at, memory_mode) VALUES (?, 0, 0, ?)
+      ON CONFLICT(id) DO UPDATE SET memory_mode = excluded.memory_mode
+    `).run(id, mode)
   }
 
   /** The recorded background pause, if any. */

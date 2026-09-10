@@ -35,6 +35,15 @@ export interface MemoryEntry {
   readonly body: string
   /** Lowercase keyword tags used by search ranking. */
   readonly tags: readonly string[]
+  /**
+   * Extra search keys: aliases and keyphrases that should also find this
+   * memory.
+   *
+   * This is the cheap half of what the literature calls key expansion — a
+   * memory about "pnpm workspaces" should be found by "monorepo" too — and it
+   * buys most of the recall a vector index would, without an index.
+   */
+  readonly keys: readonly string[]
   /** When this memory is worth recalling, in the author's words. */
   readonly appliesTo?: string
   /** Id of the memory this one replaces, when it supersedes one. */
@@ -56,6 +65,8 @@ export interface MemoryEntry {
   readonly uses: number
   /** Unix epoch milliseconds of the last read/search hit, or 0 when never used. */
   readonly lastUsedAt: number
+  /** Unix epoch milliseconds the entry was last listed in an injected block, or 0. */
+  readonly lastSurfacedAt: number
   /** How the entry entered the store. */
   readonly source: MemorySource
 }
@@ -139,6 +150,8 @@ export interface MemoryDraft {
   readonly supersedes?: string
   /** Session the draft came from, recorded as {@link MemoryEntry.sourceSession}. */
   readonly sourceSession?: string
+  /** Extra search keys (aliases, keyphrases) that should also find this memory. */
+  readonly keys?: readonly string[]
 }
 
 /** The outcome of persisting one draft. */
@@ -147,6 +160,38 @@ export interface UpsertResult {
   readonly entry: MemoryEntry
   /** `created` for a new entry, `updated` when an existing id was replaced. */
   readonly action: 'created' | 'updated'
+}
+
+/**
+ * Per-session memory switch.
+ *
+ * `off` suspends injection and extraction for one session without touching the
+ * workspace it runs in: a repository full of credentials can be worked in
+ * without turning memory off everywhere.
+ */
+export type SessionMode = 'on' | 'off'
+
+/**
+ * What one memory's usage says about whether it still earns its place.
+ *
+ * These counters live in the state database rather than in the entry file,
+ * because every session in the process updates them concurrently; `surfacedAt`
+ * is the weaker signal that keeps a memory good enough to be read straight out
+ * of the injected summary from looking unused.
+ */
+export interface RetentionRow {
+  /** Owning scope. */
+  readonly scope: string
+  /** Entry id within that scope. */
+  readonly id: string
+  /** How many times the entry was read or returned by search. */
+  readonly uses: number
+  /** Unix epoch milliseconds of the last read/search hit, or 0. */
+  readonly lastUsedAt: number
+  /** Unix epoch milliseconds the entry was last listed in an injected block, or 0. */
+  readonly surfacedAt: number
+  /** Unix epoch milliseconds a consolidation pass last reviewed it, or 0. */
+  readonly consolidatedAt: number
 }
 
 /** One ranked search hit. */

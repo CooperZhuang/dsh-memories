@@ -1,9 +1,10 @@
 /**
  * Lexical search over stored memories.
  *
- * Deliberately dependency-free and deterministic: tokens are matched
- * case-insensitively against title, body, and tags, with weights that put a
- * title hit above a body hit. `all` filters by tag or scope without a query.
+ * Deliberately dependency-free and deterministic: one score ranks everything —
+ * lexical relevance, the entry's track record, and how recently it was
+ * touched — so tool search, the injected summary, and on-demand recall all
+ * agree on what is worth recalling.
  *
  * @module dsh-memories/search
  */
@@ -35,32 +36,92 @@ function occurrences(haystack: string, needle: string): number {
 }
 
 /**
- * Score one entry against a query. Exact substring hits in the title dominate;
- * per-token hits in title, tags, and body follow.
+ * Lexical relevance: exact and per-token hits in the title, keys, tags, and
+ * body, weighted so a title hit dominates a body hit.
  * @param entry - candidate entry.
  * @param query - raw user/model query.
- * @param now - clock used for the recency tie-break.
- * @returns a non-negative score; `0` means no match.
+ * @returns a non-negative relevance score; `0` means no match.
  */
-export function scoreEntry(entry: MemoryEntry, query: string, now = Date.now()): number {
+export function relevanceOf(entry: MemoryEntry, query: string): number {
   const normalized = query.trim().toLowerCase()
   if (normalized.length === 0) return 0
   const title = entry.title.toLowerCase()
   const body = entry.body.toLowerCase()
   const tags = entry.tags.join(' ')
+  const keys = entry.keys.join(' ')
   let score = 0
   if (title.includes(normalized)) score += 40
-  if (body.includes(normalized)) score += 12
+  if (keys.includes(normalized)) score += 26
   if (tags.includes(normalized)) score += 20
+  if (body.includes(normalized)) score += 12
   for (const token of tokenize(normalized)) {
     if (isNoise(token)) continue
     if (title.includes(token)) score += 8 + occurrences(title, token)
+    if (keys.includes(token)) score += 7
     if (tags.includes(token)) score += 6
     score += Math.min(4, occurrences(body, token)) * 2
   }
-  if (score === 0) return 0
-  const ageDays = Math.max(0, (now - entry.updatedAt) / 86_400_000)
-  return score + Math.max(0, 4 - ageDays / 30)
+  return score
+}
+
+/**
+ * Half-life of a memory's recency weight, in days.
+ *
+ * Deliberately long: this is durable memory, and a project convention from last
+ * quarter is usually still true. Recency orders equally relevant memories; it
+ * does not decide by itself whether an old one is worth showing at all.
+ */
+export const RECENCY_HALF_LIFE_DAYS = 90
+
+/**
+ * Floor on the recency weight.
+ *
+ * Without it a two-year-old memory scores essentially zero and can never
+ * outrank a fresh, weaker match, however exact its own — the opposite of what
+ * durable memory is for.
+ */
+export const DECAY_FLOOR = 0.25
+
+/** The most recent moment an entry was read, surfaced, or rewritten. */
+export function recencyOf(entry: MemoryEntry): number {
+  return Math.max(entry.updatedAt, entry.lastUsedAt, entry.lastSurfacedAt)
+}
+
+/**
+ * How fast an entry's recency weight decays.
+ *
+ * A memory not read, surfaced, or rewritten for a quarter is worth half as much
+ * as one touched today, and the weight never falls below {@link DECAY_FLOOR}:
+ * recency orders memories, it does not erase them.
+ * @param entry - candidate entry.
+ * @param now - injected clock.
+ * @returns a weight in `[DECAY_FLOOR, 1]`.
+ */
+export function decayOf(entry: MemoryEntry, now = Date.now()): number {
+  const ageDays = Math.max(0, (now - recencyOf(entry)) / 86_400_000)
+  return Math.max(DECAY_FLOOR, 0.5 ** (ageDays / RECENCY_HALF_LIFE_DAYS))
+}
+
+/** How much an entry has earned its place: a small bonus per recorded use. */
+export function importanceOf(entry: MemoryEntry): number {
+  return 1 + Math.min(entry.uses, 10) * 0.35
+}
+
+/**
+ * Score one entry against a query: relevance × importance × recency decay.
+ *
+ * One formula for every ordering in the plugin — tool search, the injected
+ * summary, and the on-demand recall threshold — so "worth recalling" means the
+ * same thing everywhere and a knob tuned in one place holds in the others.
+ * @param entry - candidate entry.
+ * @param query - raw user/model query.
+ * @param now - clock used for the decay.
+ * @returns a non-negative score; `0` means the entry does not match.
+ */
+export function scoreEntry(entry: MemoryEntry, query: string, now = Date.now()): number {
+  const relevance = relevanceOf(entry, query)
+  if (relevance === 0) return 0
+  return relevance * importanceOf(entry) * decayOf(entry, now)
 }
 
 /** Filter options accepted by {@link searchMemories}. */

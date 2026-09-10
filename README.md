@@ -43,26 +43,37 @@
    冷却期内不再发起任何后台调用；成功一次即解除。手动 `/memories mine` 也受同一闸门约束。
 3. **合并重整（阶段 2）** — 阶段 1 一次只看到一个会话，无法处理**跨会话**的矛盾与碎片。
    当有新记忆落盘后，会排一个全局合并任务；冷却（`consolidateCooldownHours`，默认 6 小时）
-   到期后，把最近的记忆交给一个**受限子代理**：它不能写文件、不能跑命令、不能联网、不能
-   再委派（`maxDepth: 0` + 工具黑名单），只能返回一份严格 JSON 的合并方案——合并重复、
-   改写过期、退役失效、补上遗漏。**插件是唯一的写入者**：它校验方案里的 id 必须真实存在，
-   然后在快照保护下应用；中途失败会回滚已改动的条目。想立刻合并用 `/memories consolidate`。
+   到期后，把一批记忆交给一个**受限子代理**：它不能写文件、不能跑命令、不能联网、不能再
+   委派（`maxDepth: 1` + 工具黑名单），只能返回一份严格 JSON 的合并方案——合并重复、改写过期、
+   退役失效、补上遗漏。**插件是唯一的写入者**：它校验方案里的 id 必须真实存在，然后在快照保护
+   下应用；中途失败会回滚已改动的条目。想立刻合并用 `/memories consolidate`。
+   「退役」是**归档**不是删除：条目被移进 `archive/`，判断错了用 `/memories restore <id>` 取回。
+   每次合并的输入也不是「最近 N 条」，而是**从未复审过的优先、其余按最久未复审排序**，所以
+   藏在第 200 条的老记忆也会轮到复审，不会被新记忆永远挤在门外。
    合并有**自己**的模型路由（`consolidateProvider` / `consolidateModel`）：合并比抽取更贵，可以用
    更便宜的模型；两者留空时先回退到抽取路由，再回退到会话路由。
    它还会从记忆里提炼**技能草稿**（见下）。
 4. **分层注入（上下文）** — 一次会话只注入**一次**有界摘要：在第一个「有话说」的 step 进入，
    先全局、后项目，每段按 kind 分组列出标题 + 日期 + 一句话预览，整块不超过 `maxSummaryBytes`。
-   之后**不再重注入**——会话中途写入的记忆不刷新摘要，要用就 `memory_search`。「注入过没有」
-   看的是**对话本身**，不是进程：注入的是一条持久的 user 消息，重启 dsh 后它跟着历史一起恢复，
-   所以重启不会再多注一份；只有 `/compact`、清空会话（整段对话被替换）才会重新注入。代价是模型
-   手里的摘要可能比记忆库旧一点，收益是一段 50 轮的会话只为记忆付一次约 2～4KB，而不是每轮一次。
+   「注入过没有」看的是**对话本身**，不是进程：注入的是一条持久的 user 消息，重启 dsh 后它跟着
+   历史一起恢复，所以重启不会再多注一份；只有 `/compact`、清空会话（整段对话被替换）才会重新注入。
+   代价是模型手里的摘要可能比记忆库旧一点，收益是一段 50 轮的会话只为记忆付一次约 2～4KB。
+   摘要之外还有**按需补注**（`recallMode: on-demand`，默认）：每一轮用当前用户消息对记忆库做一次
+   确定性打分（和 `memory_search` 同一套公式，**不额外调用模型**），只有相关度够强、且这条记忆
+   本会话还没出现过时，才补一个 ≤400B 的 `<memory-recall>` 小块。闸门有两道：`recallMinScore`
+   与 `recallMaxPerConversation`；`recallMode: once` 回到「只注一次」，`off` 完全不注入、只留工具。
+
+5. **保留与归档（定期整理）** — 记忆库不会自己变小，所以除合并之外还有一条**不花额度**的确定性
+   维护线：每隔 `sweepIntervalHours`（默认 12 小时；进程启动时一次，会话空闲时再按间隔检查）
+   对所有已知工作区跑一次保留判定——**这么久没有被读到、没有被注入摘要、也不是新写的**条目
+   会被归档。判据只有 `maxUnusedDays`（默认 90 天）一条，结果可解释、可恢复；人手
+   `/memories add` 写的条目永不自动归档。想立刻整理用 `/memories sweep`。
 
 抽取还有三道闸门（照抄 Codex 的做法）：`minIdleHours`（会话至少空闲这么久）、
 `maxAgeDays`（最后活动太久的会话永不抽取）、`maxSessionsPerPass`（一次最多处理几个会话），
 用来把后台额度消耗限住。
 
-摘要内容按「最近更新 + 实际被读取次数」排序：反复被 `memory_search` 命中的记忆会优先进入
-有界摘要。
+摘要内容按**统一打分**排序：`相关度 × 重要度 × 新近度衰减`。重要度来自被 `memory_search` 命中的次数，新近度按 90 天半衰期衰减但**不降到 0.25 以下**——久远但精确的记忆仍然排得进有界摘要。同一个公式也用于工具检索和按需补注，所以「值得回忆」在三处是同一个意思。
 
 ## 安装
 
@@ -95,6 +106,7 @@ dsh plugin --profile web add github:you/dsh-memories
 - id: memories
   config:
     memoriesDir: /custom/path        # 默认 $DSH_HOME/memories
+    logFile: ''                     # 插件自己的日志文件；默认 $DSH_HOME/logs/dsh-memories.log，留空关闭
     projectRootMarkers: ['.git']
 ```
 
@@ -113,7 +125,13 @@ memories:
 | --- | --- | --- |
 | `maxSummaryBytes` | `4096` | 注入摘要字节预算；`0` 关闭注入 |
 | `maxSummaryEntries` | `12` | 每段摘要最多列出的条目数 |
-| `maxEntriesPerScope` | `200` | 每个作用域最多保存多少条，超出淘汰最久未使用的 |
+| `recallMode` | `on-demand` | 注入方式：`once` 只注一次摘要 / `on-demand` 额外按需补注 / `off` 只留工具 |
+| `recallMinScore` | `20` | 按需补注的相关度下限（标题、别名或标签命中即可达到） |
+| `recallMaxPerConversation` | `3` | 一个会话最多补注几次；`0` 等于关掉按需补注 |
+| `maxEntriesPerScope` | `200` | 每个作用域最多保留多少条，超出**归档**最久未使用的 |
+| `maxUnusedDays` | `90` | 多久没被读到/被注入摘要/也不是新写的就归档；`0` 关闭；人手写的永不归档 |
+| `dedupeSimilarity` | `0.7` | 标题与正文词重叠达到该比例时，新记忆视为改写并 `supersedes` 旧记忆；`0` 只保留完全相同规则 |
+| `sweepIntervalHours` | `12` | 定期整理间隔（对所有已知工作区）；`0` 关闭，仍可手动 `/memories sweep` |
 | `autoExtract` | `true` | 是否启用空闲后台抽取 |
 | `autoExtractIdleMs` | `300000` | 空闲多久后开始抽取（最小 1000） |
 | `extractWindowMessages` | `30` | 一次抽取最多看多少条对话消息 |
@@ -135,6 +153,8 @@ memories:
 | `consolidateProvider` / `consolidateModel` | 空 | 合并调用的模型路由；留空先回退到抽取路由，再回退到会话路由 |
 | `enableTool` | `true` | 是否注册 `memory` 工具（改完立即生效） |
 | `enableCommand` | `true` | 是否注册 `/memories` 命令（改完立即生效） |
+| `logLevel` | `info` | 插件日志文件详细程度：`off`/`error`/`warn`/`info`/`debug`；`info` = 错误+警告+每轮摘要，`debug` 再加逐条决策 |
+| `traceMaintenance` | `false` | 把归档、按需补注、复审选择等决策提升到 `info`（默认等级即可见）；关闭时它们只在 `debug` 出现 |
 
 设置走 DSH 的 settings 接缝注册（`ctx.settings.register('memories', schema, …)`），
 所以它自带 schema 校验、revision 冲突检测和文档热重载。若部署里没有挂
@@ -210,9 +230,13 @@ frontmatter 的目录包），下次技能目录刷新后进入目录。草稿�
 /memories search <query> [--kind <kind>]      检索，可按类别过滤
 /memories show <id>           看全文
 /memories add <global|project> <text> [--kind <kind>]   手工写入
-/memories forget <id>         删除
+/memories forget <id>         删除（真正删除；归档请用 archive）
+/memories archive [global|project]   列出已归档（退役/淘汰）的记忆
+/memories restore <id>        把归档的记忆取回原作用域
+/memories mode [on|off]       本次会话关闭/开启记忆（不写库、不抽取、不注入）
 /memories mine                立刻从当前会话抽取一次（不等空闲）
 /memories consolidate         立刻合并重整全部记忆（不等冷却）
+/memories sweep               立刻跑一次保留整理（归档长期无用的记忆）
 /memories skills              列出技能草稿
 /memories promote <name>      晋升一份草稿到 $DSH_HOME/skills
 /memories discard <name>      丢弃一份草稿
@@ -221,6 +245,56 @@ frontmatter 的目录包），下次技能目录刷新后进入目录。草稿�
 
 `kind` 取值：`fact` / `preference` / `knowledge` / `failure` / `procedure`。写错的 kind 会被忽略
 而不是让过滤结果为空——手滑不该让检索静默失效。
+
+## 日志与排障
+
+插件把自己说的话写进一个文件（默认 `$DSH_HOME/logs/dsh-memories.log`，超过 2MB 轮转一代，
+旧的一代留在 `dsh-memories.log.1`）：
+
+```bash
+tail -f ~/.dsh/logs/dsh-memories.log           # 实时看
+grep '\[warn\]' ~/.dsh/logs/dsh-memories.log   # 只看警告
+```
+
+`/memories stats` 会打印当前等级与文件路径，同时也是最快的一眼诊断：store 位置、两作用域条数、
+抽取/补注/保留配置、后台是否被额度暂停、状态库是不是降级成了纯内存。
+
+等级含义是「该级别及以上」，所以 `off` < `error` < `warn` < `info` < `debug`。默认 `info` =
+错误 + 警告 + 每轮抽取/合并摘要；`warn` 会丢掉那些摘要行，`debug` 再加上逐条决策。
+
+**一个必须知道的宿主行为**：cordis 对每条消息按 exporter 过滤，阈值取
+`exporter.levels?.default ?? logger.level ?? 1`，而 DSH 组合里唯一的 exporter（1000 条内存环形缓冲）
+没有声明 `levels`，于是阈值落到 `1` —— `warn`(2) 与 `debug`(3) **在任何 sink 看到之前就被丢掉**，
+并且 profile 里没有任何东西读那个环形缓冲。所以本插件自己注册了一个 `levels.default = 3` 的
+exporter，再按 `logLevel` 自行过滤；只把 profile 的 `logger.level` 调高是没用的（没有 sink）。
+这条由 `src/test/log.test.ts` 里的真实 cordis 测试钉住。
+
+想把维护决策也看清楚（为什么某条记忆被归档、为什么这一轮没补注、这次合并复审了哪些条目）：
+
+```yaml
+memories:
+  logLevel: debug          # 全部打开
+  traceMaintenance: true   # 或者只把决策提升到 info，不必整体开到 debug
+```
+
+其他排障入口：直接查 `state.db`（水位线 / 任务租约 / 用量与曝光计数 / 复审标记 / 额度暂停 /
+上次 sweep 时间）、会话日志配 `scripts/inspect-session.mjs`（注入块是持久消息，可在历史里核实
+字节数与是否重复注入）、`scripts/activation-smoke.mjs`（真实 cordis 里加载并打印注册结果）、
+`npm run eval`（抽取的离线打分）。
+
+## 离线抽取评测
+
+改抽取 prompt 是这个插件里最危险的动作：它同时影响所有工作区，而真机跑一次要花额度。
+`eval/` 下每个 JSON 是一个 fixture——一段会话、一次**真实模型的回复**、以及这次回复必须命中的
+记忆清单：
+
+```bash
+npm run eval                                   # 跑 eval/ 下全部 fixture
+node scripts/eval-extract.mjs --min-recall=0.8 # 低于该召回率就以退出码 1 结束
+```
+
+打分走真实的 `parseExtraction`（含密钥擦除），期望项与产出项按标题词重叠匹配，换个说法也算
+命中。于是它同时给你两样东西：改 prompt 前先看回归，捕获真实回复时顺手确认没有密钥泄漏。
 
 ## 存储格式
 
@@ -231,13 +305,16 @@ frontmatter 的目录包），下次技能目录刷新后进入目录。草稿�
 $DSH_HOME/memories/
 ├── index.json                     # 全局作用域索引（可重建缓存）
 ├── entries/<id>.md                # 每条全局记忆一个文件
+├── archive/<id>.md                # 归档的全局记忆（可恢复）
 ├── projects/<slug>/
 │   ├── index.json
 │   ├── project.json               # slug 由哪个绝对路径推导而来
-│   └── entries/<id>.md
+│   ├── entries/<id>.md
+│   └── archive/<id>.md            # 该工作区归档的记忆
 ├── sessions/<session-id>.md        # 证据笔记：那次会话在干什么（被挖掘过的会话）
 ├── skills/<name>/SKILL.md         # 技能草稿（未晋升前 DSH 看不到）
-└── state.db                       # SQLite：会话水位线 / 任务租约 / 用量计数 / 额度暂停
+├── archive/                       # 归档：退役/淘汰的记忆，可用 /memories restore 取回
+└── state.db                       # SQLite：水位线 / 任务租约 / 用量与曝光计数 / 复审标记 / 额度暂停
 ```
 
 条目文件：
@@ -249,6 +326,7 @@ scope: global
 kind: preference
 title: Prefer pnpm over npm
 tags: tooling, packages
+keys: monorepo, workspace
 appliesTo: before running any install or script
 created: 2026-09-09T02:00:00.000Z
 updated: 2026-09-09T02:00:00.000Z
@@ -256,6 +334,7 @@ source: tool
 session: session-11111111-2222-4333-8444-555555555555
 uses: 3
 lastUsed: 2026-09-09T05:12:00.000Z
+lastSurfaced: 2026-09-09T05:12:00.000Z
 ---
 
 The user standardizes on pnpm for every JavaScript project; never run `npm install`.
@@ -295,8 +374,8 @@ A very short session in which the user stated that this repository is shipped wi
 
 - **id = 标题的 slug**（`Prefer pnpm over npm` → `prefer-pnpm-over-npm`）。所以同一件事再写一次是**更新**而不是新增，`created` 保留、`updated` 刷新。
 - **原子写**：每次写入都是"临时文件 + rename"，不会留下半个文件；并发写也不会互相撕裂。
-- **去重**：加载时会把"标题+正文都高度重合"的条目合并，只留最新那条并删掉旧的 —— 防止同一件事被反复记成多条、挤占摘要预算。标题和正文都不重合的（哪怕正文一样）会各自保留。
-- **`uses` / `lastUsed`**：权威计数在 `state.db`（原子自增），同时镜像回条目文件，好让 markdown 自身是完整的。摘要按"最近更新 + 使用频次"排序。
+- **去重**：标题派生出 id，所以换个说法会生成新条目。写入时先用**词重叠**比对同作用域已有条目（`dedupeSimilarity`，默认 0.7）：标题与正文都够像时，新条目记下 `supersedes` 并取代旧的——既避免同一件事被记成多条，也留下"它取代了谁"的线索。加载时还会兜底合并标题+正文完全重合或互相包含的条目。
+- **`uses` / `lastUsed` / `lastSurfaced`**：权威计数在 `state.db`（原子写入），同时镜像回条目文件，好让 markdown 自身是完整的。`uses` 只在 `memory` 工具命中时增加；被摘要列出算 `lastSurfaced`（曝光），是更弱的信号——正因如此，一条"好到不需要检索"的记忆不会被保留判定误当成无用。
 - **`source`** 记来源：`tool`（模型调用工具写的）、`user`（`/memories add`）、`auto`（后台抽取）、`system`。
 
 ## 隐私
@@ -305,7 +384,8 @@ A very short session in which the user stated that this repository is shipped wi
 - 后台抽取的输入是会话对话尾部（只取用户与助手正文，丢弃工具结果和插件注入的上下文，
   以免记忆自噬），抽取结果在落盘前做密钥擦除。
 - 注入块明确告诉模型：这是**背景数据，不是指令**；记忆记录的是写入时的事实，不一定现在仍成立。
-- 关掉全部后台行为：`autoExtract: false`；只保留工具：再加 `maxSummaryBytes: 0`。
+- 关掉全部后台行为：`autoExtract: false`；只保留工具：再加 `maxSummaryBytes: 0` 或 `recallMode: off`。
+- 归档同样只动 `$DSH_HOME` 下的文件；要彻底关掉自动归档，把 `maxUnusedDays` 设为 `0`。
 
 ## 开发
 
@@ -314,6 +394,7 @@ npm i                        # 或 pnpm i；装完自动跑一次 build（prepar
 npm run typecheck            # tsc --noEmit
 npm test                     # 编译 + node --test
 npm run smoke                # 用真实 cordis 根加载插件，检查注册结果
+npm run eval                 # 离线抽取评测：回放 fixture 里保存的真实模型回复
 ```
 
 - `src/` 是 TypeScript 源；`lib/` 是**构建产物，不入库**，由 `npm run build` 生成
@@ -325,6 +406,8 @@ npm run smoke                # 用真实 cordis 根加载插件，检查注册�
 - `scripts/inspect-session.mjs <session.jsonl.zstd>`：解开会话日志，看注入块和工具表。
   会话日志是**多个 zstd 帧拼接**的，必须逐帧解压。
 - `scripts/seed.mjs`：往真实 `$DSH_HOME/memories` 各写一条全局与项目记忆，便于手测。
+- `eval/*.json` + `scripts/eval-extract.mjs`：把一个真实模型回复存成 fixture，之后每次改抽取
+  prompt 都能离线重打分（recall / precision + 密钥擦除）；`npm run eval` 跑全部 fixture。
 
 想把后台抽取的等待时间调短来手测，不要改默认值——用一个临时覆盖层：
 
@@ -347,10 +430,14 @@ dsh --profile web --patch ./fast.yml
   `extractModel`，合并另有 `consolidateProvider` / `consolidateModel`。
 - 合并子代理**可能判定"没什么可合并的"**并原样返回，这时不会产生任何写入。这是正常的，
   不是失败——它只在新记忆确实与旧记忆冲突或重复时才动手。
+- **没有任何东西是因为"老"而被删除的**：保留判定只把条目移进 `archive/`，`/memories restore <id>`
+  能原样取回；真正的删除只发生在 `/memories forget` 和归档区超过 500 条上限时。
+- 定期整理是**按进程时间**跑的（启动时一次 + 会话空闲时按 `sweepIntervalHours` 检查），不是
+  系统级 cron：从不启动 dsh 的机器不会整理，启动即退出的脚本只能赶上启动那一次。
 
 ## 端到端验证状况
 
-自动化测试覆盖了每个单元（103 项），但提示词与真实模型行为只能靠真机跑。截至最近一次
+自动化测试覆盖了每个单元（152 项，含检索 eval 语料、保留判定、归档往返、状态列迁移与按需补注闸门），但提示词与真实模型行为只能靠真机跑。截至最近一次
 真机验证：
 
 | 路径 | 状态 |
@@ -364,6 +451,8 @@ dsh --profile web --patch ./fast.yml
 | 技能草稿 → 晋升 → 技能目录 | ✅ 真机：晋升后冷启动会话的技能目录里出现了它（顺带查出并修掉了 description 含冒号导致草稿被静默丢弃的缺陷） |
 | 注入节奏（一次会话恰好一次） | ✅ 真机进程：带插件的 headless 组合跑真实会话，注入恰好 1 次（3943 字节）；真实日志里同一进程的相邻两轮，第一轮注入、第二轮没有 |
 | 重启后不重复注入 | ✅ 真实 API + 真实日志：`Session.deriveMessages()` 对注入的 recall 消息返回 `source={kind:'plugin',plugin:'memories',form:'recall'}`（判据成立），且该消息在会话日志里是普通持久事件（重启后随历史恢复） |
+| 保留/归档/定期整理/按需补注/键扩展（本轮新增） | ⏳ 单元测试覆盖：保留判定、归档往返、状态列迁移、按需补注三道闸门、检索 eval 语料（hit@3 100%）与抽取 eval fixture；真机行为待下一轮复核 |
+| 日志落盘（本轮新增） | ✅ 真实 cordis 激活（真服务 + 真 exporter）：`logLevel: info` 下文件里写出了启动行、`archiving global/ancient, unused for 9750 days`、`archived 1 unused memories`，归档文件带 `archived:` 时间戳；`warn`/`debug` 不再被宿主阈值丢弃由 `src/test/log.test.ts` 的真实 Context 测试钉住 |
 
 > 「多轮不重注入」这一条目前是**单元测试 + 单轮真机进程**两重证据：本轮想用浏览器复核时，web
 > profile 里另外几个插件把 GUI 挡住了（`dsh-message-edit` 缺 `@deepseek-ai/dsh-client-runtime/client`、

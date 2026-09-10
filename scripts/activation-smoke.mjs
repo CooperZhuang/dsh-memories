@@ -124,7 +124,7 @@ const module = await import(entry)
 console.log('exports:', Object.keys(module).sort().join(', '))
 console.log('inject:', JSON.stringify(module.inject))
 
-const plugin = ctx.plugin(module, { memoriesDir, autoExtract: false })
+const plugin = ctx.plugin(module, { memoriesDir, autoExtract: false, logFile: '' })
 await new Promise((settle) => setTimeout(settle, 200))
 
 console.log('settings namespaces:', settings.describe().map((d) => d.ns).join(', ') || '(none)')

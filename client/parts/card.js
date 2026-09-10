@@ -42,9 +42,44 @@ const FIELDS = [
     hint: { zh: '摘要里每个作用域列出多少条记忆。', en: 'How many memories each scope lists in the summary.' },
   },
   {
+    field: 'recallMode', kind: 'select',
+    options: [
+      { value: 'once', label: { zh: '仅一次', en: 'Once' } },
+      { value: 'on-demand', label: { zh: '按需补充', en: 'On demand' } },
+      { value: 'off', label: { zh: '关闭注入', en: 'Off' } },
+    ],
+    label: { zh: '记忆注入方式', en: 'Memory injection' },
+    hint: { zh: 'once 只在会话开始时注入一次摘要；on-demand 额外在当前话题明显命中记忆时补一小块；off 完全关闭注入，只留记忆工具。', en: 'once injects the summary at the start of the conversation; on-demand also adds a small block when the current turn clearly matches a memory; off disables injection and leaves only the memory tool.' },
+  },
+  {
+    field: 'recallMinScore', kind: 'number', min: 0, step: 5,
+    label: { zh: '按需注入的相关度下限', en: 'Recall relevance floor' },
+    hint: { zh: '补注需要达到的相关度分数；标题、别名或标签命中即可达到。0 表示只要沾边就补。', en: 'Relevance a memory must reach to be injected on demand; a title, key, or tag hit clears it. 0 accepts any match.' },
+  },
+  {
+    field: 'recallMaxPerConversation', kind: 'number', min: 0, step: 1,
+    label: { zh: '每会话补注次数上限', en: 'Recall deltas per conversation' },
+    hint: { zh: '一个会话最多补注几次；0 关闭按需补注，只保留一次摘要。', en: 'Maximum on-demand blocks per conversation. 0 keeps only the once-per-conversation summary.' },
+  },
+  {
     field: 'maxEntriesPerScope', kind: 'number', min: 1, step: 1,
     label: { zh: '每作用域保留条数', en: 'Stored memories per scope' },
-    hint: { zh: '超过后删除最久未使用的记忆。', en: 'Past this cap the least recently used memories are deleted.' },
+    hint: { zh: '超过后归档最久未使用的记忆（可用 /memories restore 取回）。', en: 'Past this cap the least recently used memories are archived; /memories restore brings one back.' },
+  },
+  {
+    field: 'maxUnusedDays', kind: 'number', min: 0, step: 10,
+    label: { zh: '无用记忆归档天数', en: 'Archive unused after (days)' },
+    hint: { zh: '这么久没有被读到、没有被注入摘要、也不是新写的记忆会被归档（可恢复）。0 关闭归档；人手写的记忆永不归档。', en: 'Archive a memory that has not been read, surfaced, or written for this many days. Recoverable with /memories restore. 0 disables archival; memories a person wrote are never archived.' },
+  },
+  {
+    field: 'dedupeSimilarity', kind: 'number', min: 0, step: 0.05,
+    label: { zh: '近似重复合并阈值', en: 'Near-duplicate threshold' },
+    hint: { zh: '标题与正文词重叠超过该比例时，新记忆视为改写并取代旧记忆（0–1）。0 只保留完全相同才合并的规则。', en: 'Share of title and body words two memories must share before the newer one supersedes the older (0-1). 0 keeps only the exact-match rule.' },
+  },
+  {
+    field: 'sweepIntervalHours', kind: 'number', min: 0, step: 1,
+    label: { zh: '定期整理间隔（小时）', en: 'Maintenance sweep interval (hours)' },
+    hint: { zh: '每隔多久对所有工作区做一次归档整理；0 关闭定期整理（仍可用 /memories sweep 手动执行）。', en: 'How often to run retention across every workspace. 0 disables the periodic sweep; /memories sweep still runs it on demand.' },
   },
   {
     field: 'autoExtract', kind: 'boolean',
@@ -161,6 +196,23 @@ const FIELDS = [
     label: { zh: '斜杠命令', en: 'Slash command' },
     hint: { zh: '是否注册 /memories 命令。立即生效。', en: 'Register the /memories command. Takes effect immediately.' },
   },
+  {
+    field: 'logLevel', kind: 'select',
+    options: [
+      { value: 'off', label: { zh: '不写日志', en: 'Off' } },
+      { value: 'error', label: { zh: '仅错误', en: 'Errors' } },
+      { value: 'warn', label: { zh: '错误 + 警告', en: 'Errors and warnings' } },
+      { value: 'info', label: { zh: '再 + 每轮摘要（默认）', en: 'Plus pass summaries' } },
+      { value: 'debug', label: { zh: '全部（含逐条决策）', en: 'Everything' } },
+    ],
+    label: { zh: '日志等级', en: 'Log level' },
+    hint: { zh: '本插件日志文件的详细程度。默认 info：错误、警告，以及每轮抽取/合并摘要。debug 还会记录每条归档、补注、复审决策。文件路径见 /memories stats。', en: 'How much this plugin writes to its own log file. info keeps errors, warnings, and one line per pass; debug adds every retention, recall, and review decision. /memories stats prints the path.' },
+  },
+  {
+    field: 'traceMaintenance', kind: 'boolean',
+    label: { zh: '记录维护决策明细', en: 'Trace maintenance decisions' },
+    hint: { zh: '把归档、按需补注、复审选择等决策提升到 info，默认等级就能看到；关闭时它们只在 debug 等级出现。', en: 'Log retention, recall, and selection decisions at info so a stock log level records them; off keeps them at debug.' },
+  },
 ]
 
 /** Whether the user layer carries an override for one field. */
@@ -192,6 +244,17 @@ function renderRow(React, field, snapshot, draft, onEdit, lang, copy) {
       disabled,
       onChange: (event) => onEdit(field.field, event.target.checked),
     }))
+  } else if (field.kind === 'select') {
+    controls.push(React.createElement('select', {
+      key: 'input',
+      className: 'dshm-input',
+      value: current === undefined || current === null ? '' : String(current),
+      disabled,
+      onChange: (event) => onEdit(field.field, event.target.value),
+    }, (field.options ?? []).map((option) => React.createElement('option', {
+      key: option.value,
+      value: option.value,
+    }, option.label[lang] ?? option.label.zh))))
   } else {
     controls.push(React.createElement('input', {
       key: 'input',

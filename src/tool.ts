@@ -100,6 +100,11 @@ export function registerMemoryTool(ctx: Context, runtime: MemoriesRuntime): () =
         items: { type: 'string' },
         description: 'write/search: lowercase keyword tags.',
       },
+      keys: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'write: aliases and keyphrases a future search should find this memory by (for example "monorepo" for a memory about pnpm workspaces). Cheap recall: preferred over restating the body.',
+      },
       kind: {
         type: 'string',
         enum: [...KINDS],
@@ -150,6 +155,7 @@ export function registerMemoryTool(ctx: Context, runtime: MemoriesRuntime): () =
             body,
             tags: args.tags ?? [],
             ...args.kind === undefined ? {} : { kind: args.kind },
+            ...args.keys === undefined ? {} : { keys: args.keys },
             ...args.appliesTo === undefined ? {} : { appliesTo: args.appliesTo },
           }, 'tool')
           const hint = args.scope === 'project'

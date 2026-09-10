@@ -11,6 +11,7 @@
     "declarationMap": false,
     "sourceMap": false,
     "strict": true,
+    "noEmitOnError": true,
     "exactOptionalPropertyTypes": true,
     "noUncheckedIndexedAccess": true,
     "noImplicitOverride": true,

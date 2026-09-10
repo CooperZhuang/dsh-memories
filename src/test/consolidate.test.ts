@@ -24,7 +24,7 @@ import type { MemoryDraft, MemoryEntry, MemoryScope } from '../types.js'
 
 /** Build one entry. */
 function entry(partial: Partial<MemoryEntry> & Pick<MemoryEntry, 'id' | 'title' | 'body'>): MemoryEntry {
-  return { scope: 'global', kind: 'fact', tags: [], createdAt: 1, updatedAt: 1, uses: 0, lastUsedAt: 0, source: 'auto', ...partial }
+  return { scope: 'global', kind: 'fact', tags: [], keys: [], createdAt: 1, updatedAt: 1, uses: 0, lastUsedAt: 0, lastSurfacedAt: 0, source: 'auto', ...partial }
 }
 
 /** A stub subagent seam recording the request and replaying one reply. */
@@ -54,18 +54,24 @@ function target(initial: MemoryEntry[], failOn?: string) {
         title: draft.title,
         body: draft.body,
         tags: draft.tags,
+        keys: draft.keys ?? existing?.keys ?? [],
         createdAt: existing?.createdAt ?? 1,
         updatedAt: 2,
         uses: existing?.uses ?? 0,
         lastUsedAt: existing?.lastUsedAt ?? 0,
+        lastSurfacedAt: existing?.lastSurfacedAt ?? 0,
         source,
       }
       entries.set(`${draft.scope}\u0000${id}`, next)
       return { entry: next, action: existing === undefined ? 'created' as const : 'updated' as const }
     },
-    remove: async (scope: MemoryScope, _root, id) => {
-      writes.push(`remove:${id}`)
+    archive: async (scope: MemoryScope, _root, id) => {
+      writes.push(`archive:${id}`)
       return entries.delete(`${scope}\u0000${id}`)
+    },
+    restore: async (scope: MemoryScope, _root, id) => {
+      writes.push(`restore:${id}`)
+      return entries.has(`${scope}\u0000${id}`)
     },
   }
   return { api, writes, get: (scope: MemoryScope, id: string) => entries.get(`${scope}\u0000${id}`), all: () => [...entries.values()] }
@@ -186,12 +192,13 @@ test('applyPlan merges and retires through the target', async () => {
   const second = entry({ id: 'b', title: 'B', body: 'b' })
   const store = target([first, second])
   const result = await applyPlan({
-    upserts: [{ id: 'a', scope: 'global', kind: 'preference', title: 'A merged', body: 'merged', tags: [] }, { id: null, scope: 'project', kind: 'fact', title: 'New', body: 'new', tags: [] }],
+    upserts: [{ id: 'a', scope: 'global', kind: 'preference', title: 'A merged', body: 'merged', tags: [], keys: ['alias'] }, { id: null, scope: 'project', kind: 'fact', title: 'New', body: 'new', tags: [] }],
     retire: ['b'],
     skills: [],
     notes: 'merged',
   }, store.api, undefined, { entries: [first, second] })
   assert.deepEqual(result, { written: 2, retired: 1, notes: 'merged' })
+  assert.deepEqual([...(store.get('global', 'a')?.keys ?? [])], ['alias'], 'a merged memory keeps the keys it was given')
   assert.equal(store.get('global', 'a')?.title, 'A merged')
   assert.equal(store.get('project', 'new')?.body, 'new')
   assert.equal(store.get('global', 'b'), undefined)

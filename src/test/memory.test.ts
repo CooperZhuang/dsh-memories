@@ -65,7 +65,7 @@ test('the quota knobs default on and clamp to zero', () => {
 
 /** Build a complete entry from the fields a test cares about. */
 function entry(partial: Partial<MemoryEntry> & Pick<MemoryEntry, 'id' | 'scope' | 'title' | 'body'>): MemoryEntry {
-  return { kind: 'fact', tags: [], createdAt: 1, updatedAt: 1, uses: 0, lastUsedAt: 0, source: 'tool', ...partial }
+  return { kind: 'fact', tags: [], keys: [], createdAt: 1, updatedAt: 1, uses: 0, lastUsedAt: 0, lastSurfacedAt: 0, source: 'tool', ...partial }
 }
 
 test('entry files round-trip through format and parse', () => {

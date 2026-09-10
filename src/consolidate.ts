@@ -40,7 +40,7 @@ export const CONSOLIDATE_SYSTEM = [
   'When two or more memories together describe a repeatable procedure that would be worth running again, also return it as a skill: a short kebab-case name, a one-line description, and the ordered steps. Skills are drafts a human promotes; return at most 2.',
   '',
   'Reply with JSON only, no prose and no code fence:',
-  '{"memories":[{"id":string|null,"scope":"global"|"project","kind":string,"title":string,"body":string,"tags":string[],"appliesTo":string}],"retire":[string],"skills":[{"name":string,"description":string,"steps":string[]}],"notes":string}',
+  '{"memories":[{"id":string|null,"scope":"global"|"project","kind":string,"title":string,"body":string,"tags":string[],"keys":string[],"appliesTo":string}],"retire":[string],"skills":[{"name":string,"description":string,"steps":string[]}],"notes":string}',
   'Use null for the id of a new memory. "retire" lists ids to delete. "notes" is one short sentence about what you changed.',
 ].join('\n')
 
@@ -101,7 +101,7 @@ export interface SkillDraft {
 /** One consolidation proposal, already validated against the input. */
 export interface ConsolidationPlan {
   /** Memories to add or replace, keyed by the id they replace (or `undefined` to add). */
-  readonly upserts: readonly { id: string | null; scope: MemoryScope; kind: MemoryKind; title: string; body: string; tags: readonly string[]; appliesTo?: string }[]
+  readonly upserts: readonly { id: string | null; scope: MemoryScope; kind: MemoryKind; title: string; body: string; tags: readonly string[]; keys?: readonly string[]; appliesTo?: string }[]
   /** Ids to delete. */
   readonly retire: readonly string[]
   /** Skill drafts extracted from the memory set. */
@@ -127,6 +127,7 @@ export function renderConsolidationInput(entries: readonly MemoryEntry[], projec
       blocks.push(`- id: ${entry.id}`)
       blocks.push(`  title: ${entry.title}`)
       blocks.push(`  tags: ${entry.tags.join(', ') || '(none)'}`)
+      blocks.push(`  keys: ${entry.keys.join(', ') || '(none)'}`)
       blocks.push(`  body: ${entry.body.replace(/\n+/gu, ' ')}`)
     }
     blocks.push('')
@@ -170,6 +171,7 @@ export function parsePlan(text: string, knownIds: ReadonlySet<string>, maxUpsert
     if (id !== null && seen.has(id)) continue
     if (id !== null) seen.add(id)
     const tags = Array.isArray(entry['tags']) ? entry['tags'].filter((tag): tag is string => typeof tag === 'string') : []
+    const keys = Array.isArray(entry['keys']) ? entry['keys'].filter((key): key is string => typeof key === 'string') : []
     const appliesTo = typeof entry['appliesTo'] === 'string' ? entry['appliesTo'].replace(/\s+/gu, ' ').trim().slice(0, 160) : ''
     upserts.push({
       id,
@@ -178,6 +180,7 @@ export function parsePlan(text: string, knownIds: ReadonlySet<string>, maxUpsert
       title: cleanTitle,
       body: cleanBody,
       tags,
+      keys,
       ...appliesTo.length > 0 ? { appliesTo } : {},
     })
   }
@@ -333,6 +336,49 @@ export async function runConsolidation(seam: SubagentSeam, request: ConsolidateR
   return parsePlan(text, known, request.maxUpserts)
 }
 
+/**
+ * Choose which memories one consolidation pass reviews.
+ *
+ * The pass used to receive the newest N entries, which meant an old memory was
+ * never looked at again: the first page never changed, so a stale fact deep in
+ * the store was unreachable by the only mechanism that could retire it.
+ * Selection prefers what was never reviewed, then what was reviewed longest
+ * ago, so every memory is eventually reached while new material — and material
+ * the model actually uses — still goes first.
+ *
+ * @param entries - every candidate entry.
+ * @param reviewedAt - `scope\u0000id` → last review time, or 0 when never.
+ * @param max - how many entries the pass may consider.
+ * @returns the selection to hand the sub-agent.
+ */
+export function selectForConsolidation(
+  entries: readonly MemoryEntry[],
+  reviewedAt: ReadonlyMap<string, number>,
+  max: number,
+): readonly MemoryEntry[] {
+  if (max <= 0) return []
+  const key = (entry: MemoryEntry): string => `${entry.scope}\u0000${entry.id}`
+  const selected: MemoryEntry[] = []
+  const taken = new Set<string>()
+  const fresh = entries.filter((entry) => (reviewedAt.get(key(entry)) ?? 0) === 0)
+  fresh.sort((left, right) => right.uses - left.uses || right.updatedAt - left.updatedAt || left.id.localeCompare(right.id))
+  for (const entry of fresh) {
+    if (selected.length >= max) return selected
+    selected.push(entry)
+    taken.add(key(entry))
+  }
+  const rest = entries.filter((entry) => !taken.has(key(entry)))
+  rest.sort((left, right) =>
+    (reviewedAt.get(key(left)) ?? 0) - (reviewedAt.get(key(right)) ?? 0)
+    || right.updatedAt - left.updatedAt
+    || left.id.localeCompare(right.id))
+  for (const entry of rest) {
+    if (selected.length >= max) break
+    selected.push(entry)
+  }
+  return selected
+}
+
 /** A snapshot of the store taken before applying a plan, used to roll back. */
 export interface ConsolidationSnapshot {
   /** Entries as they were before the plan ran. */
@@ -343,8 +389,10 @@ export interface ConsolidationSnapshot {
 export interface ConsolidationTarget {
   /** Write one entry, keeping `keepId` when given. */
   upsert(draft: MemoryDraft, projectRoot: string | undefined, source: MemoryEntry['source'], keepId?: string): Promise<{ entry: MemoryEntry; action: 'created' | 'updated' }>
-  /** Delete one entry by id. */
-  remove(scope: MemoryScope, projectRoot: string | undefined, id: string): Promise<boolean>
+  /** Move one entry out of the live store; returns whether it was there. */
+  archive(scope: MemoryScope, projectRoot: string | undefined, id: string): Promise<boolean>
+  /** Put an archived entry back, used to roll back a failed plan. */
+  restore(scope: MemoryScope, projectRoot: string | undefined, id: string): Promise<boolean>
 }
 
 /** The outcome of applying a plan. */
@@ -375,15 +423,17 @@ export async function applyPlan(
 ): Promise<ConsolidationResult> {
   const before = new Map(snapshot.entries.map((entry) => [`${entry.scope}\u0000${entry.id}`, entry]))
   const touched: { scope: MemoryScope; id: string }[] = []
+  /** Retirements already archived, so a failed plan can put them back. */
+  const archived: { scope: MemoryScope; id: string }[] = []
   try {
     for (const item of plan.upserts) {
-      const draft: MemoryDraft = { scope: item.scope, title: item.title, body: item.body, tags: item.tags }
+      const draft: MemoryDraft = { scope: item.scope, title: item.title, body: item.body, tags: item.tags, keys: item.keys ?? [] }
       const result = await target.upsert(draft, item.scope === 'project' ? projectRoot : undefined, 'auto', item.id ?? undefined)
       touched.push({ scope: result.entry.scope, id: result.entry.id })
     }
     for (const id of plan.retire) {
-      await target.remove('global', projectRoot, id)
-      await target.remove('project', projectRoot, id)
+      if (await target.archive('global', projectRoot, id)) archived.push({ scope: 'global', id })
+      if (await target.archive('project', projectRoot, id)) archived.push({ scope: 'project', id })
     }
     return { written: plan.upserts.length, retired: plan.retire.length, notes: plan.notes }
   } catch (error) {
@@ -393,11 +443,17 @@ export async function applyPlan(
       const original = before.get(`${item.scope}\u0000${item.id}`)
       if (original === undefined) continue
       await target.upsert(
-        { scope: original.scope, title: original.title, body: original.body, tags: original.tags },
+        { scope: original.scope, title: original.title, body: original.body, tags: original.tags, keys: [...original.keys] },
         original.scope === 'project' ? projectRoot : undefined,
         original.source,
         original.id,
       )
+    }
+    // A retirement is an archival, not a deletion, so it can be put back
+    // exactly; without this the store would lose entries to a plan that failed
+    // for an unrelated reason later in the same run.
+    for (const item of archived) {
+      await target.restore(item.scope, projectRoot, item.id).catch(() => undefined)
     }
     throw error
   }
