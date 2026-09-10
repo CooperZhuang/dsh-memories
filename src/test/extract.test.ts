@@ -261,3 +261,66 @@ test('extraction is skipped for subagent sessions and when disabled', async (t) 
     assert.equal(await runtime.runExtraction(agent), 0)
   t.after(() => rm(dir, { recursive: true, force: true }))
 })
+
+test('a provider refusal pauses background passes and the pause survives a reopen', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-quota-'))
+  const session = stubSession(process.cwd(), [{ seq: 1, role: 'user', text: 'I always deploy with pnpm run ship.' }])
+  let calls = 0
+  const refusing = {
+    stream: () => {
+      calls += 1
+      const error = new Error('rate limit exceeded') as Error & { code?: string }
+      error.code = 'RATE_LIMIT'
+      throw error
+    },
+  }
+  const runtime = new MemoriesRuntime(stubContext(refusing), {
+    memoriesDir: dir,
+    autoExtract: true,
+    quotaCooldownMinutes: 30,
+    quotaCooldownMaxMinutes: 120,
+  })
+  t.after(() => runtime.dispose())
+  const agent = { id: 'extract-session', session, status: 'idle' } as unknown as Agent
+
+  await assert.rejects(() => runtime.runExtraction(agent), /rate limit/u)
+  assert.equal(calls, 1)
+  const first = runtime.state.getLimit()
+  assert.ok(first !== undefined, 'a refusal is recorded')
+  assert.equal(first.failures, 1)
+  assert.equal(first.until - first.at, 30 * 60_000)
+
+  // The next pass never reaches the provider, so the refusal costs one call per
+  // cooldown instead of one per idle timer.
+  assert.equal(await runtime.runExtraction(agent), 0)
+  assert.equal(calls, 1)
+
+  // A second refusal doubles the wait; consecutive refusals keep doubling to a cap.
+  runtime.state.clearLimit()
+  await assert.rejects(() => runtime.runExtraction(agent), /rate limit/u)
+  const second = runtime.state.noteLimitFailure('again', 30 * 60_000, 120 * 60_000)
+  assert.equal(second.failures, 2)
+  assert.equal(second.until - second.at, 60 * 60_000)
+
+  // The pause is durable state: a restarted process must not immediately retry.
+  const reopened = new MemoriesRuntime(stubContext(refusing), { memoriesDir: dir, autoExtract: true })
+  t.after(() => reopened.dispose())
+  assert.equal(reopened.state.isLimited(), true)
+  assert.equal(await reopened.runExtraction(agent), 0)
+  assert.equal(calls, 2, 'a paused pass never calls the provider')
+
+  // A successful pass forgets the pause.
+  reopened.state.clearLimit()
+  assert.equal(reopened.state.isLimited(), false)
+  t.after(() => rm(dir, { recursive: true, force: true }))
+})
+
+test('consolidation quotes the rate limit as its own refusal', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-quota-consolidate-'))
+  const runtime = new MemoriesRuntime(stubContext({ stream: async function* () {} }), { memoriesDir: dir, autoExtract: false })
+  t.after(() => runtime.dispose())
+  runtime.state.noteLimitFailure('quota exhausted', 1_000, 1_000)
+  assert.equal(runtime.state.isLimited(), true)
+  assert.match(await runtime.stats(stubSession(process.cwd(), [])), /background: paused until/u)
+  t.after(() => rm(dir, { recursive: true, force: true }))
+})

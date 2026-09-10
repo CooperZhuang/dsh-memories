@@ -74,6 +74,29 @@ export interface ConsolidateJob {
   lastError?: string
 }
 
+/** The single background-pass pause a store records today. */
+export const BACKGROUND_LIMIT = 'background'
+
+/**
+ * A recorded "stop spending quota" state.
+ *
+ * Codex gates background memory work on a provider-reported remaining-quota
+ * percentage. DSH exposes no such number, so the same protection is driven by the
+ * refusal itself: after a rate-limit or exhausted-quota error the plugin stops
+ * starting background passes until the wait elapses, doubling it per consecutive
+ * refusal.
+ */
+export interface LimitState {
+  /** Consecutive refused passes. */
+  failures: number
+  /** Unix epoch milliseconds before which no background pass may start. */
+  until: number
+  /** Unix epoch milliseconds of the most recent refusal. */
+  at: number
+  /** Provider wording, for diagnostics. */
+  reason?: string
+}
+
 /** A minimal synchronous SQL driver, matching the subset of `node:sqlite` used here. */
 interface SqlDatabase {
   exec(sql: string): void
@@ -93,6 +116,7 @@ export class StateStore {
   private readonly sessions = new Map<string, SessionState>()
   private readonly jobs = new Map<string, ConsolidateJob>()
   private readonly usage = new Map<string, { uses: number; lastUsedAt: number }>()
+  private readonly limits = new Map<string, LimitState>()
   /** Why the SQL driver is absent, for one diagnostic line. */
   readonly degradedReason: string | undefined
 
@@ -131,6 +155,13 @@ export class StateStore {
           uses INTEGER NOT NULL DEFAULT 0,
           last_used_at INTEGER NOT NULL DEFAULT 0,
           PRIMARY KEY (scope, id)
+        );
+        CREATE TABLE IF NOT EXISTS limits (
+          id TEXT PRIMARY KEY,
+          failures INTEGER NOT NULL DEFAULT 0,
+          until INTEGER NOT NULL DEFAULT 0,
+          at INTEGER NOT NULL DEFAULT 0,
+          reason TEXT
         );
       `)
       this.migrate()
@@ -345,6 +376,71 @@ export class StateStore {
     const rows = this.db.prepare('SELECT scope, id, uses, last_used_at FROM usage').all() as
       { scope: string; id: string; uses: number; last_used_at: number }[]
     return rows.map((row) => ({ scope: row.scope, id: row.id, uses: Number(row.uses), lastUsedAt: Number(row.last_used_at) }))
+  }
+
+  /** The recorded background pause, if any. */
+  getLimit(id: string = BACKGROUND_LIMIT): LimitState | undefined {
+    if (this.db === undefined) return this.limits.get(id)
+    const row = this.db.prepare('SELECT id, failures, until, at, reason FROM limits WHERE id = ?').get(id) as
+      | { id: string; failures: number; until: number; at: number; reason: string | null }
+      | undefined
+    if (row === undefined) return undefined
+    return {
+      failures: Number(row.failures),
+      until: Number(row.until),
+      at: Number(row.at),
+      ...row.reason === null ? {} : { reason: row.reason },
+    }
+  }
+
+  /**
+   * Whether background passes are paused right now.
+   * @param now - injected clock.
+   * @param id - which pause to read.
+   * @returns true while the recorded wait has not elapsed.
+   */
+  isLimited(now = Date.now(), id: string = BACKGROUND_LIMIT): boolean {
+    const limit = this.getLimit(id)
+    return limit !== undefined && limit.until > now
+  }
+
+  /**
+   * Record one provider refusal and extend the wait.
+   *
+   * The wait doubles per consecutive refusal, capped, so a provider that keeps
+   * refusing costs one failed call per interval instead of one per idle timer.
+   *
+   * @param reason - provider wording, for diagnostics.
+   * @param baseMs - wait after the first refusal.
+   * @param maxMs - ceiling for the doubling.
+   * @param now - injected clock.
+   * @param id - which pause to write.
+   * @returns the state after this refusal.
+   */
+  noteLimitFailure(reason: string, baseMs: number, maxMs: number, now = Date.now(), id: string = BACKGROUND_LIMIT): LimitState {
+    const previous = this.getLimit(id)
+    const failures = (previous?.failures ?? 0) + 1
+    const wait = Math.min(maxMs, baseMs * 2 ** (failures - 1))
+    const state: LimitState = { failures, until: now + wait, at: now, reason }
+    if (this.db === undefined) {
+      this.limits.set(id, state)
+      return state
+    }
+    this.db.prepare(`
+      INSERT INTO limits (id, failures, until, at, reason) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        failures = excluded.failures, until = excluded.until, at = excluded.at, reason = excluded.reason
+    `).run(id, state.failures, state.until, state.at, state.reason ?? null)
+    return state
+  }
+
+  /** Forget the pause after a pass succeeds. */
+  clearLimit(id: string = BACKGROUND_LIMIT): void {
+    if (this.db === undefined) {
+      this.limits.delete(id)
+      return
+    }
+    this.db.prepare('DELETE FROM limits WHERE id = ?').run(id)
   }
 }
 

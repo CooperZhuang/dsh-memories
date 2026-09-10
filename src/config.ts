@@ -68,6 +68,11 @@ export const DEFAULT_CONSOLIDATE_MAX_ENTRIES = 64
 /** Default timeout for one consolidation sub-agent run. */
 export const DEFAULT_CONSOLIDATE_TIMEOUT_MS = 180_000
 
+/** Default wait after a provider refuses a background pass for quota or rate. */
+export const DEFAULT_QUOTA_COOLDOWN_MINUTES = 30
+
+/** Default ceiling for that wait as consecutive refusals double it. */
+export const DEFAULT_QUOTA_COOLDOWN_MAX_MINUTES = 480
 /**
  * The tunable settings section: one schema shared by the settings seam, the
  * GUI form, and the runtime. Every field carries its default, so an absent
@@ -105,10 +110,20 @@ export const MemoriesSettingsSchema = z.object({
   consolidateCooldownHours: z.number().default(DEFAULT_CONSOLIDATE_COOLDOWN_HOURS).description('Minimum hours between consolidation passes; bounds background quota use.'),
   consolidateMaxEntries: z.number().default(DEFAULT_CONSOLIDATE_MAX_ENTRIES).description('How many memories one consolidation pass may consider.'),
   consolidateTimeoutMs: z.number().default(DEFAULT_CONSOLIDATE_TIMEOUT_MS).description('Timeout for one consolidation sub-agent run.'),
+  /** Stop background passes while the provider is refusing for quota or rate. */
+  pauseOnQuotaError: z.boolean().default(true).description('Stop background extraction and consolidation after a rate-limit or exhausted-quota error, until the cooldown elapses.'),
+  /** Wait after the first such refusal; doubles per consecutive refusal. */
+  quotaCooldownMinutes: z.number().default(DEFAULT_QUOTA_COOLDOWN_MINUTES).description('Minutes to wait after a rate-limit or quota refusal. Doubles per consecutive refusal.'),
+  /** Ceiling for that doubling. */
+  quotaCooldownMaxMinutes: z.number().default(DEFAULT_QUOTA_COOLDOWN_MAX_MINUTES).description('Upper bound for the quota cooldown.'),
   /** Explicit extraction provider route; empty reuses the session route. */
   extractProvider: z.string().default('').description("Provider route for extraction. Empty reuses the session's own logged route."),
   /** Explicit extraction model; empty reuses the session route. */
   extractModel: z.string().default('').description("Model for extraction. Empty reuses the session's own logged route."),
+  /** Explicit consolidation provider route; empty falls back to the extraction route. */
+  consolidateProvider: z.string().default('').description('Provider route for consolidation. Empty falls back to the extraction route, then the session route.'),
+  /** Explicit consolidation model; empty falls back to the extraction route. */
+  consolidateModel: z.string().default('').description('Model for consolidation. Empty falls back to the extraction route, then the session route.'),
   /** Whether the `memory` tool is registered for the model. */
   enableTool: z.boolean().default(true).description('Register the model-facing memory tool.'),
   /** Whether `/memories` is registered. */
@@ -137,8 +152,13 @@ export const MEMORIES_SETTINGS_DEFAULTS: MemoriesSettings = {
   consolidateCooldownHours: DEFAULT_CONSOLIDATE_COOLDOWN_HOURS,
   consolidateMaxEntries: DEFAULT_CONSOLIDATE_MAX_ENTRIES,
   consolidateTimeoutMs: DEFAULT_CONSOLIDATE_TIMEOUT_MS,
+  pauseOnQuotaError: true,
+  quotaCooldownMinutes: DEFAULT_QUOTA_COOLDOWN_MINUTES,
+  quotaCooldownMaxMinutes: DEFAULT_QUOTA_COOLDOWN_MAX_MINUTES,
   extractProvider: '',
   extractModel: '',
+  consolidateProvider: '',
+  consolidateModel: '',
   enableTool: true,
   enableCommand: true,
 }
@@ -173,6 +193,11 @@ export interface MemoriesConfig {
   extractMaxMemories?: number
   extractProvider?: string
   extractModel?: string
+  consolidateProvider?: string
+  consolidateModel?: string
+  pauseOnQuotaError?: boolean
+  quotaCooldownMinutes?: number
+  quotaCooldownMaxMinutes?: number
   enableTool?: boolean
   enableCommand?: boolean
 }
@@ -200,6 +225,13 @@ export function normalizeSettings(input: Partial<MemoriesSettings> | undefined):
   const route = provider.length > 0 && model.length > 0
     ? { extractProvider: provider, extractModel: model }
     : { extractProvider: '', extractModel: '' }
+  const consolidateProvider = value.consolidateProvider?.trim() ?? ''
+  const consolidateModel = value.consolidateModel?.trim() ?? ''
+  // A lone half is not a route: the pair resolves together or not at all, and an
+  // empty consolidation route falls back to the extraction one at call time.
+  const consolidateRoute = consolidateProvider.length > 0 && consolidateModel.length > 0
+    ? { consolidateProvider, consolidateModel }
+    : { consolidateProvider: '', consolidateModel: '' }
   return {
     maxSummaryBytes: positive(value.maxSummaryBytes, DEFAULT_MAX_SUMMARY_BYTES, 0),
     maxSummaryEntries: positive(value.maxSummaryEntries, DEFAULT_MAX_SUMMARY_ENTRIES),
@@ -218,12 +250,36 @@ export function normalizeSettings(input: Partial<MemoriesSettings> | undefined):
     consolidateCooldownHours: positive(value.consolidateCooldownHours, DEFAULT_CONSOLIDATE_COOLDOWN_HOURS, 0),
     consolidateMaxEntries: positive(value.consolidateMaxEntries, DEFAULT_CONSOLIDATE_MAX_ENTRIES),
     consolidateTimeoutMs: positive(value.consolidateTimeoutMs, DEFAULT_CONSOLIDATE_TIMEOUT_MS),
+    pauseOnQuotaError: value.pauseOnQuotaError ?? true,
+    quotaCooldownMinutes: positive(value.quotaCooldownMinutes, DEFAULT_QUOTA_COOLDOWN_MINUTES, 0),
+    quotaCooldownMaxMinutes: positive(value.quotaCooldownMaxMinutes, DEFAULT_QUOTA_COOLDOWN_MAX_MINUTES, 0),
     ...route,
+    ...consolidateRoute,
     enableTool: value.enableTool ?? true,
     enableCommand: value.enableCommand ?? true,
   }
 }
 
+/**
+ * The route one consolidation pass runs on.
+ *
+ * Codex keeps `memories.extract_model` and `memories.consolidation_model`
+ * separate; here an unset consolidation route falls back to the extraction one
+ * and then to the session's own logged route, so an existing configuration that
+ * only names `extractProvider`/`extractModel` keeps behaving as before.
+ *
+ * @param settings - the tunables in force.
+ * @returns the provider/model pair, or `{}` to reuse the session route.
+ */
+export function consolidationRouteOf(settings: MemoriesSettings): { provider?: string; model?: string } {
+  if (settings.consolidateProvider.length > 0 && settings.consolidateModel.length > 0) {
+    return { provider: settings.consolidateProvider, model: settings.consolidateModel }
+  }
+  if (settings.extractProvider.length > 0 && settings.extractModel.length > 0) {
+    return { provider: settings.extractProvider, model: settings.extractModel }
+  }
+  return {}
+}
 /**
  * Resolve deployment paths and the tunable defaults.
  *

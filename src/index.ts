@@ -21,13 +21,13 @@
  *
  * @module dsh-memories
  */
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, isQuotaExceededError, QUOTA_EXCEEDED_CODE } from '@deepseek-ai/dsh-llm'
 import type { LlmRuntime, UserMessage } from '@deepseek-ai/dsh-llm'
 import type { Agent, SessionStartSource } from '@deepseek-ai/dsh-agent'
 import type { Session } from '@deepseek-ai/dsh-session'
 import type { CommandInvocation } from '@deepseek-ai/dsh-commands'
 import type { Context } from '@deepseek-ai/cordis'
-import { Config as ConfigSchema, MemoriesSettingsSchema, SETTINGS_NS, normalizeSettings, resolveConfig } from './config.js'
+import { Config as ConfigSchema, MemoriesSettingsSchema, SETTINGS_NS, consolidationRouteOf, normalizeSettings, resolveConfig } from './config.js'
 import type { MemoriesConfig, MemoriesSettings, ResolvedConfig } from './config.js'
 import type { SettingsProvider } from '@deepseek-ai/dsh-settings'
 import { MemoryStore, slugify } from './storage.js'
@@ -309,6 +309,44 @@ export class MemoriesRuntime {
   }
 
   /**
+   * Whether background passes are paused right now.
+   *
+   * Codex gates memory work on a provider-reported remaining-quota percentage;
+   * DSH exposes no such number, so the gate here is the refusal itself (see
+   * {@link noteLimitRefusal}).
+   *
+   * @returns true while a recorded wait has not elapsed.
+   */
+  private backgroundPaused(): boolean {
+    if (!this.settings.pauseOnQuotaError) return false
+    return this.state.isLimited()
+  }
+
+  /**
+   * Pause background passes after a provider refused for quota or rate.
+   *
+   * Only refusals pause: a malformed reply, a timeout, or a missing route says
+   * nothing about the account's remaining quota, and treating them as refusals
+   * would stop extraction for reasons the cooldown cannot fix.
+   *
+   * @param error - the failure thrown by an extraction or consolidation call.
+   */
+  private noteLimitRefusal(error: unknown): void {
+    if (!this.settings.pauseOnQuotaError) return
+    const code = (error as { code?: unknown } | null | undefined)?.code
+    const message = error instanceof Error ? error.message : String(error)
+    if (code !== 'RATE_LIMIT' && code !== QUOTA_EXCEEDED_CODE && !isQuotaExceededError(message)) return
+    const base = this.settings.quotaCooldownMinutes * 60_000
+    const max = Math.max(base, this.settings.quotaCooldownMaxMinutes * 60_000)
+    const state = this.state.noteLimitFailure(message.slice(0, 200), base, max)
+    this.ctx.logger.warn(
+      'dsh-memories: provider refused background work (%s), pausing background passes for %d min',
+      typeof code === 'string' ? code : 'quota',
+      Math.round((state.until - state.at) / 60_000),
+    )
+  }
+
+  /**
    * Record that a session was used just now.
    *
    * This is the input the `maxAgeDays` gate reads. It is deliberately separate
@@ -532,6 +570,11 @@ export class MemoriesRuntime {
    */
   async runExtraction(agent: Agent, budget?: AbortSignal): Promise<number> {
     if (!this.settings.autoExtract) return 0
+    if (this.backgroundPaused()) {
+      const limit = this.state.getLimit()
+      this.ctx.logger.debug?.('dsh-memories: background pass paused until %s (%d refusals)', new Date(limit?.until ?? 0).toISOString(), limit?.failures ?? 0)
+      return 0
+    }
     if (agent.status !== 'idle') return 0
     const session = agent.session
     const key = session.id
@@ -554,18 +597,28 @@ export class MemoriesRuntime {
       // signal: the plugin is disposed as the process shuts down, and tying the
       // pass to that signal would abort exactly the pass a one-shot run needs.
       const signal = budget ?? this.lifecycle.signal
-      const outcome = await runExtraction(llm, {
-        session,
-        window,
-        projectLabel,
-        ...this.settings.extractProvider.length > 0 && this.settings.extractModel.length > 0
-          ? { provider: this.settings.extractProvider, model: this.settings.extractModel }
-          : {},
-        maxOutputTokens: this.settings.extractMaxOutputTokens,
-        maxMemories: this.settings.extractMaxMemories,
-        timeoutMs: this.settings.extractTimeoutMs,
-        signal,
-      })
+      let outcome
+      try {
+        outcome = await runExtraction(llm, {
+          session,
+          window,
+          projectLabel,
+          ...this.settings.extractProvider.length > 0 && this.settings.extractModel.length > 0
+            ? { provider: this.settings.extractProvider, model: this.settings.extractModel }
+            : {},
+          maxOutputTokens: this.settings.extractMaxOutputTokens,
+          maxMemories: this.settings.extractMaxMemories,
+          timeoutMs: this.settings.extractTimeoutMs,
+          signal,
+        })
+      } catch (error) {
+        // A refusal pauses every background pass, then propagates: the caller's
+        // error handling is unchanged, it just runs less often from here on.
+        this.noteLimitRefusal(error)
+        throw error
+      }
+      // Reaching the provider proves quota is available again.
+      this.state.clearLimit()
       if (outcome.kind === 'none') {
         this.ctx.logger.debug?.('dsh-memories: extraction produced nothing (%s)', outcome.reason)
       } else {
@@ -643,6 +696,9 @@ export class MemoriesRuntime {
     const token = `consolidate-${process.pid}-${Date.now().toString(36)}`
     const job = this.state.claimJob(CONSOLIDATE_JOB, token, 600_000)
     if (job === undefined) return undefined
+    // A paused account skips the pass and leaves the job in place: the cooldown
+    // is the right place to retry, not this turn.
+    if (this.backgroundPaused()) return undefined
     // The job's recorded root wins: consolidation is process-level, so the
     // session that happens to run the pass must not decide whose project
     // memories get consolidated.
@@ -659,9 +715,7 @@ export class MemoriesRuntime {
       }
       const plan = await runConsolidation(seam, {
         parent,
-        ...this.settings.extractProvider.length > 0 && this.settings.extractModel.length > 0
-          ? { provider: this.settings.extractProvider, model: this.settings.extractModel }
-          : {},
+        ...consolidationRouteOf(this.settings),
         entries,
         projectLabel: this.store.target('project', root).label,
         maxUpserts: this.settings.consolidateMaxEntries,
@@ -688,6 +742,7 @@ export class MemoriesRuntime {
         }
       }
       this.state.deleteJob(CONSOLIDATE_JOB)
+      this.state.clearLimit()
       this.ctx.logger.info('dsh-memories: consolidated %d written, %d retired, %d skill drafts', result.written, result.retired, staged.length)
       return [
         `Consolidated ${entries.length} memories: ${result.written} written, ${result.retired} retired.`,
@@ -705,6 +760,7 @@ export class MemoriesRuntime {
         notBefore: Date.now() + Math.min(6, job.retries + 1) * 3_600_000,
         lastError: message,
       })
+      this.noteLimitRefusal(error)
       this.ctx.logger.warn('dsh-memories: consolidation failed: %s', message)
       return undefined
     }
@@ -723,6 +779,14 @@ export class MemoriesRuntime {
     }
   }
 
+  /** One line describing whether background passes are running, for `/memories stats`. */
+  private backgroundLine(now = Date.now()): string {
+    const limit = this.state.getLimit()
+    if (limit === undefined || !this.settings.pauseOnQuotaError) return 'running'
+    if (limit.until <= now) return `running (last refusal ${new Date(limit.at).toISOString()})`
+    return `paused until ${new Date(limit.until).toISOString()} after ${limit.failures} refusal${limit.failures === 1 ? '' : 's'}${limit.reason === undefined ? '' : `: ${limit.reason}`}`
+  }
+
   /** A one-line status used by `/memories` and diagnostics. */
   async stats(session: Session): Promise<string> {
     const states = await this.allScopes(session)
@@ -731,6 +795,7 @@ export class MemoriesRuntime {
       ...states.map((scope) => `${scope.label}: ${scope.entries.length} memories`),
       `auto-extract: ${this.settings.autoExtract ? `on (idle ${Math.round(this.settings.autoExtractIdleMs / 1000)}s, ≥${this.settings.minIdleHours}h, ≤${this.settings.maxAgeDays}d)` : 'off'}`,
       `sessions mined: ${this.state.sessionCount()}`,
+      `background: ${this.backgroundLine()}`,
       `state store: ${this.state.durable ? 'sqlite' : `memory-only (${this.state.degradedReason ?? 'driver unavailable'})`}`,
     ]
     return lines.join('\n')

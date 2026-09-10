@@ -11,7 +11,7 @@ import test from 'node:test'
 import { MemoryStore, formatEntry, parseEntry, projectSlug, slugify } from '../storage.js'
 import { browseMemories, scoreEntry, searchMemories } from '../search.js'
 import { rankForSummary, renderMemorySummary } from '../render.js'
-import { DEFAULT_MAX_SUMMARY_BYTES, normalizeSettings, resolveConfig } from '../config.js'
+import { DEFAULT_MAX_SUMMARY_BYTES, consolidationRouteOf, normalizeSettings, resolveConfig } from '../config.js'
 import { findProjectRoot } from '../workspace.js'
 import type { MemoryEntry } from '../types.js'
 
@@ -33,6 +33,34 @@ test('projectSlug is stable per root and distinct across roots', () => {
   assert.equal(a, projectSlug('C:\\Code\\alpha'))
   assert.notEqual(a, b)
   assert.match(a, /^alpha-[0-9a-f]{8}$/u)
+})
+
+test('the consolidation route falls back to the extraction route, then to the session', () => {
+  const base = normalizeSettings({})
+  assert.deepEqual(consolidationRouteOf(base), {}, 'no route at all reuses the session route')
+  assert.deepEqual(
+    consolidationRouteOf({ ...base, extractProvider: 'p', extractModel: 'm' }),
+    { provider: 'p', model: 'm' },
+    'an unset consolidation route inherits extraction',
+  )
+  assert.deepEqual(
+    consolidationRouteOf({ ...base, extractProvider: 'p', extractModel: 'm', consolidateProvider: 'q', consolidateModel: 'n' }),
+    { provider: 'q', model: 'n' },
+    'its own route wins',
+  )
+  // A lone half is not a route, exactly like the extraction pair.
+  const half = normalizeSettings({ consolidateProvider: 'q' })
+  assert.equal(half.consolidateModel, '')
+  assert.deepEqual(consolidationRouteOf({ ...half, extractProvider: 'p', extractModel: 'm' }), { provider: 'p', model: 'm' })
+})
+
+test('the quota knobs default on and clamp to zero', () => {
+  const settings = normalizeSettings({})
+  assert.equal(settings.pauseOnQuotaError, true)
+  assert.equal(settings.quotaCooldownMinutes, 30)
+  assert.equal(settings.quotaCooldownMaxMinutes, 480)
+  assert.equal(normalizeSettings({ quotaCooldownMinutes: -5 }).quotaCooldownMinutes, 0)
+  assert.equal(normalizeSettings({ pauseOnQuotaError: false }).pauseOnQuotaError, false)
 })
 
 /** Build a complete entry from the fields a test cares about. */

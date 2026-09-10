@@ -117,6 +117,21 @@ const FIELDS = [
     hint: { zh: '一次合并子代理运行的超时时间。', en: 'Timeout for one consolidation sub-agent run.' },
   },
   {
+    field: 'pauseOnQuotaError', kind: 'boolean',
+    label: { zh: '额度紧张时暂停后台', en: 'Pause background work on quota errors' },
+    hint: { zh: '提供方因限流或额度耗尽拒绝后，暂停后台抽取与合并，直到冷却结束。', en: 'After a rate-limit or exhausted-quota refusal, stop background extraction and consolidation until the cooldown elapses.' },
+  },
+  {
+    field: 'quotaCooldownMinutes', kind: 'number', min: 0, step: 5,
+    label: { zh: '额度冷却（分钟）', en: 'Quota cooldown (minutes)' },
+    hint: { zh: '一次拒绝后等待多久；连续拒绝会翻倍。0 表示不暂停。', en: 'Wait after one refusal; doubles per consecutive refusal. 0 disables the pause.' },
+  },
+  {
+    field: 'quotaCooldownMaxMinutes', kind: 'number', min: 0, step: 30,
+    label: { zh: '额度冷却上限（分钟）', en: 'Quota cooldown ceiling (minutes)' },
+    hint: { zh: '上面那个等待翻倍后的上限。', en: 'Upper bound as the wait doubles.' },
+  },
+  {
     field: 'extractProvider', kind: 'text',
     label: { zh: '抽取提供方', en: 'Extraction provider' },
     hint: { zh: '抽取用的提供方路由；留空则复用该会话已记录的请求路由。', en: "Provider route for extraction. Empty reuses the session's own logged route." },
@@ -125,6 +140,16 @@ const FIELDS = [
     field: 'extractModel', kind: 'text',
     label: { zh: '抽取模型', en: 'Extraction model' },
     hint: { zh: '抽取用的模型；留空则复用该会话已记录的请求路由。', en: "Model for extraction. Empty reuses the session's own logged route." },
+  },
+  {
+    field: 'consolidateProvider', kind: 'text',
+    label: { zh: '合并提供方', en: 'Consolidation provider' },
+    hint: { zh: '合并用的提供方路由；留空则先回退到抽取路由，再回退到会话路由。', en: 'Provider route for consolidation. Empty falls back to the extraction route, then the session route.' },
+  },
+  {
+    field: 'consolidateModel', kind: 'text',
+    label: { zh: '合并模型', en: 'Consolidation model' },
+    hint: { zh: '合并用的模型；留空则先回退到抽取路由，再回退到会话路由。', en: 'Model for consolidation. Empty falls back to the extraction route, then the session route.' },
   },
   {
     field: 'enableTool', kind: 'boolean',
