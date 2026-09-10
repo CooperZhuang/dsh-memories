@@ -48,16 +48,18 @@ export const EXTRACT_SYSTEM = [
   '- "fact": durable background that is none of the above.',
   'Add "appliesTo" (a short phrase saying when the memory matters) when the title does not make it obvious.',
   'Prefer few high-value memories over many trivial ones. Return at most the requested number.',
-  'Reply with JSON only, no prose and no code fence: {"memories":[{"scope":"global"|"project","kind":string,"title":string,"body":string,"tags":string[],"appliesTo":string}]}',
-  'When nothing is worth remembering, reply exactly {"memories":[]}.',
+  'Also write "summary": one paragraph (2-4 sentences) saying what this session was about — the task, the decisions, and anything that would help someone judge the memories above later. It is stored as the evidence behind them.',
+  'Reply with JSON only, no prose and no code fence: {"summary":string,"memories":[{"scope":"global"|"project","kind":string,"title":string,"body":string,"tags":string[],"appliesTo":string}]}',
+  'When nothing is worth remembering, reply exactly {"summary":"","memories":[]}.'
 ].join('\n')
 
 /** JSON output contract for one extraction call. */
 export const EXTRACT_JSON_SCHEMA = {
   type: 'object',
   additionalProperties: false,
-  required: ['memories'],
+  required: ['summary', 'memories'],
   properties: {
+    summary: { type: 'string' },
     memories: {
       type: 'array',
       items: {
@@ -174,24 +176,36 @@ function resolveRoute(
   return undefined
 }
 
-/** Parse the model's JSON reply into drafts, tolerating a code fence. */
-export function parseDrafts(text: string, maxMemories: number): MemoryDraft[] {
+/**
+ * Parse the model's JSON reply into the session summary and its drafts,
+ * tolerating a code fence.
+ *
+ * @param text - the model's reply.
+ * @param maxMemories - how many drafts to keep.
+ * @param sessionId - session the drafts came from, recorded as provenance.
+ * @returns the drafts plus the evidence summary (empty when the reply had none).
+ */
+export function parseExtraction(text: string, maxMemories: number, sessionId: string): { drafts: MemoryDraft[]; summary: string } {
+  const result = { drafts: [] as MemoryDraft[], summary: '' }
   const trimmed = text.trim().replace(/^```(?:json)?\s*/iu, '').replace(/```$/u, '').trim()
   const start = trimmed.indexOf('{')
   const end = trimmed.lastIndexOf('}')
-  if (start < 0 || end <= start) return []
+  if (start < 0 || end <= start) return result
   let parsed: unknown
   try {
     parsed = JSON.parse(trimmed.slice(start, end + 1))
   } catch {
-    return []
+    return result
   }
-  if (typeof parsed !== 'object' || parsed === null || !('memories' in parsed)) return []
-  const raw = (parsed as { memories: unknown }).memories
-  if (!Array.isArray(raw)) return []
-  const drafts: MemoryDraft[] = []
+  if (typeof parsed !== 'object' || parsed === null || !('memories' in parsed)) return result
+  const envelope = parsed as { memories: unknown; summary?: unknown }
+  if (typeof envelope.summary === 'string') {
+    result.summary = redactSecrets(envelope.summary.replace(/\s+/gu, ' ').trim()).slice(0, 1_200)
+  }
+  const raw = envelope.memories
+  if (!Array.isArray(raw)) return result
   for (const item of raw) {
-    if (drafts.length >= maxMemories) break
+    if (result.drafts.length >= maxMemories) break
     if (typeof item !== 'object' || item === null) continue
     const record = item as Record<string, unknown>
     const scope = record['scope']
@@ -209,16 +223,17 @@ export function parseDrafts(text: string, maxMemories: number): MemoryDraft[] {
     const appliesTo = typeof record['appliesTo'] === 'string'
       ? redactSecrets(record['appliesTo'].replace(/\s+/gu, ' ').trim()).slice(0, 160)
       : ''
-    drafts.push({
+    result.drafts.push({
       scope: scope as MemoryScope,
       kind: toMemoryKind(record['kind']),
       title: cleanTitle,
       body: cleanBody,
       tags,
       ...appliesTo.length > 0 ? { appliesTo } : {},
+      sourceSession: sessionId,
     })
   }
-  return drafts
+  return result
 }
 
 /** Everything one extraction call needs. */
@@ -244,7 +259,13 @@ export interface ExtractionRequest {
 
 /** Outcome of one extraction call. */
 export type ExtractionOutcome =
-  | { readonly kind: 'memories'; readonly drafts: readonly MemoryDraft[]; readonly route: { provider: string; model: string } }
+  | {
+    readonly kind: 'memories'
+    readonly drafts: readonly MemoryDraft[]
+    /** What the session was about, stored as the evidence behind the drafts. */
+    readonly summary: string
+    readonly route: { provider: string; model: string }
+  }
   | { readonly kind: 'none'; readonly reason: 'empty-window' | 'no-route' | 'empty-reply' }
 
 /**
@@ -291,7 +312,7 @@ export async function runExtraction(llm: LlmRuntime, request: ExtractionRequest)
     .filter((block): block is Extract<ContentBlock, { type: 'text' }> => block.type === 'text')
     .map((block) => block.text)
     .join('\n')
-  const drafts = parseDrafts(text, request.maxMemories)
-  if (drafts.length === 0) return { kind: 'none', reason: 'empty-reply' }
-  return { kind: 'memories', drafts, route }
+  const parsed = parseExtraction(text, request.maxMemories, request.session.id)
+  if (parsed.drafts.length === 0) return { kind: 'none', reason: 'empty-reply' }
+  return { kind: 'memories', drafts: parsed.drafts, summary: parsed.summary, route }
 }

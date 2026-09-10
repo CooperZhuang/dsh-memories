@@ -10,6 +10,7 @@
 import { MEMORY_KIND_HEADINGS, MEMORY_KINDS } from './types.js'
 import type { MemoryEntry, MemoryHit } from './types.js'
 import type { ScopeEntries } from './search.js'
+import type { SessionNote } from './storage.js'
 
 /** Opening and closing frame of every injected memory block. */
 export const MEMORY_OPEN = '<memory-context>'
@@ -102,7 +103,7 @@ export function renderMemorySummary(scopes: readonly SummaryScope[], options: Su
   const guidance = [
     'Project memories override global ones when they disagree.',
     'A memory records what was true when written, not necessarily now: verify before relying on it and say so when you answer from unverified memory.',
-    'Use memory_search for details and memory_write to record something worth keeping for future sessions.',
+    'Use the `memory` tool for details: action=search finds memories, action=read shows one in full, action=evidence shows the conversation a memory came from, action=write records something worth keeping.'
   ].join(' ')
   const render = (maxChars: number, perScope: number): string => {
     const sections = populated.map((scope) => {
@@ -167,9 +168,23 @@ export function renderEntry(entry: MemoryEntry): string {
     `created: ${new Date(entry.createdAt).toISOString()}`,
     `updated: ${new Date(entry.updatedAt).toISOString()}`,
     `source: ${entry.source}`,
+    ...entry.sourceSession === undefined
+      ? []
+      : [`session: ${entry.sourceSession} (memory action=evidence, or memories/sessions/${entry.sourceSession}.md)`],
     '',
     entry.body,
   ].join('\n')
+}
+
+/** Render one session's evidence note for the model. */
+export function renderEvidence(note: SessionNote): string {
+  const lines = [
+    `Session ${note.session} (${new Date(note.at).toISOString()})${note.project === undefined ? '' : ` — ${note.project}`}`,
+    '',
+    note.summary.length > 0 ? note.summary : '(the extractor recorded no summary for this session)',
+  ]
+  if (note.memories.length > 0) lines.push('', `Memories this session produced: ${note.memories.join(', ')}`)
+  return lines.join('\n')
 }
 
 /** Render a scope listing for a human-facing command. */

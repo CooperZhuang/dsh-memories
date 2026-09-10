@@ -32,15 +32,23 @@
    调用把最近一段对话里**值得长期保留的事实**抽成记忆并写入。子代理会话、委派深度 > 0
    的会话不参与。抽出来的内容先做**密钥擦除**（`sk-…`、`ghp_…`、AKIA…、JWT、私钥块、
    `api_key=…`、`Bearer …` 等）再落盘。
+   同一次调用还会返回一段**本次会话的摘要**，写成 `memories/sessions/<session-id>.md`——这就是
+   记忆的**证据**：记忆说“学到了什么”，这份笔记说“当时在干什么”，判断一条记忆还成不成立时可以
+   回头看它（`memory` 工具的 `evidence` 动作）。
    抽取需要进程还活着：它只在**长驻进程**（`dsh web` 这类）里按空闲时间触发；一次性运行
    （`dsh --profile headless "..."`）通常在空闲计时器到点前就已退出，那一轮不会被抽取。
    想立刻抽一次用 `/memories mine`。
+   提供方因**限流或额度耗尽**拒绝时（`RATE_LIMIT` / `QUOTA`），一切后台 pass 会暂停
+   `quotaCooldownMinutes`（默认 30 分钟，连续拒绝翻倍、封顶 `quotaCooldownMaxMinutes`），
+   冷却期内不再发起任何后台调用；成功一次即解除。手动 `/memories mine` 也受同一闸门约束。
 3. **合并重整（阶段 2）** — 阶段 1 一次只看到一个会话，无法处理**跨会话**的矛盾与碎片。
    当有新记忆落盘后，会排一个全局合并任务；冷却（`consolidateCooldownHours`，默认 6 小时）
    到期后，把最近的记忆交给一个**受限子代理**：它不能写文件、不能跑命令、不能联网、不能
    再委派（`maxDepth: 0` + 工具黑名单），只能返回一份严格 JSON 的合并方案——合并重复、
    改写过期、退役失效、补上遗漏。**插件是唯一的写入者**：它校验方案里的 id 必须真实存在，
    然后在快照保护下应用；中途失败会回滚已改动的条目。想立刻合并用 `/memories consolidate`。
+   合并有**自己**的模型路由（`consolidateProvider` / `consolidateModel`）：合并比抽取更贵，可以用
+   更便宜的模型；两者留空时先回退到抽取路由，再回退到会话路由。
    它还会从记忆里提炼**技能草稿**（见下）。
 4. **分层注入（上下文）** — 一次会话只注入**一次**有界摘要：在第一个「有话说」的 step 进入，
    先全局、后项目，每段按 kind 分组列出标题 + 日期 + 一句话预览，整块不超过 `maxSummaryBytes`。
@@ -120,7 +128,11 @@ memories:
 | `consolidateCooldownHours` | `6` | 两次合并之间至少间隔多少小时 |
 | `consolidateMaxEntries` | `64` | 一次合并最多考虑多少条记忆 |
 | `consolidateTimeoutMs` | `180000` | 一次合并子代理调用的超时 |
+| `pauseOnQuotaError` | `true` | 提供方因限流/额度拒绝后，暂停一切后台 pass 直到冷却结束 |
+| `quotaCooldownMinutes` | `30` | 一次拒绝后等多久；连续拒绝翻倍；`0` 等于关掉暂停 |
+| `quotaCooldownMaxMinutes` | `480` | 上面那个翻倍的上限 |
 | `extractProvider` / `extractModel` | 空 | 抽取调用的模型路由；留空就用该会话日志里记录的请求路由 |
+| `consolidateProvider` / `consolidateModel` | 空 | 合并调用的模型路由；留空先回退到抽取路由，再回退到会话路由 |
 | `enableTool` | `true` | 是否注册 `memory` 工具（改完立即生效） |
 | `enableCommand` | `true` | 是否注册 `/memories` 命令（改完立即生效） |
 
@@ -137,7 +149,7 @@ memories:
 - **记忆**：记忆列表（按作用域/类别过滤、关键词搜索、逐条删除）、「新增记忆」表单、待晋升的
   skill 草稿（可提升或丢弃）。项目作用域按 `overview` 报出的项目 slug 选择——**一个项目作用域
   只有在那个工作区里跑过会话之后才会出现**，界面不会凭路径凭空造出一个作用域。
-- **配置**：全部 21 个可调项，标签与说明都是中文，改完立即生效。
+- **配置**：全部 26 个可调项，标签与说明都是中文，改完立即生效。
 
 它在**设置 → 插件 → 插件配置**里刻意**不再注册卡片**：那个列表留给主机插件，这个插件的一切
 都归它自己的页面。
@@ -162,8 +174,11 @@ memories:
 | `search` | `query?` + `scope?` + `tags?` + `limit?` | 关键词检索两个作用域；`query` 为空时按最近更新列出 |
 | `read` | `id` + `scope?` | 按 id 读全文（默认先项目、后全局） |
 | `forget` | `id` + `scope?` | 删除一条 |
-
+| `evidence` | `id` 或 `evidenceSession` | 读一条记忆背后那次会话的证据笔记（当时在干什么、产出了哪些记忆） |
 写项目记忆时，工具结果里会附一句提示：**如果这条事实对无关项目也成立，请同时写一份全局记忆**。
+
+`evidence` 是给“这条记忆还成立吗”用的：注入的摘要和 `search` 只给结论，证据笔记给出当时的上下文
+与时间线。没有证据笔记的会话（比如从未被挖掘过）会明确告诉你没有，而不是编一段。
 
 ## 技能草稿
 
@@ -220,8 +235,9 @@ $DSH_HOME/memories/
 │   ├── index.json
 │   ├── project.json               # slug 由哪个绝对路径推导而来
 │   └── entries/<id>.md
+├── sessions/<session-id>.md        # 证据笔记：那次会话在干什么（被挖掘过的会话）
 ├── skills/<name>/SKILL.md         # 技能草稿（未晋升前 DSH 看不到）
-└── state.db                       # SQLite：会话水位线 / 任务租约 / 用量计数
+└── state.db                       # SQLite：会话水位线 / 任务租约 / 用量计数 / 额度暂停
 ```
 
 条目文件：
@@ -237,6 +253,7 @@ appliesTo: before running any install or script
 created: 2026-09-09T02:00:00.000Z
 updated: 2026-09-09T02:00:00.000Z
 source: tool
+session: session-11111111-2222-4333-8444-555555555555
 uses: 3
 lastUsed: 2026-09-09T05:12:00.000Z
 ---
@@ -244,8 +261,24 @@ lastUsed: 2026-09-09T05:12:00.000Z
 The user standardizes on pnpm for every JavaScript project; never run `npm install`.
 ```
 
-`kind` 和 `appliesTo` 是可选的：缺 `kind` 时按 `fact` 解析，所以**旧文件不需要迁移**，
-新字段也不会让老条目失效。
+`kind`、`appliesTo`、`session` 都是可选的：缺 `kind` 时按 `fact` 解析，所以**旧文件不需要迁移**，
+新字段也不会让老条目失效。`session` 指向 `sessions/<id>.md`，供 `memory` 的 `evidence` 动作回头
+看上下文；人工写入（`/memories add`、工具写入）没有 `session`，那也很正常。
+
+证据笔记本身也是 Markdown，头尾仍是简单 frontmatter：
+
+```markdown
+---
+session: "probe-11111111"
+at: 2026-09-10T02:47:57.409Z
+project: "project:dsh-memories"
+memories: ship-this-repo-with-pnpm-run-ship
+---
+
+A very short session in which the user stated that this repository is shipped with `pnpm run ship` …
+```
+
+笔记按写入时间保留最新 200 份（`SESSION_NOTE_LIMIT`），旧的自动淘汰，不会无限长。
 
 为什么要分开：
 
@@ -310,14 +343,14 @@ dsh --profile web --patch ./fast.yml
 - 摘要**一次会话只注入一次**：会话中途新写入的记忆不会重新出现在摘要里（只有新会话、`/compact`
   或清空会话才会重新注入），要用就 `memory_search`。「注入过」看的是对话里有没有那条 recall
   消息，所以重启 dsh 不会重置；代价是每轮要读一次会话历史（`deriveMessages` 是增量投影，很便宜）。
-- 抽取用的模型默认跟随该会话已记录的请求路由；如需固定路由，显式配 `extractProvider` /
-  `extractModel`。
+- 抽取/合并的模型默认跟随该会话已记录的请求路由；如需固定路由，显式配 `extractProvider` /
+  `extractModel`，合并另有 `consolidateProvider` / `consolidateModel`。
 - 合并子代理**可能判定"没什么可合并的"**并原样返回，这时不会产生任何写入。这是正常的，
   不是失败——它只在新记忆确实与旧记忆冲突或重复时才动手。
 
 ## 端到端验证状况
 
-自动化测试覆盖了每个单元（96 项），但提示词与真实模型行为只能靠真机跑。截至最近一次
+自动化测试覆盖了每个单元（103 项），但提示词与真实模型行为只能靠真机跑。截至最近一次
 真机验证：
 
 | 路径 | 状态 |
@@ -325,6 +358,8 @@ dsh --profile web --patch ./fast.yml
 | 工具写入、注入、模型真的用了记忆 | ✅ 真机 |
 | 设置 → 记忆 页面（列表/搜索/范围与类别过滤/新增/删除/可调项） | ✅ 真机浏览器：真写入了 `settings.yaml`，新增的记忆当场出现在列表里并被后续注入读到；「插件 → 插件配置」里不再有重复卡片 |
 | 空闲抽取（真模型） | ✅ 真机：模型自己写了 `kind` 与 `appliesTo` |
+| 证据层（真模型） | ✅ 真机：SDK 驱动的真实会话被抽取后，`memories/sessions/<id>.md` 里写下了模型给的会话摘要，条目带上 `session:` 溯源；`memory action=evidence` 能读回该笔记 |
+| 额度闸门 | ✅ 单元测试（含跨重启保留）；未经真实限流触发 |
 | 合并子代理（真子代理） | ✅ 真机：受限子代理运行、返回结构化方案、方案被应用 |
 | 技能草稿 → 晋升 → 技能目录 | ✅ 真机：晋升后冷启动会话的技能目录里出现了它（顺带查出并修掉了 description 含冒号导致草稿被静默丢弃的缺陷） |
 | 注入节奏（一次会话恰好一次） | ✅ 真机进程：带插件的 headless 组合跑真实会话，注入恰好 1 次（3943 字节）；真实日志里同一进程的相邻两轮，第一轮注入、第二轮没有 |

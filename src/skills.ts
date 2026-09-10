@@ -20,6 +20,9 @@
 import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import type { SkillDraft } from './consolidate.js'
+// One YAML scalar encoder for the whole package: the skill frontmatter and the
+// session evidence notes must both survive descriptions a model wrote.
+import { yamlScalar } from './storage.js'
 
 /** The skill-name grammar the harness loader accepts. */
 const SKILL_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
@@ -45,27 +48,6 @@ async function exists(path: string): Promise<boolean> {
 export function normalizeSkillName(value: string): string | undefined {
   const name = value.toLowerCase().replace(/[^a-z0-9]+/gu, '-').replace(/^-+|-+$/gu, '').slice(0, 64)
   return SKILL_NAME.test(name) ? name : undefined
-}
-
-/**
- * Encode one frontmatter value as a YAML double-quoted scalar.
- *
- * A plain scalar breaks the document as soon as the value contains a mapping
- * colon, a leading indicator (`-`, `#`, `[`), or a newline — and the harness
- * loader responds by SKIPPING the skill with a warning nobody sees, so the
- * promoted file would sit in the skill root and never reach the catalog. Quoting
- * makes every value safe, including the model-authored descriptions that
- * consolidation produces.
- *
- * @param value - the raw text.
- * @returns a double-quoted YAML scalar with the escapes YAML defines.
- */
-function yamlScalar(value: string): string {
-  return `"${value
-    .replace(/\\/gu, '\\\\')
-    .replace(/"/gu, '\\"')
-    .replace(/\r\n|\r|\n/gu, '\\n')
-    .replace(/\t/gu, '\\t')}"`
 }
 
 /**

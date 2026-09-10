@@ -220,6 +220,7 @@ function parseEntryView(value: unknown): Record<string, unknown> {
     body: asText(view.body, 'entry.body'),
     tags: asList(view.tags, 'entry.tags').map((tag) => asText(tag, 'entry.tag')),
     appliesTo: asText(view.appliesTo, 'entry.appliesTo'),
+    sourceSession: asText(view.sourceSession, 'entry.sourceSession'),
     createdAt: asCount(view.createdAt, 'entry.createdAt'),
     updatedAt: asCount(view.updatedAt, 'entry.updatedAt'),
     uses: asCount(view.uses, 'entry.uses'),
@@ -350,6 +351,8 @@ export interface EntryView {
   readonly body: string
   readonly tags: readonly string[]
   readonly appliesTo: string
+  /** Session this memory came from, or `''` when it has no recorded source. */
+  readonly sourceSession: string
   readonly createdAt: number
   readonly updatedAt: number
   readonly uses: number
@@ -367,6 +370,7 @@ function entryView(entry: MemoryEntry): EntryView {
     body: entry.body,
     tags: [...entry.tags],
     appliesTo: entry.appliesTo ?? '',
+    sourceSession: entry.sourceSession ?? '',
     createdAt: entry.createdAt,
     updatedAt: entry.updatedAt,
     uses: entry.uses,

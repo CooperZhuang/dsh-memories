@@ -84,6 +84,43 @@ test('entry files round-trip through format and parse', () => {
   assert.deepEqual(parsed, value)
 })
 
+test('an entry records the session it came from, and keeps it across a rewrite', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-provenance-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const store = new MemoryStore(dir)
+  await store.upsert({ scope: 'global', title: 'Ship with pnpm', body: 'Run pnpm run ship.', tags: [], sourceSession: 'session-42' }, undefined, 'auto')
+  const stored = await store.read('global', undefined, 'ship-with-pnpm')
+  assert.equal(stored?.sourceSession, 'session-42')
+  assert.match(await readFile(join(dir, 'entries', 'ship-with-pnpm.md'), 'utf8'), /^session: session-42$/mu)
+
+  // A consolidation rewrites the body without naming the session; provenance is
+  // not the rewriter's to drop.
+  await store.upsert({ scope: 'global', title: 'Ship with pnpm', body: 'Always run pnpm run ship.', tags: [] }, undefined, 'auto')
+  assert.equal((await store.read('global', undefined, 'ship-with-pnpm'))?.sourceSession, 'session-42')
+})
+
+test('session evidence notes round-trip, including text a plain YAML scalar would break', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-notes-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const store = new MemoryStore(dir)
+  const path = await store.writeSessionNote({
+    session: 'session-1',
+    at: 1_700_000_000_000,
+    project: 'project:demo',
+    summary: 'The user wrote: ship with pnpm run ship.',
+    memories: ['ship-with-pnpm', 'prefer-pnpm'],
+  })
+  assert.equal(path, join(dir, 'sessions', 'session-1.md'))
+  const note = await store.readSessionNote('session-1')
+  assert.equal(note?.session, 'session-1')
+  assert.equal(note?.project, 'project:demo')
+  assert.equal(note?.summary, 'The user wrote: ship with pnpm run ship.')
+  assert.deepEqual(note?.memories, ['ship-with-pnpm', 'prefer-pnpm'])
+  assert.equal(note?.at, 1_700_000_000_000)
+  assert.deepEqual(await store.listSessionNotes(), ['session-1'])
+  assert.equal(await store.readSessionNote('never-mined'), undefined)
+})
+
 test('an entry with no recorded use round-trips its zero counters', () => {
   const value = entry({ id: 'fresh', scope: 'global', title: 'Fresh', body: 'Never read yet.' })
   const parsed = parseEntry(formatEntry(value), 'global', 'fallback')

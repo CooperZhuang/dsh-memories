@@ -43,6 +43,7 @@ const SECTION_COPY = {
     tabConfig: '配置',
     unavailable: '本部署没有把 memories 远程接口暴露给浏览器，只能编辑可调项。',
     uses: '使用',
+    session: '来自会话',
     updated: '更新于',
     saved: '已保存。',
     removed: '已删除。',
@@ -80,6 +81,7 @@ const SECTION_COPY = {
     tabConfig: 'Configuration',
     unavailable: 'This deployment does not expose the memories Remote API to the browser; only the tunables can be edited.',
     uses: 'used',
+    session: 'from',
     updated: 'updated',
     saved: 'Saved.',
     removed: 'Deleted.',
@@ -123,6 +125,9 @@ function createMemoriesSection(React, Card) {
         h('span', { key: 'updated' }, `${copy.updated} ${whenText(entry.updatedAt)}`),
         h('span', { key: 'uses' }, `${copy.uses} ${entry.uses}`),
         entry.tags.length > 0 ? h('span', { key: 'tags' }, entry.tags.join(' · ')) : null,
+        entry.sourceSession !== undefined && entry.sourceSession.length > 0
+          ? h('span', { key: 'session' }, `${copy.session} ${entry.sourceSession}`)
+          : null,
       ]),
       h('div', { key: 'actions', className: 'dshm-actions' }, [
         h('button', {

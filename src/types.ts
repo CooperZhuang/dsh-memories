@@ -39,6 +39,15 @@ export interface MemoryEntry {
   readonly appliesTo?: string
   /** Id of the memory this one replaces, when it supersedes one. */
   readonly supersedes?: string
+  /**
+   * Session this memory was learned in.
+   *
+   * The evidence behind a memory: `memories/sessions/<id>.md` records what that
+   * conversation was about, which is what a reader needs when a memory's wording
+   * or chronology could change the answer. Codex keeps the same pointer as a
+   * rollout summary its read path can open.
+   */
+  readonly sourceSession?: string
   /** Unix epoch milliseconds when the entry was first written. */
   readonly createdAt: number
   /** Unix epoch milliseconds of the most recent write. */
@@ -128,6 +137,8 @@ export interface MemoryDraft {
   readonly appliesTo?: string
   /** Id of a memory this one replaces. */
   readonly supersedes?: string
+  /** Session the draft came from, recorded as {@link MemoryEntry.sourceSession}. */
+  readonly sourceSession?: string
 }
 
 /** The outcome of persisting one draft. */

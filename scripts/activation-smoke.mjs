@@ -13,7 +13,7 @@
 import { Context } from '@deepseek-ai/cordis'
 import { pathToFileURL } from 'node:url'
 import { resolve } from 'node:path'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -156,6 +156,22 @@ if (tool !== undefined) {
   console.log('memory parameters:', params.join(', '))
   const search = tool.output.render({ action: 'search' }, { ok: true, action: 'search', message: 'hello', results: [] })
   console.log('render smoke:', JSON.stringify(search))
+
+  // The evidence action reads the note a session left behind; write one the way
+  // a mined session leaves it, then ask the real tool dispatch for it.
+  await mkdir(join(memoriesDir, 'sessions'), { recursive: true })
+  await writeFile(
+    join(memoriesDir, 'sessions', 'smoke-session.md'),
+    '---\nsession: smoke-session\nat: 2023-11-14T22:13:20.000Z\nproject: project:demo\n---\n\nWe set up the deploy script.\n',
+  )
+  const evidence = await tool.execute({ action: 'evidence', evidenceSession: 'smoke-session' }, {
+    agent: { session: { id: 'smoke-session', header: { cwd: pluginDir } } },
+  })
+  console.log('tool evidence:', JSON.stringify(evidence).slice(0, 220))
+  const missing = await tool.execute({ action: 'evidence', evidenceSession: 'never-mined' }, {
+    agent: { session: { id: 'smoke-session', header: { cwd: pluginDir } } },
+  })
+  console.log('tool evidence (missing):', JSON.stringify(missing).slice(0, 160))
 }
 
 const memories = commands.registered.get('memories')

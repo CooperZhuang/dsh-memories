@@ -15,7 +15,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { MemoriesRuntime } from '../index.js'
-import { EXTRACT_JSON_SCHEMA, collectWindow, parseDrafts, redactSecrets, runExtraction } from '../extract.js'
+import { EXTRACT_JSON_SCHEMA, collectWindow, parseExtraction, redactSecrets, runExtraction } from '../extract.js'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Session } from '@deepseek-ai/dsh-session'
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
@@ -92,23 +92,29 @@ test('redactSecrets removes credential-shaped text and keeps prose', () => {
   assert.equal(redactSecrets('plain prose about pnpm'), 'plain prose about pnpm')
 })
 
-test('parseDrafts accepts a bare object, a fenced object, and rejects junk', () => {
-  const payload = '{"memories":[{"scope":"global","title":"Prefer pnpm","body":"Use pnpm.","tags":["tooling"]}]}'
-  assert.equal(parseDrafts(payload, 5).length, 1)
-  assert.equal(parseDrafts(`\`\`\`json\n${payload}\n\`\`\``, 5).length, 1)
-  assert.equal(parseDrafts('{"memories":[]}', 5).length, 0)
-  assert.equal(parseDrafts('not json at all', 5).length, 0)
-  assert.equal(parseDrafts('{"memories":[{"scope":"elsewhere","title":"x","body":"y"}]}', 5).length, 0)
-  assert.equal(parseDrafts('{"memories":[{"scope":"global","title":"","body":"y"}]}', 5).length, 0)
-  const capped = parseDrafts(JSON.stringify({
+test('parseExtraction accepts a bare object, a fenced object, and rejects junk', () => {
+  const payload = '{"summary":"The user set up a pnpm workflow.","memories":[{"scope":"global","title":"Prefer pnpm","body":"Use pnpm.","tags":["tooling"]}]}'
+  const parsed = parseExtraction(payload, 5, 'session-1')
+  assert.equal(parsed.drafts.length, 1)
+  assert.equal(parsed.summary, 'The user set up a pnpm workflow.')
+  assert.equal(parsed.drafts[0]?.sourceSession, 'session-1')
+  assert.equal(parseExtraction(`\`\`\`json\n${payload}\n\`\`\``, 5, 'session-1').drafts.length, 1)
+  assert.equal(parseExtraction('{"memories":[]}', 5, 'session-1').drafts.length, 0)
+  // A reply without a summary still parses; the evidence note then says so.
+  assert.equal(parseExtraction('{"memories":[]}', 5, 'session-1').summary, '')
+  assert.equal(parseExtraction('not json at all', 5, 'session-1').drafts.length, 0)
+  assert.equal(parseExtraction('{"memories":[{"scope":"elsewhere","title":"x","body":"y"}]}', 5, 'session-1').drafts.length, 0)
+  assert.equal(parseExtraction('{"memories":[{"scope":"global","title":"","body":"y"}]}', 5, 'session-1').drafts.length, 0)
+  const capped = parseExtraction(JSON.stringify({
     memories: [1, 2, 3, 4].map((index) => ({ scope: 'global', title: `t${index}`, body: `b${index}` })),
-  }), 2)
-  assert.equal(capped.length, 2)
+  }), 2, 'session-1')
+  assert.equal(capped.drafts.length, 2)
 })
 
-test('parseDrafts redacts secrets inside extracted memories', () => {
-  const drafts = parseDrafts('{"memories":[{"scope":"global","title":"API key","body":"the key is sk-abcdefghijklmnopqrstuvwx"}]}', 5)
-  assert.equal(drafts[0]?.body, 'the key is [redacted]')
+test('parseExtraction redacts secrets inside extracted memories and the summary', () => {
+  const parsed = parseExtraction('{"summary":"they pasted sk-abcdefghijklmnopqrstuvwx","memories":[{"scope":"global","title":"API key","body":"the key is sk-abcdefghijklmnopqrstuvwx"}]}', 5, 'session-1')
+  assert.equal(parsed.drafts[0]?.body, 'the key is [redacted]')
+  assert.equal(parsed.summary, 'they pasted [redacted]')
 })
 
 test('collectWindow reads only human/assistant prose after the watermark', () => {
@@ -141,7 +147,8 @@ test('collectWindow honours the message and character caps from the newest end',
 
 test('the extraction JSON schema is closed and requires the documented fields', () => {
   assert.equal(EXTRACT_JSON_SCHEMA.additionalProperties, false)
-  assert.deepEqual([...EXTRACT_JSON_SCHEMA.required], ['memories'])
+  // The summary is required too: it becomes the evidence note behind the drafts.
+  assert.deepEqual([...EXTRACT_JSON_SCHEMA.required], ['summary', 'memories'])
   assert.deepEqual([...EXTRACT_JSON_SCHEMA.properties.memories.items.required], ['scope', 'title', 'body'])
 })
 
@@ -322,5 +329,22 @@ test('consolidation quotes the rate limit as its own refusal', async (t) => {
   runtime.state.noteLimitFailure('quota exhausted', 1_000, 1_000)
   assert.equal(runtime.state.isLimited(), true)
   assert.match(await runtime.stats(stubSession(process.cwd(), [])), /background: paused until/u)
+  t.after(() => rm(dir, { recursive: true, force: true }))
+})
+
+test('a successful pass writes the evidence note behind the drafts', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-evidence-'))
+  const session = stubSession(process.cwd(), [{ seq: 1, role: 'user', text: 'We always ship with pnpm run ship.' }])
+  const reply = '{"summary":"The user explained how this project ships.","memories":[{"scope":"project","title":"Deploy with pnpm run ship","body":"Ship this project with `pnpm run ship`.","tags":["deploy"]}]}'
+  const runtime = new MemoriesRuntime(stubContext(fakeLlm(reply)), { memoriesDir: dir, autoExtract: true, extractTimeoutMs: 5_000 })
+  t.after(() => runtime.dispose())
+  const agent = { id: 'extract-session', session, status: 'idle' } as unknown as Agent
+
+  assert.equal(await runtime.runExtraction(agent), 1)
+  const note = await runtime.store.readSessionNote('extract-session')
+  assert.equal(note?.summary, 'The user explained how this project ships.')
+  assert.deepEqual(note?.memories, ['deploy-with-pnpm-run-ship'])
+  const stored = (await runtime.store.list('project', process.cwd(), { fresh: true }))[0]
+  assert.equal(stored?.sourceSession, 'extract-session')
   t.after(() => rm(dir, { recursive: true, force: true }))
 })

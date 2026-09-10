@@ -126,6 +126,7 @@ export function formatEntry(entry: MemoryEntry): string {
     tags,
     ...entry.appliesTo !== undefined && entry.appliesTo.length > 0 ? [`appliesTo: ${entry.appliesTo}`] : [],
     ...entry.supersedes !== undefined && entry.supersedes.length > 0 ? [`supersedes: ${entry.supersedes}`] : [],
+    ...entry.sourceSession !== undefined && entry.sourceSession.length > 0 ? [`session: ${entry.sourceSession}`] : [],
     `created: ${new Date(entry.createdAt).toISOString()}`,
     `updated: ${new Date(entry.updatedAt).toISOString()}`,
     `source: ${entry.source}`,
@@ -178,6 +179,7 @@ export function parseEntry(text: string, scope: MemoryScope, fallbackId: string)
   const rawUses = Number(fields.get('uses') ?? '0')
   const appliesTo = fields.get('appliesto')
   const supersedes = fields.get('supersedes')
+  const sourceSession = fields.get('session')
   return {
     id: fields.get('id') ?? fallbackId,
     scope,
@@ -189,6 +191,7 @@ export function parseEntry(text: string, scope: MemoryScope, fallbackId: string)
     tags: (fields.get('tags') ?? '').split(',').map(normalizeTag).filter((tag) => tag.length > 0),
     ...appliesTo !== undefined && appliesTo.length > 0 ? { appliesTo } : {},
     ...supersedes !== undefined && supersedes.length > 0 ? { supersedes } : {},
+    ...sourceSession !== undefined && sourceSession.length > 0 ? { sourceSession } : {},
     createdAt: parseTime(fields.get('created'), updatedAt),
     updatedAt,
     uses: Number.isFinite(rawUses) && rawUses > 0 ? Math.trunc(rawUses) : 0,
@@ -265,6 +268,96 @@ interface IndexCache {
 
 /** How long a cached index is trusted before the directory is re-scanned. */
 const INDEX_TTL_MS = 2_000
+
+/** How many per-session evidence notes the store keeps before the oldest go. */
+export const SESSION_NOTE_LIMIT = 200
+
+/**
+ * Encode one frontmatter value as a YAML double-quoted scalar.
+ *
+ * A plain scalar breaks the document as soon as the value contains a mapping
+ * colon, a leading indicator, or a newline, and both readers here respond by
+ * ignoring the file. Quoting makes every value safe.
+ *
+ * @param value - the raw text.
+ * @returns a double-quoted YAML scalar with the escapes YAML defines.
+ */
+export function yamlScalar(value: string): string {
+  return `"${value
+    .replace(/\\/gu, '\\\\')
+    .replace(/"/gu, '\\"')
+    .replace(/\r\n|\r|\n/gu, '\\n')
+    .replace(/\t/gu, '\\t')}"`
+}
+
+/**
+ * One mined session's evidence note.
+ *
+ * The counterpart of Codex's `rollout_summaries/`: a memory records WHAT was
+ * learned, and this records what the conversation was about, so a reader can
+ * judge whether the memory still applies.
+ */
+export interface SessionNote {
+  /** Session the note describes. */
+  readonly session: string
+  /** Unix epoch milliseconds when the note was written. */
+  readonly at: number
+  /** Scope label of the workspace it was mined in, when it had one. */
+  readonly project?: string
+  /** What the session was about, in the model's words. */
+  readonly summary: string
+  /** Ids of the entries this session contributed. */
+  readonly memories: readonly string[]
+}
+
+/** Where per-session evidence notes live inside the memory store. */
+export function sessionNotesDir(memoriesDir: string): string {
+  return join(memoriesDir, 'sessions')
+}
+
+/** Read the first field of one note's frontmatter block. */
+function noteField(header: string, name: string): string | undefined {
+  for (const line of header.split('\n')) {
+    const separator = line.indexOf(':')
+    if (separator < 0) continue
+    if (line.slice(0, separator).trim().toLowerCase() !== name) continue
+    const raw = line.slice(separator + 1).trim()
+    if (raw.length >= 2 && raw.startsWith('"') && raw.endsWith('"')) {
+      return raw.slice(1, -1)
+        .replace(/\\n/gu, '\n')
+        .replace(/\\t/gu, '\t')
+        .replace(/\\"/gu, '"')
+        .replace(/\\\\/gu, '\\')
+    }
+    return raw
+  }
+  return undefined
+}
+
+/**
+ * Parse one evidence note.
+ * @param text - file content.
+ * @param fallbackSession - session id derived from the file name.
+ * @returns the note, or `undefined` when the file is not a note.
+ */
+export function parseSessionNote(text: string, fallbackSession: string): SessionNote | undefined {
+  const normalized = text.replace(/^\uFEFF/u, '')
+  if (!normalized.startsWith(FENCE)) return undefined
+  const end = normalized.indexOf(`\n${FENCE}`, FENCE.length)
+  if (end < 0) return undefined
+  const header = normalized.slice(FENCE.length, end)
+  const body = normalized.slice(end + FENCE.length + 1).replace(/^\n+/u, '').trim()
+  const session = noteField(header, 'session') ?? fallbackSession
+  const memories = (noteField(header, 'memories') ?? '').split(',').map((id) => id.trim()).filter((id) => id.length > 0)
+  const project = noteField(header, 'project')
+  return {
+    session,
+    at: parseTime(noteField(header, 'at'), 0),
+    ...project === undefined || project.length === 0 ? {} : { project },
+    summary: body,
+    memories,
+  }
+}
 
 /**
  * A memory store rooted at one harness home.
@@ -482,6 +575,7 @@ export class MemoryStore {
     const tags = [...new Set(draft.tags.map(normalizeTag).filter((tag) => tag.length > 0))].slice(0, 12)
     const appliesTo = draft.appliesTo?.trim()
     const supersedes = draft.supersedes?.trim()
+    const sourceSession = draft.sourceSession?.trim() ?? existing?.sourceSession
     const entry: MemoryEntry = {
       id,
       scope: draft.scope,
@@ -493,6 +587,9 @@ export class MemoryStore {
       tags,
       ...appliesTo !== undefined && appliesTo.length > 0 ? { appliesTo } : {},
       ...supersedes !== undefined && supersedes.length > 0 ? { supersedes } : {},
+      // Provenance survives a rewrite: a consolidation that re-words an entry
+      // must not erase which conversation it came from.
+      ...sourceSession !== undefined && sourceSession.length > 0 ? { sourceSession } : {},
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
       uses: existing?.uses ?? 0,
@@ -538,6 +635,67 @@ export class MemoryStore {
       await rm(join(this.entriesDir(scope, projectRoot), `${entry.id}.md`), { force: true })
     }
     this.invalidate(scope, projectRoot)
+  }
+
+  /**
+   * Write one mined session's evidence note.
+   *
+   * This is the layer Codex keeps as `rollout_summaries/`: a memory says WHAT
+   * was learned, and this note says what the conversation was about, so a reader
+   * can judge whether the memory still applies — or go and re-read it.
+   *
+   * @param note - the note to persist.
+   * @returns the absolute path written.
+   */
+  async writeSessionNote(note: SessionNote): Promise<string> {
+    const dir = sessionNotesDir(this.memoriesDir)
+    const path = join(dir, `${slugify(note.session)}.md`)
+    const header = [
+      FENCE,
+      `session: ${yamlScalar(note.session)}`,
+      `at: ${new Date(note.at).toISOString()}`,
+      ...note.project === undefined ? [] : [`project: ${yamlScalar(note.project)}`],
+      ...note.memories.length === 0 ? [] : [`memories: ${note.memories.join(', ')}`],
+      FENCE,
+      '',
+    ].join('\n')
+    await writeAtomic(path, `${header}${note.summary.trim()}\n`)
+    await this.evictNotes()
+    return path
+  }
+
+  /** Read one session's evidence note. */
+  async readSessionNote(session: string): Promise<SessionNote | undefined> {
+    const text = await readText(join(sessionNotesDir(this.memoriesDir), `${slugify(session)}.md`))
+    if (text === undefined) return undefined
+    return parseSessionNote(text, session)
+  }
+
+  /** Every evidence note's session id, newest write first. */
+  async listSessionNotes(): Promise<readonly string[]> {
+    const dir = sessionNotesDir(this.memoriesDir)
+    let names: string[]
+    try {
+      const dirents = await readdir(dir, { withFileTypes: true })
+      names = dirents.filter((dirent) => dirent.isFile() && dirent.name.endsWith('.md')).map((dirent) => dirent.name)
+    } catch (error) {
+      if (isMissing(error)) return []
+      throw error
+    }
+    const stamped: { id: string; at: number }[] = []
+    for (const name of names) {
+      const stat_ = await stat(join(dir, name)).catch(() => undefined)
+      stamped.push({ id: name.replace(/\.md$/u, ''), at: stat_?.mtimeMs ?? 0 })
+    }
+    return stamped.sort((left, right) => right.at - left.at).map((row) => row.id)
+  }
+
+  /** Keep the note store bounded: one small file per mined session, newest kept. */
+  private async evictNotes(): Promise<void> {
+    const ids = await this.listSessionNotes()
+    for (const id of ids.slice(SESSION_NOTE_LIMIT)) {
+      await rm(join(sessionNotesDir(this.memoriesDir), `${id}.md`), { force: true })
+    }
   }
 
   /**

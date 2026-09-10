@@ -622,9 +622,22 @@ export class MemoriesRuntime {
       if (outcome.kind === 'none') {
         this.ctx.logger.debug?.('dsh-memories: extraction produced nothing (%s)', outcome.reason)
       } else {
+        const stored: string[] = []
         for (const draft of outcome.drafts) {
-          await this.store.upsert(draft, draft.scope === 'project' ? root : undefined, 'auto')
+          const result = await this.store.upsert(draft, draft.scope === 'project' ? root : undefined, 'auto')
+          stored.push(result.entry.id)
         }
+        // The evidence note is part of the result, not a nice-to-have: without it
+        // a memory has no history to check when its wording or age matters.
+        await this.store.writeSessionNote({
+          session: key,
+          at: Date.now(),
+          project: projectLabel,
+          summary: outcome.summary,
+          memories: stored,
+        }).catch((error: unknown) => {
+          this.ctx.logger.warn('dsh-memories: could not write the evidence note for %s: %o', key, error)
+        })
         this.ctx.logger.info('dsh-memories: stored %d memories from session %s', outcome.drafts.length, key)
       }
       this.state.putSession(key, {

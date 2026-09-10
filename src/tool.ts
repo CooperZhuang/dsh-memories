@@ -11,7 +11,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type { Context } from '@deepseek-ai/cordis'
 import type { MemoriesRuntime } from './index.js'
-import { renderEntry, renderHit } from './render.js'
+import { renderEntry, renderEvidence, renderHit } from './render.js'
 import type { MemoryScope } from './types.js'
 
 /** The scopes the model may name. */
@@ -21,7 +21,7 @@ const SCOPES = ['global', 'project'] as const
 const KINDS = ['fact', 'preference', 'knowledge', 'failure', 'procedure'] as const
 
 /** The actions the model may take. */
-const ACTIONS = ['write', 'search', 'read', 'forget'] as const
+const ACTIONS = ['write', 'search', 'read', 'forget', 'evidence'] as const
 
 /** Description head: what the tool is for. */
 const DESCRIPTION = [
@@ -29,6 +29,7 @@ const DESCRIPTION = [
   '',
   'When to write (action=write): the user states a preference or working style, a project decision is made with its reason, a command or workflow is discovered, an environment quirk or gotcha is found, or the user asks you to remember something. Do NOT write transient task state, secrets, credentials, or anything already captured in the repository.',
   'When to search (action=search): before starting work that may have been done before, when the user references earlier sessions, or when you need a detail the injected summary only previews.',
+  'When a memory\'s wording, age, or context could change your answer, action=evidence returns the conversation it came from: what that session was about, and which memories it produced. Do not open evidence speculatively; open it when the memory alone is not enough.',
   '',
   'Choose the scope deliberately on every write:',
   '- "global" — true across every project: how the user likes to work, durable preferences, general tooling facts. A memory that would help on an unrelated repository belongs here.',
@@ -79,7 +80,7 @@ export function registerMemoryTool(ctx: Context, runtime: MemoriesRuntime): () =
         type: 'string',
         required: true,
         enum: [...ACTIONS],
-        description: 'write (store a memory), search (find memories), read (show one by id), forget (delete one).',
+        description: 'write (store a memory), search (find memories), read (show one by id), forget (delete one), evidence (show the session a memory came from).',
       },
       scope: {
         type: 'string',
@@ -116,6 +117,10 @@ export function registerMemoryTool(ctx: Context, runtime: MemoriesRuntime): () =
         type: 'string',
         description: 'read/forget: the memory id from a search result.',
       },
+      evidenceSession: {
+        type: 'string',
+        description: 'evidence: the session id whose evidence note to read. Use this when you already know the session; otherwise pass the memory id instead.',
+      },
       limit: {
         type: 'integer',
         description: 'search: maximum hits (default 8, max 25).',
@@ -126,7 +131,8 @@ export function registerMemoryTool(ctx: Context, runtime: MemoriesRuntime): () =
       render: (_args, value) => [{ type: 'text', text: value.message }],
       presentationMeta: (_args, value) => ({ action: value.action, count: value.results.length }),
     },
-    isConcurrencySafe: (args) => args.action === 'search' || args.action === 'read',
+    // Reading evidence costs nothing, so it runs alongside other read-only calls.
+    isConcurrencySafe: (args) => args.action === 'search' || args.action === 'read' || args.action === 'evidence',
     async execute(args, exec: ToolRunContext) {
       const agent = exec.agent
       if (agent === undefined) throw new Error('dsh-memories: the memory tool requires an owning agent session')
@@ -208,6 +214,37 @@ export function registerMemoryTool(ctx: Context, runtime: MemoriesRuntime): () =
             }
           }
           return { ok: false, action: args.action, message: `No memory with id ${JSON.stringify(id)}.`, results: [] }
+        }
+        case 'evidence': {
+          // The model can name the memory (the usual case: it just read one) or the
+          // session id directly when the note mentioned it.
+          let target = args.evidenceSession?.trim()
+          let context = ''
+          const id = args.id?.trim()
+          if ((target === undefined || target.length === 0) && id !== undefined && id.length > 0) {
+            const order: readonly MemoryScope[] = args.scope === undefined ? ['project', 'global'] : [args.scope]
+            let found
+            for (const scope of order) {
+              found = await runtime.read(session, scope, id, false)
+              if (found !== undefined) break
+            }
+            if (found === undefined) {
+              return { ok: false, action: args.action, message: `No memory with id ${JSON.stringify(id)}.`, results: [] }
+            }
+            context = `Memory ${JSON.stringify(found.title)}: `
+            target = found.sourceSession
+            if (target === undefined || target.length === 0) {
+              return { ok: true, action: args.action, message: `${context}this memory records no source session.`, results: [toResult(found)] }
+            }
+          }
+          if (target === undefined || target.length === 0) {
+            throw new Error('dsh-memories: evidence requires an id or evidenceSession')
+          }
+          const note = await runtime.store.readSessionNote(target)
+          if (note === undefined) {
+            return { ok: true, action: args.action, message: `No evidence note for session ${JSON.stringify(target)} (only mined sessions have one).`, results: [] }
+          }
+          return { ok: true, action: args.action, message: `${context}${renderEvidence(note)}`, results: [] }
         }
         /* c8 ignore next 2 -- the registry validates the action enum before dispatch */
         default:
