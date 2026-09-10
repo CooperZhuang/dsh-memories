@@ -16,7 +16,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import { MemoryLog, allows, createFileSink, createLogExporter, formatLogMessage, logPath, toLogLevel } from '../log.js'
+import { LOG_NAME, MemoryLog, allows, createFileSink, createLogExporter, formatLogMessage, logPath, pluginLogger, toLogLevel } from '../log.js'
 import type { LoggerType } from '@deepseek-ai/cordis'
 
 /** Every severity, most serious first. */
@@ -88,26 +88,40 @@ test('a real cordis sink records warn and debug, which the host would otherwise 
   const sink = createFileSink(path)
   assert.ok(sink !== undefined)
   const exporter = createLogExporter(sink, () => level)
-  // The declaration that makes the difference: without it the host threshold
-  // falls back to 1 and everything below `info` is discarded before reaching us.
-  assert.equal(exporter.levels?.default, 3)
+  // The declaration that makes the difference: without a threshold for this
+  // logger the host falls back to 1 and everything below `info` is discarded
+  // before reaching us. Scoping it to the name is equally deliberate — an
+  // exporter is process-wide, and `default: 3` would hand this file every other
+  // plugin's debug traffic too.
+  assert.equal(exporter.levels?.[LOG_NAME], 3)
+  assert.equal(exporter.levels?.default, undefined)
   ctx.logger.exporter(exporter)
 
-  const log = new MemoryLog(ctx.logger as never, () => true)
-  ctx.logger.warn('careful %d', 1)
+  const log = new MemoryLog(pluginLogger(ctx.logger), () => true)
+  log.warn('careful %d', 1)
   log.info('stored %d memories', 2)
   log.decision('archived %s', 'ancient')
   log.debug('quiet detail')
+  // Somebody else's line must not land in this plugin's file.
+  ctx.logger('web-server').warn('ECONNRESET from another plugin')
+  // A line of ours that went out through the service rather than the named
+  // logger carries the fiber's name, so the host applies its own fallback
+  // threshold to it — which delivers `info` but drops `warn`. The name check is
+  // why every call site uses the named logger; the prefix is only insurance for
+  // what the host did deliver.
+  ctx.logger.info('dsh-memories: service-level line %d', 3)
 
   const written = await readFile(path, 'utf8')
   assert.match(written, /\[warn\] .*careful 1/u, 'a warning must reach the file')
   assert.match(written, /\[info\] .*stored 2 memories/u)
   assert.match(written, /\[info\] .*archived ancient/u, 'tracing raises a decision to info')
   assert.match(written, /\[debug\] .*quiet detail/u)
+  assert.match(written, /service-level line 3/u, 'a prefixed line is ours even from the service')
+  assert.doesNotMatch(written, /another plugin/u, 'only this plugin\'s lines belong in its file')
 
   // The verbosity is read per line, so a settings change applies immediately.
   level = 'error'
-  ctx.logger.warn('after the change')
+  log.warn('after the change')
   assert.doesNotMatch(await readFile(path, 'utf8'), /after the change/u)
 })
 

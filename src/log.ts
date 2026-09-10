@@ -126,13 +126,43 @@ export function formatLogMessage(exporter: Exporter, message: Message): string {
   return `${new Date(message.ts).toISOString()} [${message.type}] ${message.name} ${body.replace(/\s*\n\s*/gu, ' ')}`
 }
 
+/** The logger name every line from this plugin carries, and the sink filters on. */
+export const LOG_NAME = 'dsh-memories'
+
+/**
+ * Whether one host message belongs in this plugin's file.
+ *
+ * The name is the real filter, but the prefix is accepted as a fallback: a line
+ * that goes out through `ctx.logger` instead of the named logger carries the
+ * fiber's name (`memories`), not this one, and dropping the plugin's own message
+ * silently is exactly the failure mode this module exists to prevent. The host
+ * still applies its own threshold to such a line, so the fallback only rescues
+ * what was delivered — which is why every call site uses the named logger.
+ *
+ * @param message - the structured record.
+ * @param name - the logger name this file owns.
+ * @returns true when the message is ours.
+ */
+export function ownsMessage(message: Message, name = LOG_NAME): boolean {
+  if (message.name === name) return true
+  const first = message.args[0]
+  return typeof first === 'string' && first.startsWith('dsh-memories:')
+}
+
 /**
  * Build the exporter that writes to a sink.
  *
- * `levels.default = 3` is the whole reason this object exists: it overrides the
- * composition's implicit threshold of `1`, which is what silently discards every
- * `warn` and `debug` line. {@link allows} then decides what this file records,
- * reading the setting live so a change applies to the next line.
+ * `levels` is the whole reason this object exists: cordis filters each message
+ * per exporter against `exporter.levels?.[name] ?? exporter.levels?.default ??
+ * logger.level ?? 1`, and the composition's only default exporter declares no
+ * levels, so the threshold falls back to `1` and every `warn` and `debug` line is
+ * discarded before a sink sees it. Naming THIS logger in the map raises its
+ * threshold without touching what the host does with anybody else's — an
+ * exporter is process-wide, and a `default: 3` here would hand this plugin every
+ * other plugin's debug traffic too.
+ *
+ * `export` still checks the name, because messages that pass the host's fallback
+ * threshold (`error` and `info`) from other plugins do reach every exporter.
  *
  * The verbosity thunk returns a plain string because that is what the settings
  * schema declares; an unrecognized value normalizes to `info` here exactly as it
@@ -140,18 +170,39 @@ export function formatLogMessage(exporter: Exporter, message: Message): string {
  *
  * @param sink - where formatted lines go.
  * @param level - the verbosity in force right now.
+ * @param name - the logger name this file owns.
  * @returns the exporter to hand `ctx.logger.exporter`.
  */
-export function createLogExporter(sink: LogSink, level: () => string): Exporter {
+export function createLogExporter(sink: LogSink, level: () => string, name = LOG_NAME): Exporter {
   const exporter: Exporter = {
     colors: false,
-    levels: { default: 3 },
+    levels: { [name]: 3 },
     export: (message: Message): void => {
+      if (!ownsMessage(message, name)) return
       if (!allows(toLogLevel(level()), message.type)) return
       sink.write(formatLogMessage(exporter, message))
     },
   }
   return exporter
+}
+
+/**
+ * Resolve the plugin's named logger.
+ *
+ * A name is what keeps this plugin's file to this plugin's lines. Deployments and
+ * test doubles that expose only the service's methods (no call signature) fall
+ * back to the service itself, which still logs — just under the fiber's name.
+ *
+ * @param logger - `ctx.logger` as the plugin sees it.
+ * @returns the object whose methods the runtime logs through.
+ */
+export function pluginLogger(logger: unknown): LoggerLike {
+  const service = logger as LoggerLike & ((name: string) => LoggerLike)
+  if (typeof service === 'function') {
+    const named = service(LOG_NAME)
+    if (named !== undefined && typeof named.info === 'function') return named
+  }
+  return service
 }
 
 /** The subset of `ctx.logger` this plugin calls. */

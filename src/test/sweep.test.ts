@@ -110,11 +110,13 @@ test('an archived memory can be listed and restored through the runtime', async 
 })
 
 test('stats reports the recall and retention configuration', async (t) => {
-  const { runtime } = await fixture(t, { recallMode: 'once', maxUnusedDays: 30, sweepIntervalHours: 24 })
+  const { runtime } = await fixture(t, { recallMode: 'once', maxUnusedDays: 30, sweepIntervalHours: 24, autoExtract: true, minIdleHours: 6 })
   const text = await runtime.stats(stubSession(process.cwd()))
   assert.match(text, /recall: once/u)
   assert.match(text, /archive after 30d unused/u)
   assert.match(text, /sweep every 24h/u)
   assert.match(text, /session mode: on/u)
   assert.match(text, /logging: info → /u, 'stats names the log level and file')
+  assert.match(text, /sessions: 0 mined \/ 0 tracked/u)
+  assert.match(text, /auto-extract: on \(mine after 6h idle/u, 'stats shows the effective wait, not the raw knobs')
 })

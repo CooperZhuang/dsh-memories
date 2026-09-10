@@ -319,3 +319,29 @@ export async function runExtraction(llm: LlmRuntime, request: ExtractionRequest)
   if (parsed.drafts.length === 0) return { kind: 'none', reason: 'empty-reply' }
   return { kind: 'memories', drafts: parsed.drafts, summary: parsed.summary, route }
 }
+
+/**
+ * How long to wait after a session settles before mining it.
+ *
+ * The delay is the *larger* of the two configured waits, and that is the whole
+ * point: scheduling for the idle delay alone produced a pass that always failed
+ * the quiet-window gate. The timer fires once and is never re-armed, so a 5
+ * minute timer guarding a 6 hour window meant stage 1 never ran at all — the
+ * plugin's own store showed dozens of tracked sessions and not one watermark.
+ *
+ * @param settings - the tunables in force.
+ * @returns milliseconds to wait after the session settles.
+ */
+export function extractionDelayMs(settings: { autoExtractIdleMs: number; minIdleHours: number }): number {
+  return Math.max(settings.autoExtractIdleMs, settings.minIdleHours * 3_600_000)
+}
+
+/** Render a delay as `45s`, `5m`, or `6h30m`, for one diagnostic line. */
+export function formatDelay(ms: number): string {
+  const seconds = Math.max(0, Math.round(ms / 1_000))
+  if (seconds < 60) return `${seconds}s`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes}m`
+  const rest = minutes % 60
+  return rest === 0 ? `${Math.floor(minutes / 60)}h` : `${Math.floor(minutes / 60)}h${rest}m`
+}

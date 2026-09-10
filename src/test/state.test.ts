@@ -217,3 +217,12 @@ test('a store created before the retention columns migrates on open', async (t) 
   assert.equal(reopened.retentionRows()[0]?.consolidatedAt, 2)
   assert.equal(reopened.getSessionMode('nobody'), 'on')
 })
+
+test('minedCount separates mined sessions from merely tracked ones', async (t) => {
+  const { store } = await tempStore(t)
+  store.touchSession('touched', 5)
+  store.setSessionMode('switched', 'off')
+  store.putSession('mined', { lastSeq: 7, at: 6, contributed: true })
+  assert.equal(store.sessionCount(), 3, 'every row counts as tracked')
+  assert.equal(store.minedCount(), 1, 'only the session with a watermark was mined')
+})

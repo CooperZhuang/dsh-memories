@@ -15,7 +15,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { MemoriesRuntime } from '../index.js'
-import { EXTRACT_JSON_SCHEMA, collectWindow, parseExtraction, redactSecrets, runExtraction } from '../extract.js'
+import { EXTRACT_JSON_SCHEMA, collectWindow, extractionDelayMs, formatDelay, parseExtraction, redactSecrets, runExtraction } from '../extract.js'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Session } from '@deepseek-ai/dsh-session'
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
@@ -353,5 +353,72 @@ test('a successful pass writes the evidence note behind the drafts', async (t) =
   assert.deepEqual(note?.memories, ['deploy-with-pnpm-run-ship'])
   const stored = (await runtime.store.list('project', process.cwd(), { fresh: true }))[0]
   assert.equal(stored?.sourceSession, 'extract-session')
+  t.after(() => rm(dir, { recursive: true, force: true }))
+})
+
+test('the settle timer actually runs a pass once its wait elapses', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-settle-'))
+  const session = stubSession(process.cwd(), [{ seq: 1, role: 'user', text: 'We always ship with pnpm run ship.' }])
+  const reply = '{"memories":[{"scope":"project","title":"Deploy with pnpm run ship","body":"Ship this project with `pnpm run ship`.","tags":["deploy"]}]}'
+  // Short waits on both knobs: this is the whole settle path — timer, quiet-window
+  // gate, pass, watermark — and it is what the shipped defaults could never reach
+  // (a 5 minute timer guarded by a 6 hour window, with no re-arm). The idle delay
+  // is clamped to a 1000 ms floor, so this is as short as the timer can be.
+  const runtime = new MemoriesRuntime(stubContext(fakeLlm(reply)), {
+    memoriesDir: dir,
+    autoExtract: true,
+    minIdleHours: 0,
+    autoExtractIdleMs: 1_000,
+    extractTimeoutMs: 5_000,
+  })
+  t.after(() => runtime.dispose())
+  const agent = {
+    id: 'settle-session',
+    session,
+    status: 'idle',
+    runMaintenance: async (task: (signal: AbortSignal) => Promise<number>) => await task(new AbortController().signal),
+  } as unknown as Agent
+
+  runtime.scheduleExtraction(agent)
+  await new Promise((settle) => setTimeout(settle, 1_400))
+  assert.equal(runtime.state.getSession('extract-session')?.lastSeq, 1, 'the settle timer mined the session')
+  assert.equal((await runtime.store.list('project', process.cwd(), { fresh: true })).length, 1)
+  t.after(() => rm(dir, { recursive: true, force: true }))
+})
+
+test('the extraction delay is the larger of the two configured waits', () => {
+  // Scheduling for `autoExtractIdleMs` alone produced a pass that could never
+  // satisfy `minIdleHours`, and the timer is never re-armed — so with the shipped
+  // defaults (5 minutes against 6 hours) stage 1 never ran at all.
+  assert.equal(extractionDelayMs({ autoExtractIdleMs: 300_000, minIdleHours: 6 }), 6 * 3_600_000)
+  assert.equal(extractionDelayMs({ autoExtractIdleMs: 300_000, minIdleHours: 0 }), 300_000)
+  assert.equal(extractionDelayMs({ autoExtractIdleMs: 8 * 3_600_000, minIdleHours: 6 }), 8 * 3_600_000)
+  assert.equal(formatDelay(45_000), '45s')
+  assert.equal(formatDelay(300_000), '5m')
+  assert.equal(formatDelay(6 * 3_600_000), '6h')
+  assert.equal(formatDelay(6.5 * 3_600_000), '6h30m')
+})
+
+test('the exit flush mines a session that never had its quiet window', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-flush-'))
+  const session = stubSession(process.cwd(), [{ seq: 1, role: 'user', text: 'We always ship with pnpm run ship.' }])
+  const reply = '{"memories":[{"scope":"project","title":"Deploy with pnpm run ship","body":"Ship this project with `pnpm run ship`.","tags":["deploy"]}]}'
+  // A six-hour quiet window against an immediate exit: the timer cannot be what
+  // saves this session, only the forced flush can.
+  const runtime = new MemoriesRuntime(stubContext(fakeLlm(reply)), { memoriesDir: dir, autoExtract: true, minIdleHours: 6, extractTimeoutMs: 5_000 })
+  t.after(() => runtime.dispose())
+  // `mine` claims the idle phase through `runMaintenance`, so the stub has to
+  // provide it the way a real agent does.
+  const agent = {
+    id: 'flush-session',
+    session,
+    status: 'idle',
+    runMaintenance: async (task: (signal: AbortSignal) => Promise<number>) => await task(new AbortController().signal),
+  } as unknown as Agent
+  runtime.scheduleExtraction(agent)
+
+  assert.equal(await runtime.flushExit(5_000), 1, 'the exit boundary ignores the quiet window')
+  // The watermark is keyed by the session, not by the agent id.
+  assert.equal(runtime.state.getSession('extract-session')?.lastSeq, 1)
   t.after(() => rm(dir, { recursive: true, force: true }))
 })

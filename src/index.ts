@@ -38,9 +38,8 @@ import { MEMORY_OPEN, rankForSummary, renderEntry, renderHit, renderMemorySummar
 import type { SummaryScope } from './render.js'
 import { findProjectRoot } from './workspace.js'
 import { planRetention, retentionKey } from './retention.js'
-import { MemoryLog, createFileSink, createLogExporter } from './log.js'
-import type { LoggerLike } from './log.js'
-import { collectWindow, runExtraction } from './extract.js'
+import { MemoryLog, createFileSink, createLogExporter, pluginLogger } from './log.js'
+import { collectWindow, extractionDelayMs, formatDelay, runExtraction } from './extract.js'
 import { applyPlan, denyToolsFor, runConsolidation, selectForConsolidation } from './consolidate.js'
 import { discardDraft, listDrafts, promote, writeDraft } from './skills.js'
 import type { ConsolidationTarget, SubagentSeam } from './consolidate.js'
@@ -125,6 +124,11 @@ export class MemoriesRuntime {
   private readonly lifecycle = new AbortController()
   /** The plugin's own logger: the host logger, plus the decision facade. */
   private readonly log: MemoryLog
+  /**
+   * Why the configured log file is not being written, when it could not be
+   * opened. Set by the composition, surfaced by `/memories stats`.
+   */
+  logSinkError: string | undefined
 
   constructor(
     private readonly ctx: Context,
@@ -139,7 +143,7 @@ export class MemoriesRuntime {
     this.state = new StateStore(statePath(this.deployment.memoriesDir))
     this.llm = ctx.get('llm') as LlmRuntime | undefined
     this.subagents = ctx.get('subagents') as SubagentSeam | undefined
-    this.log = new MemoryLog(ctx.logger as unknown as LoggerLike, () => this.settings.traceMaintenance)
+    this.log = new MemoryLog(pluginLogger(ctx.logger), () => this.settings.traceMaintenance)
   }
 
   /** The tunables in force right now. */
@@ -522,7 +526,7 @@ export class MemoriesRuntime {
     const base = this.settings.quotaCooldownMinutes * 60_000
     const max = Math.max(base, this.settings.quotaCooldownMaxMinutes * 60_000)
     const state = this.state.noteLimitFailure(message.slice(0, 200), base, max)
-    this.ctx.logger.warn(
+    this.log.warn(
       'dsh-memories: provider refused background work (%s), pausing background passes for %d min',
       typeof code === 'string' ? code : 'quota',
       Math.round((state.until - state.at) / 60_000),
@@ -601,7 +605,7 @@ export class MemoriesRuntime {
           if (!this.lifecycle.signal.aborted) this.log.warn('dsh-memories: extraction failed for session %s: %o', agent.session.id, error)
         },
       )
-    }, this.settings.autoExtractIdleMs)
+    }, extractionDelayMs(this.settings))
     timer.unref?.()
     this.idleTimers.set(agent, timer)
   }
@@ -649,15 +653,27 @@ export class MemoriesRuntime {
    * phase is skipped; the next settle pass tries again.
    *
    * @param agent - the settled agent to mine.
+   * @param force - mine even without a quiet window; the exit flush passes it,
+   *   because a session being torn down is finished by definition and would
+   *   otherwise never be mined by a process that exits before `minIdleHours`.
    * @returns how many drafts were stored.
    */
-  private async mine(agent: Agent): Promise<number> {
+  private async mine(agent: Agent, force = false): Promise<number> {
     if (this.sessionOff(agent.session)) return 0
-    if (agent.status !== 'idle') return 0
-    if (!this.idleEnough(agent)) return 0
+    if (!force) {
+      if (agent.status !== 'idle') return 0
+      if (!this.idleEnough(agent)) {
+        this.log.decision('dsh-memories: session %s is not quiet enough yet, still inside the %sh window',
+          agent.session.id, this.settings.minIdleHours)
+        return 0
+      }
+    }
     try {
-      return await agent.runMaintenance(async (signal) => this.runExtraction(agent, signal))
-    } catch {
+      return await agent.runMaintenance(async (signal) => this.runExtraction(agent, signal, force))
+    } catch (error) {
+      // Claiming the idle phase can be refused (a wake arrived first), and a
+      // broken seam should not be silent: the pass is skipped either way.
+      this.log.decision('dsh-memories: could not claim the idle phase for session %s: %o', agent.session.id, error)
       return 0
     }
   }
@@ -708,7 +724,10 @@ export class MemoriesRuntime {
       if (budget.aborted || mined >= limit) break
       mined += 1
       try {
-        stored += await this.mine(agent)
+        // Forced: at this boundary the session is over, so the quiet-window gate
+        // would only guarantee that a process which exits before `minIdleHours`
+        // never mines anything.
+        stored += await this.mine(agent, true)
       } catch (error) {
         if (!budget.aborted) this.log.warn('dsh-memories: exit extraction failed for session %s: %o', agent.session.id, error)
       }
@@ -753,16 +772,18 @@ export class MemoriesRuntime {
    *
    * @param agent - the settled agent to mine.
    * @param budget - optional outer cancellation (a settle-window or shutdown deadline).
+   * @param force - skip the "is the agent idle" gate; used by the exit flush and
+   *   by `/memories mine`, where the caller has already decided to spend the call.
    * @returns how many drafts were stored.
    */
-  async runExtraction(agent: Agent, budget?: AbortSignal): Promise<number> {
+  async runExtraction(agent: Agent, budget?: AbortSignal, force = false): Promise<number> {
     if (!this.settings.autoExtract) return 0
     if (this.backgroundPaused()) {
       const limit = this.state.getLimit()
-      this.ctx.logger.debug?.('dsh-memories: background pass paused until %s (%d refusals)', new Date(limit?.until ?? 0).toISOString(), limit?.failures ?? 0)
+      this.log.debug('dsh-memories: background pass paused until %s (%d refusals)', new Date(limit?.until ?? 0).toISOString(), limit?.failures ?? 0)
       return 0
     }
-    if (agent.status !== 'idle') return 0
+    if (!force && agent.status !== 'idle') return 0
     const session = agent.session
     const key = session.id
     if (this.extracting.has(key)) return 0
@@ -823,7 +844,7 @@ export class MemoriesRuntime {
           summary: outcome.summary,
           memories: stored,
         }).catch((error: unknown) => {
-          this.ctx.logger.warn('dsh-memories: could not write the evidence note for %s: %o', key, error)
+          this.log.warn('dsh-memories: could not write the evidence note for session %s: %o', key, error)
         })
         this.log.info('dsh-memories: stored %d memories from session %s (%s)', outcome.drafts.length, key, stored.join(', '))
       }
@@ -841,10 +862,10 @@ export class MemoriesRuntime {
     }
   }
 
-  /** Force an extraction now, ignoring the idle timer (used by `/memories mine`). */
+  /** Force an extraction now, ignoring the idle timer and the quiet window (used by `/memories mine`). */
   async mineNow(agent: Agent): Promise<number> {
     this.cancelExtraction(agent)
-    const stored = await this.runExtraction(agent)
+    const stored = await this.runExtraction(agent, undefined, true)
     if (stored > 0) this.enqueueConsolidation(Date.now(), false, await this.projectRoot(agent.session))
     return stored
   }
@@ -943,7 +964,7 @@ export class MemoriesRuntime {
           await writeDraft(this.store.memoriesDir, draft)
           staged.push(draft.name)
         } catch (error) {
-          this.ctx.logger.warn('dsh-memories: could not stage skill draft %s: %o', draft.name, error)
+          this.log.warn('dsh-memories: could not stage skill draft %s: %o', draft.name, error)
         }
       }
       this.state.deleteJob(CONSOLIDATE_JOB)
@@ -1020,7 +1041,7 @@ export class MemoriesRuntime {
       if (descriptor === undefined) continue
       archived += await this.retain('project', descriptor.root, now)
     }
-    if (archived > 0) this.ctx.logger.info('dsh-memories: archived %d unused memories', archived)
+    if (archived > 0) this.log.info('dsh-memories: archived %d unused memories', archived)
     return archived
   }
 
@@ -1051,6 +1072,12 @@ export class MemoriesRuntime {
     const last = Number(this.state.getMeta(SWEEP_META_KEY) ?? '0')
     const when = Number.isFinite(last) && last > 0 ? new Date(last).toISOString() : 'never'
     return `, sweep every ${this.settings.sweepIntervalHours}h (last ${when})`
+  }
+
+  /** Where this plugin's log is going, or why it is not. */
+  private logDestination(): string {
+    if (this.deployment.logFile.length === 0) return 'off'
+    return this.logSinkError ?? this.deployment.logFile
   }
 
   /** This session's memory switch. */
@@ -1118,12 +1145,12 @@ export class MemoriesRuntime {
     const lines = [
       `memory home: ${this.store.memoriesDir}`,
       ...states.map((scope) => `${scope.label}: ${scope.entries.length} memories`),
-      `auto-extract: ${this.settings.autoExtract ? `on (idle ${Math.round(this.settings.autoExtractIdleMs / 1000)}s, ≥${this.settings.minIdleHours}h, ≤${this.settings.maxAgeDays}d)` : 'off'}`,
+      `auto-extract: ${this.settings.autoExtract ? `on (mine after ${formatDelay(extractionDelayMs(this.settings))} idle, ≤${this.settings.maxAgeDays}d old)` : 'off'}`,
       `recall: ${this.settings.recallMode} (score ≥${this.settings.recallMinScore}, ≤${this.settings.recallMaxPerConversation} per conversation)`,
       `retention: ${this.settings.maxUnusedDays > 0 ? `archive after ${this.settings.maxUnusedDays}d unused` : 'off'}${this.sweepLine()}`,
       `session mode: ${this.sessionMode(session)}`,
-      `logging: ${this.settings.logLevel}${this.settings.traceMaintenance ? ' + maintenance trace' : ''} → ${this.deployment.logFile.length > 0 ? this.deployment.logFile : 'off'}`,
-      `sessions mined: ${this.state.sessionCount()}`,
+      `logging: ${this.settings.logLevel}${this.settings.traceMaintenance ? ' + maintenance trace' : ''} → ${this.logDestination()}`,
+      `sessions: ${this.state.minedCount()} mined / ${this.state.sessionCount()} tracked`,
       `background: ${this.backgroundLine()}`,
       `state store: ${this.state.durable ? 'sqlite' : `memory-only (${this.state.degradedReason ?? 'driver unavailable'})`}`,
     ]
@@ -1224,6 +1251,10 @@ function helpText(): string {
  */
 export function apply(ctx: Context, config: MemoriesConfig = {}): void {
   const deployment = resolveConfig(config)
+  // Every line this plugin emits goes through its own named logger: the name is
+  // what keeps other plugins' traffic out of this plugin's log file, and using it
+  // here too means a failure during composition is recorded like any other.
+  const log = pluginLogger(ctx.logger)
   /**
    * Authoritative tunables.
    *
@@ -1250,25 +1281,29 @@ export function apply(ctx: Context, config: MemoriesConfig = {}): void {
         liveRegistrations()
       }), 'dsh-memories.settingsWatch')
     } catch (error) {
-      ctx.logger.warn('dsh-memories: settings registration failed, using row defaults: %o', error)
+      log.warn('dsh-memories: settings registration failed, using row defaults: %o', error)
     }
-  }
-
-  // The host logger drops `warn` and `debug` before any sink sees them: the only
-  // exporter a stock composition installs declares no level, so the threshold
-  // falls back to 1 and `warn` (2) is filtered out. Registering our own exporter
-  // with `levels.default = 3` overrides that, and the file then records whatever
-  // `logLevel` allows — which is what makes a failed extraction, a quota refusal,
-  // or a retention decision observable at all.
-  const sink = createFileSink(deployment.logFile)
-  if (sink !== undefined) {
-    ctx.logger.exporter(createLogExporter(sink, () => current.logLevel))
-  } else if (deployment.logFile.trim().length > 0) {
-    ctx.logger.warn('dsh-memories: could not open the log file %s', deployment.logFile)
   }
 
   const runtime = new MemoriesRuntime(ctx, config, read)
   ctx.effect(() => () => runtime.dispose(), 'dsh-memories.lifecycle')
+
+  // The host logger drops `warn` and `debug` before any sink sees them: the only
+  // exporter a stock composition installs declares no level, so the threshold
+  // falls back to 1 and `warn` (2) is filtered out. Registering our own exporter
+  // for this plugin's logger name only raises that threshold for our lines, and
+  // the file then records whatever `logLevel` allows — which is what makes a
+  // failed extraction, a quota refusal, or a retention decision observable.
+  const sink = createFileSink(deployment.logFile)
+  if (sink !== undefined) {
+    ctx.logger.exporter(createLogExporter(sink, () => current.logLevel))
+  } else if (deployment.logFile.trim().length > 0) {
+    // Recorded on the runtime rather than only logged: this very message cannot
+    // reach the file that failed to open, and the host's own sink is a ring
+    // buffer that a stock profile never reads. `stats` is where a user looks.
+    runtime.logSinkError = `unwritable: ${deployment.logFile}`
+    log.warn('dsh-memories: could not open the log file %s', deployment.logFile)
+  }
   // The Settings page reads and edits memories through the Typert gateway, so
   // registering the invocation manifest and providing the `memories` service
   // are what make `ctx.remote.memories.*` callable from the browser. Both are
@@ -1282,24 +1317,24 @@ export function apply(ctx: Context, config: MemoriesConfig = {}): void {
       const service = createRemoteService({ store: runtime.store, dshHome: deployment.dshHome })
       ctx.effect(() => ctx.provide(REMOTE_SERVICE, service), 'dsh-memories.remoteService')
     } catch (error) {
-      ctx.logger.warn('dsh-memories: remote registration failed, the settings page stays unavailable: %o', error)
+      log.warn('dsh-memories: remote registration failed, the settings page stays unavailable: %o', error)
     }
   }
   // Import (and remove) a pre-SQLite watermark file once, so upgrading does not
   // re-mine conversations that were already processed.
   void importLegacyState(runtime.state, runtime.store.memoriesDir).then((imported) => {
     if (imported === undefined) return
-    ctx.logger.info('dsh-memories: imported %d watermarks from the legacy state file', imported)
+    log.info('dsh-memories: imported %d watermarks from the legacy state file', imported)
   }).catch((error: unknown) => {
-    ctx.logger.warn('dsh-memories: legacy state import failed: %o', error)
+    log.warn('dsh-memories: legacy state import failed: %o', error)
   })
   // The first sweep runs here rather than waiting for a session to settle: a
   // process that starts and stops (a script, a one-shot task) then still gets
   // the periodic cleanup it would otherwise never reach.
   void runtime.sweepIfDue().catch((error: unknown) => {
-    ctx.logger.warn('dsh-memories: startup sweep failed: %o', error)
+    log.warn('dsh-memories: startup sweep failed: %o', error)
   })
-  ctx.logger.info(
+  log.info(
     'dsh-memories: store at %s autoExtract=%s idle=%d settings=%s log=%s',
     runtime.store.memoriesDir,
     String(runtime.settings.autoExtract),

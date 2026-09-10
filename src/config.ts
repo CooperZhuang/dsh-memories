@@ -268,6 +268,13 @@ export interface MemoriesConfig {
   extractMaxOutputTokens?: number
   extractTimeoutMs?: number
   extractMaxMemories?: number
+  minIdleHours?: number
+  maxAgeDays?: number
+  maxSessionsPerPass?: number
+  consolidate?: boolean
+  consolidateCooldownHours?: number
+  consolidateMaxEntries?: number
+  consolidateTimeoutMs?: number
   extractProvider?: string
   extractModel?: string
   consolidateProvider?: string

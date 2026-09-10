@@ -285,10 +285,32 @@ export class StateStore {
     }))
   }
 
-  /** Number of sessions with a watermark. */
+  /**
+   * Number of sessions this store knows about.
+   *
+   * Every row counts, including ones that only ever recorded activity or a
+   * memory switch, so this answers "has this store seen the session" — which is
+   * what the legacy-import guard needs. {@link minedCount} answers "was it
+   * mined", which is what a diagnostic wants.
+   */
   sessionCount(): number {
     if (this.db === undefined) return this.sessions.size
     const row = this.db.prepare('SELECT COUNT(*) AS n FROM sessions').get() as { n: number }
+    return Number(row.n)
+  }
+
+  /**
+   * Number of sessions that were actually mined.
+   *
+   * The distinction is not cosmetic: a store can accumulate dozens of activity
+   * rows while extraction has never once completed, and a single "sessions"
+   * number reports that as a busy, healthy plugin.
+   */
+  minedCount(): number {
+    if (this.db === undefined) {
+      return [...this.sessions.values()].filter((state) => state.lastSeq > 0 || state.contributed === true).length
+    }
+    const row = this.db.prepare('SELECT COUNT(*) AS n FROM sessions WHERE last_seq > 0 OR contributed = 1').get() as { n: number }
     return Number(row.n)
   }
 

@@ -73,6 +73,15 @@
 `maxAgeDays`（最后活动太久的会话永不抽取）、`maxSessionsPerPass`（一次最多处理几个会话），
 用来把后台额度消耗限住。
 
+**有效等待时间是 `max(autoExtractIdleMs, minIdleHours)`**，这一条容易看漏：定时器只在会话转入空闲时
+武装一次、触发后不重排，所以若按 `autoExtractIdleMs`（默认 5 分钟）定闹钟、却要求空闲满 `minIdleHours`
+（默认 6 小时）才放行，那次触发必然被拒，之后再也不会有第二次——默认配置下阶段 1/2 等于从不执行。
+现在定时器直接等到两个闸门都满足的时刻。`/memories mine` 与**进程退出兜底**不受空闲窗口限制：
+会话都要结束了，「它还在动」这个理由不再成立。
+
+`/memories stats` 里的 `auto-extract` 一行显示的就是这个**有效等待**，`sessions: N mined / M tracked`
+则区分「真正抽取完成的会话」与「只是留下过活动记录的会话」——两者差得很多时，说明抽取根本没跑起来。
+
 摘要内容按**统一打分**排序：`相关度 × 重要度 × 新近度衰减`。重要度来自被 `memory_search` 命中的次数，新近度按 90 天半衰期衰减但**不降到 0.25 以下**——久远但精确的记忆仍然排得进有界摘要。同一个公式也用于工具检索和按需补注，所以「值得回忆」在三处是同一个意思。
 
 ## 安装
@@ -133,13 +142,13 @@ memories:
 | `dedupeSimilarity` | `0.7` | 标题与正文词重叠达到该比例时，新记忆视为改写并 `supersedes` 旧记忆；`0` 只保留完全相同规则 |
 | `sweepIntervalHours` | `12` | 定期整理间隔（对所有已知工作区）；`0` 关闭，仍可手动 `/memories sweep` |
 | `autoExtract` | `true` | 是否启用空闲后台抽取 |
-| `autoExtractIdleMs` | `300000` | 空闲多久后开始抽取（最小 1000） |
+| `autoExtractIdleMs` | `300000` | 空闲多久后开始抽取（最小 1000）；实际等待见 `minIdleHours` |
 | `extractWindowMessages` | `30` | 一次抽取最多看多少条对话消息 |
 | `extractMaxInputChars` | `24000` | 抽取输入的字符预算 |
 | `extractMaxOutputTokens` | `2048` | 抽取调用的输出上限 |
 | `extractTimeoutMs` | `120000` | 抽取调用超时 |
 | `extractMaxMemories` | `5` | 一次抽取最多产出多少条记忆 |
-| `minIdleHours` | `6` | 会话至少空闲这么久才可被抽取 |
+| `minIdleHours` | `6` | 会话至少空闲这么久才可被抽取；实际等待取它与 `autoExtractIdleMs` 的较大者 |
 | `maxAgeDays` | `10` | 最后活动早于此天数的会话永不被抽取 |
 | `maxSessionsPerPass` | `2` | 一次抽取最多处理多少个会话（新的优先） |
 | `consolidate` | `true` | 是否启用阶段 2 合并重整 |
@@ -249,7 +258,8 @@ frontmatter 的目录包），下次技能目录刷新后进入目录。草稿�
 ## 日志与排障
 
 插件把自己说的话写进一个文件（默认 `$DSH_HOME/logs/dsh-memories.log`，超过 2MB 轮转一代，
-旧的一代留在 `dsh-memories.log.1`）：
+旧的一代留在 `dsh-memories.log.1`）。文件里**只有本插件的行**：exporter 是按 logger 名过滤的，
+不会把 web-server、hmr 等其他插件的噪音一起收进来：
 
 ```bash
 tail -f ~/.dsh/logs/dsh-memories.log           # 实时看
@@ -257,17 +267,19 @@ grep '\[warn\]' ~/.dsh/logs/dsh-memories.log   # 只看警告
 ```
 
 `/memories stats` 会打印当前等级与文件路径，同时也是最快的一眼诊断：store 位置、两作用域条数、
-抽取/补注/保留配置、后台是否被额度暂停、状态库是不是降级成了纯内存。
+抽取/补注/保留配置与**有效抽取等待**、`sessions: N mined / M tracked`、后台是否被额度暂停、
+状态库是不是降级成了纯内存、以及日志文件写不出来时的原因。
 
 等级含义是「该级别及以上」，所以 `off` < `error` < `warn` < `info` < `debug`。默认 `info` =
 错误 + 警告 + 每轮抽取/合并摘要；`warn` 会丢掉那些摘要行，`debug` 再加上逐条决策。
 
-**一个必须知道的宿主行为**：cordis 对每条消息按 exporter 过滤，阈值取
-`exporter.levels?.default ?? logger.level ?? 1`，而 DSH 组合里唯一的 exporter（1000 条内存环形缓冲）
-没有声明 `levels`，于是阈值落到 `1` —— `warn`(2) 与 `debug`(3) **在任何 sink 看到之前就被丢掉**，
-并且 profile 里没有任何东西读那个环形缓冲。所以本插件自己注册了一个 `levels.default = 3` 的
-exporter，再按 `logLevel` 自行过滤；只把 profile 的 `logger.level` 调高是没用的（没有 sink）。
-这条由 `src/test/log.test.ts` 里的真实 cordis 测试钉住。
+**一个必须知道的宿主行为**：cordis 对每条消息**按 exporter × logger 名**过滤，阈值取
+`exporter.levels?.[name] ?? exporter.levels?.default ?? logger.level ?? 1`，而 DSH 组合里唯一的
+exporter（1000 条内存环形缓冲）没有声明 `levels`，于是阈值落到 `1` —— `warn`(2) 与 `debug`(3)
+**在任何 sink 看到之前就被丢掉**，并且 profile 里没有任何东西读那个环形缓冲。所以本插件注册了
+自己的 exporter，并**只为自己的 logger 名**（`dsh-memories`）声明阈值 `3`：既让插件自己的
+warn/debug 落盘，又不会顺手把其他插件的 debug 流量也打开。只把 profile 的 `logger.level` 调高
+是没用的（没有 sink 会读）。这条由 `src/test/log.test.ts` 里的真实 cordis 测试钉住。
 
 想把维护决策也看清楚（为什么某条记忆被归档、为什么这一轮没补注、这次合并复审了哪些条目）：
 
@@ -418,8 +430,10 @@ dsh --profile web --patch ./fast.yml
 
 ## 已知取舍
 
-- 抽取是**事后**的，而且只在长驻进程里按空闲时间触发：会话刚结束就立刻关掉进程，这一轮
-  不会被抽取（用 `/memories mine` 可以立刻抽一次）。
+- 抽取是**事后**的，而且只在长驻进程里按空闲时间触发：会话要空闲到
+  `max(autoExtractIdleMs, minIdleHours)`（默认 6 小时）才会被抽取。进程退出时还有一次
+  **兜底抽取**（不受空闲窗口限制，预算 8 秒），所以「聊完就关」通常也能被抽到；真正确保抽到的
+  手段仍是 `/memories mine`。
 - 检索是**词法匹配**（标题/正文/tag 加权 + 使用频次 + 新近度），不是向量检索。
 - 项目记忆按工作区根划分，**同一仓库的多个 clone 是两份独立记忆**（因为路径不同）。
 - 摘要有字节预算，记忆很多时只会列出最相关的一部分，其余靠 `memory_search` 取。
@@ -444,7 +458,7 @@ dsh --profile web --patch ./fast.yml
 | --- | --- |
 | 工具写入、注入、模型真的用了记忆 | ✅ 真机 |
 | 设置 → 记忆 页面（列表/搜索/范围与类别过滤/新增/删除/可调项） | ✅ 真机浏览器：真写入了 `settings.yaml`，新增的记忆当场出现在列表里并被后续注入读到；「插件 → 插件配置」里不再有重复卡片 |
-| 空闲抽取（真模型） | ✅ 真机：模型自己写了 `kind` 与 `appliesTo` |
+| 空闲抽取（真模型） | ⚠️ 真机（但用了 `minIdleHours: 0` 覆盖层）：模型自己写了 `kind` 与 `appliesTo`。**注意**：默认配置下这条路径过去从不执行——见下一行 |
 | 证据层（真模型） | ✅ 真机：SDK 驱动的真实会话被抽取后，`memories/sessions/<id>.md` 里写下了模型给的会话摘要，条目带上 `session:` 溯源；`memory action=evidence` 能读回该笔记 |
 | 额度闸门 | ✅ 单元测试（含跨重启保留）；未经真实限流触发 |
 | 合并子代理（真子代理） | ✅ 真机：受限子代理运行、返回结构化方案、方案被应用 |
@@ -453,6 +467,7 @@ dsh --profile web --patch ./fast.yml
 | 重启后不重复注入 | ✅ 真实 API + 真实日志：`Session.deriveMessages()` 对注入的 recall 消息返回 `source={kind:'plugin',plugin:'memories',form:'recall'}`（判据成立），且该消息在会话日志里是普通持久事件（重启后随历史恢复） |
 | 保留/归档/定期整理/按需补注/键扩展（本轮新增） | ⏳ 单元测试覆盖：保留判定、归档往返、状态列迁移、按需补注三道闸门、检索 eval 语料（hit@3 100%）与抽取 eval fixture；真机行为待下一轮复核 |
 | 日志落盘（本轮新增） | ✅ 真实 cordis 激活（真服务 + 真 exporter）：`logLevel: info` 下文件里写出了启动行、`archiving global/ancient, unused for 9750 days`、`archived 1 unused memories`，归档文件带 `archived:` 时间戳；`warn`/`debug` 不再被宿主阈值丢弃由 `src/test/log.test.ts` 的真实 Context 测试钉住 |
+| 抽取定时器 / 退出兜底 / 日志名过滤 / sessions 计数（缺陷修复） | ✅ 现场证据：真实库 `sessions_total=59` 而 `last_seq>0` **为 0**（阶段 1/2 从未执行），根因是 5 分钟定时器配 6 小时静默闸门且不重排；修复后定时器等到 `max(autoExtractIdleMs, minIdleHours)`、退出兜底与 `/memories mine` 绕过该闸门（均由新单测钉住）。真实 cordis 探针确认日志文件**只含本插件的行**（web-server / auto-thinking-effort 的噪音被排除）、stats 输出 `auto-extract: on (mine after 6h idle …)` 与 `sessions: N mined / M tracked` |
 
 > 「多轮不重注入」这一条目前是**单元测试 + 单轮真机进程**两重证据：本轮想用浏览器复核时，web
 > profile 里另外几个插件把 GUI 挡住了（`dsh-message-edit` 缺 `@deepseek-ai/dsh-client-runtime/client`、
