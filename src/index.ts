@@ -154,6 +154,7 @@ export class MemoriesRuntime {
 
   /** Abort every owned background activity and release the state store. */
   dispose(): void {
+    this.stopPeriodicExtraction()
     this.lifecycle.abort(new Error('dsh-memories disposed'))
     this.state.close()
   }
@@ -615,14 +616,7 @@ export class MemoriesRuntime {
       }
       void this.mine(agent).then(
         async (stored) => {
-          // New material is what makes a consolidation pass worth running; the
-          // pass itself waits out its own cooldown. The workspace root is
-          // recorded so the pass covers THIS session's project scope.
-          if (stored > 0) this.enqueueConsolidation(Date.now(), false, await this.projectRoot(agent.session))
-          // Retention costs no quota and needs no new material, so it runs on
-          // its own interval; consolidation still needs a dirty job.
-          void this.sweepIfDue()
-          void this.consolidateIfDue(agent)
+          await this.afterPass(agent, stored)
         },
         (error: unknown) => {
           if (!this.lifecycle.signal.aborted) this.log.warn('dsh-memories: extraction failed for session %s: %o', agent.session.id, error)
@@ -631,6 +625,87 @@ export class MemoriesRuntime {
     }, delayMs)
     timer.unref?.()
     this.idleTimers.set(agent, timer)
+  }
+
+  /**
+   * The bookkeeping every pass shares once it has run.
+   *
+   * New material is what makes a consolidation pass worth running; retention
+   * costs no quota and needs no new material, so it runs on its own interval.
+   *
+   * @param agent - the session's agent.
+   * @param stored - how many drafts the pass stored.
+   */
+  private async afterPass(agent: Agent, stored: number): Promise<void> {
+    if (stored > 0) this.enqueueConsolidation(Date.now(), false, await this.projectRoot(agent.session))
+    // Awaited, not fired and forgotten: retention is local file work, it runs at
+    // most once per interval, and leaving it in flight makes the pass's side
+    // effects land after the caller thinks the pass is over.
+    await this.sweepIfDue()
+    void this.consolidateIfDue(agent)
+  }
+
+  /**
+   * (Re)start the periodic check from the current settings.
+   *
+   * Idempotent, so the settings watcher can call it on every commit: the old
+   * timer is cleared first, and an interval of `0` simply leaves none running.
+   */
+  startPeriodicExtraction(): void {
+    this.stopPeriodicExtraction()
+    const minutes = this.settings.extractIntervalMinutes
+    if (!(minutes > 0)) return
+    const timer = setInterval(() => {
+      void this.runPeriodicPass()
+    }, minutes * 60_000)
+    timer.unref?.()
+    this.periodicTimer = timer
+  }
+
+  /** Stop the periodic check, if one is running. */
+  stopPeriodicExtraction(): void {
+    if (this.periodicTimer !== undefined) clearInterval(this.periodicTimer)
+    this.periodicTimer = undefined
+  }
+
+  /** The periodic check's timer, when one is armed. */
+  private periodicTimer: NodeJS.Timeout | undefined
+
+  /**
+   * Mine every open session that has something new, in slices.
+   *
+   * This is what keeps a long working session from losing its middle: a
+   * settle-only pass reads the newest slice once and then moves the watermark
+   * past everything before it, so those messages are never mined. The idle window
+   * is deliberately not consulted here — the point is to capture while the
+   * session is still running — but peak hours and the quota gate still are, and
+   * `runMaintenance` inside {@link mine} waits for a natural gap instead of
+   * racing the conversation.
+   *
+   * A session with nothing new costs no model call.
+   */
+  async runPeriodicPass(): Promise<void> {
+    if (!this.settings.autoExtract) return
+    if (!(this.settings.extractIntervalMinutes > 0)) return
+    if (this.backgroundPaused()) return
+    for (const reference of [...this.tracked]) {
+      if (this.lifecycle.signal.aborted) return
+      const agent = reference.deref()
+      if (agent === undefined) {
+        this.tracked.delete(reference)
+        continue
+      }
+      const session = agent.session
+      if (!this.eligible(session)) continue
+      if (this.extracting.has(session.id)) continue
+      if (this.hasNothingNew(session)) continue
+      try {
+        await this.afterPass(agent, await this.mine(agent, { ignoreIdleWindow: true }))
+      } catch (error) {
+        this.log.warn('dsh-memories: periodic extraction failed for session %s: %o', session.id, error)
+      }
+    }
+    await this.sweepIfDue()
   }
 
   /**
@@ -758,7 +833,12 @@ export class MemoriesRuntime {
         this.tracked.delete(reference)
         continue
       }
-      if (this.mined.has(agent.session.id)) continue
+      // Content decides, not a per-process flag: a periodic pass may already have
+      // mined this session, and the minutes that followed it still deserve a pass.
+      // Reading the transcript is free; only the model call costs anything, and
+      // `runExtraction` skips that when the window is empty.
+      if (this.extracting.has(agent.session.id)) continue
+      if (this.hasNothingNew(agent.session)) continue
       if (budget.aborted || mined >= limit) break
       mined += 1
       try {
@@ -773,8 +853,20 @@ export class MemoriesRuntime {
     return stored
   }
 
-  /** Whether an extraction has already run for this session in this process. */
-  private mined = new Set<string>()
+  /**
+   * Whether a session has nothing after its watermark.
+   *
+   * The check exists so a flush (or a periodic tick) does not spend a model call
+   * to learn that there is nothing to read: walking the surface is free.
+   *
+   * @param session - session to inspect.
+   * @returns true when there is nothing new to mine.
+   */
+  private hasNothingNew(session: Session): boolean {
+    const after = this.state.getSession(session.id)?.lastSeq ?? 0
+    const window = collectWindow(session, after, this.settings.extractWindowMessages, this.settings.extractMaxInputChars)
+    return window.lastSeq === undefined || window.text.trim().length === 0
+  }
 
   /** Agents that have settled at least once and may need an exit flush. */
   private readonly tracked = new Set<WeakRef<Agent>>()
@@ -828,7 +920,6 @@ export class MemoriesRuntime {
     const llm = this.llm
     if (llm === undefined) return 0
     this.extracting.add(key)
-    this.mined.add(key)
     // Keep the event loop alive for the duration: a one-shot run has nothing
     // else scheduled, and Node would exit mid-request. Released in `finally`.
     const hold = setTimeout(() => undefined, this.settings.extractTimeoutMs + 1_000)
@@ -1214,7 +1305,7 @@ export class MemoriesRuntime {
     const lines = [
       `memory home: ${this.store.memoriesDir}`,
       ...states.map((scope) => `${scope.label}: ${scope.entries.length} memories`),
-      `auto-extract: ${this.settings.autoExtract ? `on (wait ${formatDelay(extractionDelayMs(this.settings))} idle, ≤${this.settings.maxAgeDays}d old)` : 'off'}`,
+      `auto-extract: ${this.settings.autoExtract ? `on (every ${formatDelay(this.settings.extractIntervalMinutes * 60_000)}${this.settings.minIdleHours > 0 ? ` + ${formatDelay(extractionDelayMs(this.settings))} quiet to settle` : ''}, ≤${this.settings.maxAgeDays}d old)` : 'off'}`,
       `peak-hours: ${this.peakLine()}`,
       `recall: ${this.settings.recallMode} (score ≥${this.settings.recallMinScore}, ≤${this.settings.recallMaxPerConversation} per conversation)`,
       `retention: ${this.settings.maxUnusedDays > 0 ? `archive after ${this.settings.maxUnusedDays}d unused` : 'off'}${this.sweepLine()}`,
@@ -1338,8 +1429,8 @@ export function apply(ctx: Context, config: MemoriesConfig = {}): void {
   const read = (): MemoriesSettings => current
   /** Assigned once the live registrations exist; a no-op until then. */
   let liveRegistrations = (): void => undefined
-  /** Assigned once the runtime exists, so a settings commit can report a bad value. */
-  let reportIssues = (): void => undefined
+  /** Assigned once the runtime exists, so a settings commit can act on it. */
+  let onSettingsCommit = (): void => undefined
 
   // The settings seam is optional: a deployment that composes no provider
   // keeps the row-level defaults and simply has no settings document.
@@ -1351,7 +1442,7 @@ export function apply(ctx: Context, config: MemoriesConfig = {}): void {
       ctx.effect(() => scope.watch((next) => {
         current = normalizeSettings(next)
         liveRegistrations()
-        reportIssues()
+        onSettingsCommit()
       }), 'dsh-memories.settingsWatch')
     } catch (error) {
       log.warn('dsh-memories: settings registration failed, using row defaults: %o', error)
@@ -1360,7 +1451,11 @@ export function apply(ctx: Context, config: MemoriesConfig = {}): void {
 
   const runtime = new MemoriesRuntime(ctx, config, read)
   ctx.effect(() => () => runtime.dispose(), 'dsh-memories.lifecycle')
-  reportIssues = () => runtime.reportSettingsIssues()
+  onSettingsCommit = () => {
+    runtime.startPeriodicExtraction()
+    runtime.reportSettingsIssues()
+  }
+  runtime.startPeriodicExtraction()
   runtime.reportSettingsIssues()
 
   // The host logger drops `warn` and `debug` before any sink sees them: the only

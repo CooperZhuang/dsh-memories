@@ -75,10 +75,21 @@ export function toRecallMode(value: unknown): RecallMode {
 export const DEFAULT_AUTO_EXTRACT_IDLE_MS = 300_000
 
 /** Default number of surface messages handed to the extractor. */
-export const DEFAULT_EXTRACT_WINDOW_MESSAGES = 30
+export const DEFAULT_EXTRACT_WINDOW_MESSAGES = 60
 
 /** Default character budget for the extraction transcript. */
-export const DEFAULT_EXTRACT_MAX_INPUT_CHARS = 24_000
+export const DEFAULT_EXTRACT_MAX_INPUT_CHARS = 48_000
+
+/**
+ * Default minutes between periodic extraction checks; `0` disables them.
+ *
+ * A settle-only pass mines a session once, after it has been quiet for the whole
+ * quiet window, and reads only the newest slice of it — so a long working session
+ * loses everything before that slice for good, because the watermark moves past
+ * it. A periodic check mines in slices as the session runs, which is also why the
+ * window above is sized for one interval rather than for a whole conversation.
+ */
+export const DEFAULT_EXTRACT_INTERVAL_MINUTES = 30
 
 /** Default output-token cap for one extraction call. */
 export const DEFAULT_EXTRACT_MAX_OUTPUT_TOKENS = 2048
@@ -167,6 +178,8 @@ export const MemoriesSettingsSchema = z.object({
   extractTimeoutMs: z.number().default(DEFAULT_EXTRACT_TIMEOUT_MS).description('Timeout for one extraction call.'),
   /** Max drafts one extraction may produce. */
   extractMaxMemories: z.number().default(DEFAULT_EXTRACT_MAX_MEMORIES).description('Maximum memories one extraction pass may store.'),
+  /** Minutes between periodic extraction checks over every open session. */
+  extractIntervalMinutes: z.number().default(DEFAULT_EXTRACT_INTERVAL_MINUTES).description('How often to check every open session for new material and mine it in slices. Fractions are allowed. 0 disables the periodic check, leaving mining to the settle timer and the exit flush. Peak hours and the quota gate still apply; a session with nothing new costs no model call.'),
   /** A session must have been idle this long before it is mined. */
   minIdleHours: z.number().default(DEFAULT_MIN_IDLE_HOURS).description('A session must have been idle at least this many hours before it is mined.'),
   /** Sessions older than this are never mined. */
@@ -224,6 +237,7 @@ export const MEMORIES_SETTINGS_DEFAULTS: MemoriesSettings = {
   extractMaxOutputTokens: DEFAULT_EXTRACT_MAX_OUTPUT_TOKENS,
   extractTimeoutMs: DEFAULT_EXTRACT_TIMEOUT_MS,
   extractMaxMemories: DEFAULT_EXTRACT_MAX_MEMORIES,
+  extractIntervalMinutes: DEFAULT_EXTRACT_INTERVAL_MINUTES,
   minIdleHours: DEFAULT_MIN_IDLE_HOURS,
   maxAgeDays: DEFAULT_MAX_AGE_DAYS,
   maxSessionsPerPass: DEFAULT_MAX_SESSIONS_PER_PASS,
@@ -281,6 +295,7 @@ export interface MemoriesConfig {
   extractMaxOutputTokens?: number
   extractTimeoutMs?: number
   extractMaxMemories?: number
+  extractIntervalMinutes?: number
   minIdleHours?: number
   maxAgeDays?: number
   maxSessionsPerPass?: number
@@ -374,6 +389,7 @@ export function normalizeSettings(input: Partial<MemoriesSettings> | undefined):
     extractMaxOutputTokens: positive(value.extractMaxOutputTokens, DEFAULT_EXTRACT_MAX_OUTPUT_TOKENS),
     extractTimeoutMs: positive(value.extractTimeoutMs, DEFAULT_EXTRACT_TIMEOUT_MS),
     extractMaxMemories: positive(value.extractMaxMemories, DEFAULT_EXTRACT_MAX_MEMORIES),
+    extractIntervalMinutes: decimal(value.extractIntervalMinutes, DEFAULT_EXTRACT_INTERVAL_MINUTES),
     minIdleHours: decimal(value.minIdleHours, DEFAULT_MIN_IDLE_HOURS),
     maxAgeDays: positive(value.maxAgeDays, DEFAULT_MAX_AGE_DAYS, 0),
     maxSessionsPerPass: positive(value.maxSessionsPerPass, DEFAULT_MAX_SESSIONS_PER_PASS),

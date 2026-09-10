@@ -72,6 +72,11 @@ function stubSession(cwd: string, events: { seq: number; role: 'user' | 'assista
       }
     },
     requestHeader: () => ({ config: { provider: 'fake-provider', model: 'fake-model' } }),
+    /** Grow the surface mid-test, the way a conversation does. */
+    append: (event: { seq: number; role: 'user' | 'assistant'; text: string }) => {
+      bySeq.set(event.seq, event)
+      nodes.push(event.seq)
+    },
   } as unknown as Session
 }
 
@@ -436,5 +441,112 @@ test('peak hours hold back the automatic passes but not an explicit one', async 
   assert.equal(runtime.state.getSession('extract-session'), undefined, 'the settle timer waits the window out')
   assert.equal(await runtime.flushExit(5_000), 0, 'the exit flush is an automatic spend, so it defers too')
   assert.equal(await runtime.mineNow(agent), 1, 'an explicit /memories mine ignores the window')
+  t.after(() => rm(dir, { recursive: true, force: true }))
+})
+
+/** The agent stub every periodic test needs: idle, and able to claim the idle phase. */
+function idleAgent(session: Session, id = 'periodic-session'): Agent {
+  return {
+    id,
+    session,
+    status: 'idle',
+    runMaintenance: async (task: (signal: AbortSignal) => Promise<number>) => await task(new AbortController().signal),
+  } as unknown as Agent
+}
+
+test('a periodic pass mines new material and costs nothing when there is none', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-periodic-'))
+  const session = stubSession(process.cwd(), [{ seq: 1, role: 'user', text: 'We always ship with pnpm run ship.' }])
+  const reply = '{"memories":[{"scope":"project","title":"Deploy with pnpm run ship","body":"Ship this project with `pnpm run ship`.","tags":[]}]}'
+  const seen: { user?: string | undefined } = {}
+  // The quiet window is six hours, so the settle path could not fire for hours:
+  // the periodic check is what mines this session, and it must not consult that
+  // window — the whole point is to capture while the session is still running.
+  const runtime = new MemoriesRuntime(stubContext(fakeLlm(reply, seen)), {
+    memoriesDir: dir,
+    autoExtract: true,
+    minIdleHours: 6,
+    extractIntervalMinutes: 30,
+    extractTimeoutMs: 5_000,
+  })
+  t.after(() => runtime.dispose())
+  const agent = idleAgent(session)
+  runtime.scheduleExtraction(agent)
+
+  await runtime.runPeriodicPass()
+  assert.equal(runtime.state.getSession('extract-session')?.lastSeq, 1, 'the slice was mined')
+  assert.ok(seen.user !== undefined, 'the first pass called the model')
+
+  // Nothing new since the watermark: the next pass must not spend a call.
+  seen.user = undefined
+  await runtime.runPeriodicPass()
+  assert.equal(seen.user, undefined, 'a session with nothing new costs no model call')
+  t.after(() => rm(dir, { recursive: true, force: true }))
+})
+
+test('a periodic pass respects the peak window', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-periodic-peak-'))
+  const session = stubSession(process.cwd(), [{ seq: 1, role: 'user', text: 'We always ship with pnpm run ship.' }])
+  const reply = '{"memories":[{"scope":"project","title":"Deploy with pnpm run ship","body":"Ship it.","tags":[]}]}'
+  const runtime = new MemoriesRuntime(stubContext(fakeLlm(reply)), {
+    memoriesDir: dir,
+    autoExtract: true,
+    extractIntervalMinutes: 30,
+    peakHours: '* 00:00-24:00',
+    extractTimeoutMs: 5_000,
+  })
+  t.after(() => runtime.dispose())
+  runtime.scheduleExtraction(idleAgent(session))
+
+  await runtime.runPeriodicPass()
+  assert.equal(runtime.state.getSession('extract-session'), undefined, 'spending waits for off-peak')
+  t.after(() => rm(dir, { recursive: true, force: true }))
+})
+
+test('the periodic timer actually runs a pass', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-periodic-timer-'))
+  const session = stubSession(process.cwd(), [{ seq: 1, role: 'user', text: 'We always ship with pnpm run ship.' }])
+  const reply = '{"memories":[{"scope":"project","title":"Deploy with pnpm run ship","body":"Ship it.","tags":[]}]}'
+  // 0.02 minutes ≈ 1.2s: fractional intervals are kept, which is what makes this
+  // testable without waiting half an hour.
+  const runtime = new MemoriesRuntime(stubContext(fakeLlm(reply)), {
+    memoriesDir: dir,
+    autoExtract: true,
+    extractIntervalMinutes: 0.02,
+    extractTimeoutMs: 5_000,
+  })
+  t.after(() => runtime.dispose())
+  runtime.scheduleExtraction(idleAgent(session))
+  runtime.startPeriodicExtraction()
+
+  await new Promise((settle) => setTimeout(settle, 1_600))
+  assert.equal(runtime.state.getSession('extract-session')?.lastSeq, 1, 'the interval fired')
+  runtime.stopPeriodicExtraction()
+  t.after(() => rm(dir, { recursive: true, force: true }))
+})
+
+test('the exit flush still mines what arrived after a periodic pass', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-periodic-flush-'))
+  const session = stubSession(process.cwd(), [{ seq: 1, role: 'user', text: 'We always ship with pnpm run ship.' }])
+  const reply = '{"memories":[{"scope":"project","title":"Deploy with pnpm run ship","body":"Ship it.","tags":[]}]}'
+  const runtime = new MemoriesRuntime(stubContext(fakeLlm(reply)), {
+    memoriesDir: dir,
+    autoExtract: true,
+    minIdleHours: 6,
+    extractIntervalMinutes: 30,
+    extractTimeoutMs: 5_000,
+  })
+  t.after(() => runtime.dispose())
+  const agent = idleAgent(session)
+  runtime.scheduleExtraction(agent)
+
+  await runtime.runPeriodicPass()
+  assert.equal(runtime.state.getSession('extract-session')?.lastSeq, 1)
+  // The turn continues after the periodic pass, and then the process exits: the
+  // flush must look at the content, not at "have we mined this session already".
+  ;(session as unknown as { append: (event: { seq: number; role: 'user'; text: string }) => void })
+    .append({ seq: 2, role: 'user', text: 'Also run tsc before publishing.' })
+  assert.equal(await runtime.flushExit(5_000), 1, 'new material is not skipped by a per-process flag')
+  assert.equal(runtime.state.getSession('extract-session')?.lastSeq, 2)
   t.after(() => rm(dir, { recursive: true, force: true }))
 })

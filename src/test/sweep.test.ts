@@ -118,6 +118,6 @@ test('stats reports the recall and retention configuration', async (t) => {
   assert.match(text, /session mode: on/u)
   assert.match(text, /logging: info → /u, 'stats names the log level and file')
   assert.match(text, /sessions: 0 mined \/ 0 tracked/u)
-  assert.match(text, /auto-extract: on \(wait 6h idle/u, 'stats shows the effective wait, not the raw knobs')
+  assert.match(text, /auto-extract: on \(every 30m \+ 6h quiet to settle/u, 'stats shows both the periodic check and the settle wait')
   assert.match(text, /peak-hours: off/u, 'no peak rule is reported as off')
 })

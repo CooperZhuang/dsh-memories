@@ -28,16 +28,24 @@
 1. **显式写入（工具）** — 模型调用 `memory` 工具，每次写入都必须显式指定 `global` 或
    `project`。标题即身份：同一标题再写一次是**更新**而不是新增。可以顺带指明 `kind` 和
    `appliesTo`（什么时候该想起它）。
-2. **空闲抽取（阶段 1）** — 会话空闲 `autoExtractIdleMs`（默认 5 分钟）后，用一次辅助模型
-   调用把最近一段对话里**值得长期保留的事实**抽成记忆并写入。子代理会话、委派深度 > 0
-   的会话不参与。抽出来的内容先做**密钥擦除**（`sk-…`、`ghp_…`、AKIA…、JWT、私钥块、
-   `api_key=…`、`Bearer …` 等）再落盘。
+2. **抽取（阶段 1）** — 有两条触发路径，都用一次辅助模型调用把一段对话里**值得长期保留的事实**
+   抽成记忆并写入：
+   - **周期性检查**（`extractIntervalMinutes`，默认 30 分钟）：每隔这么久扫一遍所有打开的会话，
+     只要有新内容、且会话当时正好空闲，就抽**一段**（水位线决定从哪儿接着抽）。这样长时间连续
+     使用的会话会边用边被抽，而不是等到最后只抽一次尾巴。
+   - **settle 抽取**：会话空闲到 `max(autoExtractIdleMs, minIdleHours)` 后补一次。
+   子代理会话、委派深度 > 0 的会话不参与。抽出来的内容先做**密钥擦除**（`sk-…`、`ghp_…`、AKIA…、
+   JWT、私钥块、`api_key=…`、`Bearer …` 等）再落盘。
    同一次调用还会返回一段**本次会话的摘要**，写成 `memories/sessions/<session-id>.md`——这就是
    记忆的**证据**：记忆说“学到了什么”，这份笔记说“当时在干什么”，判断一条记忆还成不成立时可以
    回头看它（`memory` 工具的 `evidence` 动作）。
-   抽取需要进程还活着：它只在**长驻进程**（`dsh web` 这类）里按空闲时间触发；一次性运行
-   （`dsh --profile headless "..."`）通常在空闲计时器到点前就已退出，那一轮不会被抽取。
+   抽取需要进程还活着：它只在**长驻进程**（`dsh web` 这类）里触发；一次性运行
+   （`dsh --profile headless "..."`）通常在计时器到点前就已退出，那一轮不会被抽取。
    想立刻抽一次用 `/memories mine`。
+
+   > 为什么要有周期性检查：settle 抽取每次只读**最新一段**（`extractWindowMessages`），读完后水位线
+   > 推到最新，所以一段几百条消息的长会话里，早于那一段的内容**再也不会被抽取**。周期检查把长会话
+   > 切成若干段，每段都覆盖，这是它存在的唯一理由（没有新内容时不产生模型调用）。
    提供方因**限流或额度耗尽**拒绝时（`RATE_LIMIT` / `QUOTA`），一切后台 pass 会暂停
    `quotaCooldownMinutes`（默认 30 分钟，连续拒绝翻倍、封顶 `quotaCooldownMaxMinutes`），
    冷却期内不再发起任何后台调用；成功一次即解除。手动 `/memories mine` 也受同一闸门约束。
@@ -78,6 +86,11 @@
 才放行，那次触发必然被拒，之后再也不会有第二次——默认配置下阶段 1/2 等于从不执行。
 现在定时器直接等到两个闸门都满足的时刻。两个值都支持小数（`minIdleHours: 0.5` = 半小时）。
 `/memories mine` 与**进程退出兜底**不受空闲窗口限制：会话都要结束了，「它还在动」这个理由不再成立。
+
+**周期性抽取（`extractIntervalMinutes`，默认 30 分钟）** 是主路径：每隔这么久扫一遍所有打开的会话，
+只要有新内容且会话当时空闲，就抽一段（`runMaintenance` 会等一个自然的间隙，不会跟对话抢）。它
+**不看静默窗口**（否则长会话期间永远轮不到），但仍受错峰与额度闸门约束；会话没有新内容时**不产生
+任何模型调用**（只走一遍水位线判断）。`/memories stats` 的 `auto-extract` 行同时给出周期与 settle 等待。
 
 **错峰（`peakHours`）**：阶段 1 抽取与阶段 2 合并是全插件仅有的两处模型调用，也就是仅有的花钱处。
 `peakHours` 按**本地时间**列出「高价时段」，两个 pass 都会被推迟到窗口之外；留空则不限制。
@@ -159,11 +172,12 @@ memories:
 | `sweepIntervalHours` | `12` | 定期整理间隔（对所有已知工作区）；`0` 关闭，仍可手动 `/memories sweep` |
 | `autoExtract` | `true` | 是否启用空闲后台抽取 |
 | `autoExtractIdleMs` | `300000` | 空闲多久后开始抽取（最小 1000）；实际等待见 `minIdleHours` |
-| `extractWindowMessages` | `30` | 一次抽取最多看多少条对话消息 |
-| `extractMaxInputChars` | `24000` | 抽取输入的字符预算 |
+| `extractWindowMessages` | `60` | 一次抽取最多看多少条对话消息（按一个周期间隔的增量来定） |
+| `extractMaxInputChars` | `48000` | 抽取输入的字符预算 |
 | `extractMaxOutputTokens` | `2048` | 抽取调用的输出上限 |
 | `extractTimeoutMs` | `120000` | 抽取调用超时 |
 | `extractMaxMemories` | `5` | 一次抽取最多产出多少条记忆 |
+| `extractIntervalMinutes` | `30` | 周期性抽取间隔（分钟，可小数）：只要有新内容且会话当时空闲就抽一段；无新内容不花调用；受错峰与额度闸门约束；`0` 关闭 |
 | `minIdleHours` | `6` | 会话至少空闲这么久才可被抽取，支持小数（`0.5` = 半小时）；实际等待取它与 `autoExtractIdleMs` 的较大者 |
 | `peakHours` | 空 | 本地时间的错峰规则，后台抽取/合并会推迟到窗口外；留空不限制。DeepSeek 用 `"Mon-Fri 09:00-12:00, Mon-Fri 14:00-18:00"` |
 | `maxAgeDays` | `10` | 最后活动早于此天数的会话永不被抽取 |
@@ -448,15 +462,15 @@ dsh --profile web --patch ./fast.yml
 
 ## 已知取舍
 
-- 抽取是**事后**的，而且只在长驻进程里按空闲时间触发：会话要空闲到
-  `max(autoExtractIdleMs, minIdleHours)` 才会被抽取（配了 `peakHours` 时还要等出谷时）。
-  进程退出时还有一次
-  **兜底抽取**（不受空闲窗口限制、预算 8 秒，但同样遵守 `peakHours`），所以「聊完就关」通常也能被
-  抽到；真正确保抽到的
-  手段仍是 `/memories mine`（它不受任何时间限制）。
-- **避峰会让记忆晚一点落盘**，换来的是这些调用打对折。如果一次会话的尾巴正好赶上峰时结束前就被
-  挤出抽取窗口（`extractWindowMessages`，默认 30 条），那段内容可能轮不到——想立刻落盘就
-  `/memories mine`。
+- 抽取只在**长驻进程**里发生：周期检查每 `extractIntervalMinutes`（默认 30 分钟）扫一遍，
+  settle 抽取要等到 `max(autoExtractIdleMs, minIdleHours)`，配了 `peakHours` 时两者都要等出谷时。
+  进程退出时还有一次**兜底抽取**（不受空闲窗口限制、预算 8 秒，但同样遵守 `peakHours`），所以
+  「聊完就关」通常也能被抽到；真正确保抽到的手段仍是 `/memories mine`（不受任何时间限制）。
+- **一段比窗口更长的对话会丢头**：每段最多读 `extractWindowMessages` 条（默认 60）与
+  `extractMaxInputChars` 个字符（默认 48000），超出的部分水位线会直接跨过去。周期检查让这种情况
+  很难发生（30 分钟内一般凑不满 60 条用户/助手消息），但如果你在半小时里狂发消息，或把周期调得
+  很长，就会碰到——把这两个值一起调大即可。
+- **避峰会让记忆晚一点落盘**，换来的是这些调用打对折（`peakHours` 为空则不延迟）。
 - 检索是**词法匹配**（标题/正文/tag 加权 + 使用频次 + 新近度），不是向量检索。
 - 项目记忆按工作区根划分，**同一仓库的多个 clone 是两份独立记忆**（因为路径不同）。
 - 摘要有字节预算，记忆很多时只会列出最相关的一部分，其余靠 `memory_search` 取。
@@ -492,6 +506,7 @@ dsh --profile web --patch ./fast.yml
 | 日志落盘（本轮新增） | ✅ 真实 cordis 激活（真服务 + 真 exporter）：`logLevel: info` 下文件里写出了启动行、`archiving global/ancient, unused for 9750 days`、`archived 1 unused memories`，归档文件带 `archived:` 时间戳；`warn`/`debug` 不再被宿主阈值丢弃由 `src/test/log.test.ts` 的真实 Context 测试钉住 |
 | 抽取定时器 / 退出兜底 / 日志名过滤 / sessions 计数（缺陷修复） | ✅ 现场证据：真实库 `sessions_total=59` 而 `last_seq>0` **为 0**（阶段 1/2 从未执行），根因是 5 分钟定时器配 6 小时静默闸门且不重排；修复后定时器等到 `max(autoExtractIdleMs, minIdleHours)`、退出兜底与 `/memories mine` 绕过该闸门（均由新单测钉住）。真实 cordis 探针确认日志文件**只含本插件的行**（web-server / auto-thinking-effort 的噪音被排除）、stats 输出 `auto-extract: on (wait 6h idle …)` 与 `sessions: N mined / M tracked` |
 | 错峰调度 `peakHours`（本轮新增） | ✅ 单元测试覆盖星期几/跨午夜/非法条目/延迟计算与「自动 pass 让路、手动命令不让路」（19 项 schedule 测试）。价格口径来自官方 2026-09-10 起的峰谷规则（工作日 09:00-12:00 + 14:00-18:00 峰时，峰价 = 谷价 ×2，周末全谷时）。真机行为待下一轮复核 |
+| 周期性抽取 `extractIntervalMinutes`（本轮新增） | ✅ 单元测试覆盖：有新内容才抽、「无新内容不产生模型调用」、遵守峰时、定时器真的会按间隔跑、以及退出兜底在周期抽过之后仍会补抽新内容（+4 项）。现场依据：长会话只抽一次尾巴会把中间内容永久跳过（`collectWindow` 取尾部、水位线推到最新） |
 
 > 「多轮不重注入」这一条目前是**单元测试 + 单轮真机进程**两重证据：本轮想用浏览器复核时，web
 > profile 里另外几个插件把 GUI 挡住了（`dsh-message-edit` 缺 `@deepseek-ai/dsh-client-runtime/client`、

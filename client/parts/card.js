@@ -94,7 +94,7 @@ const FIELDS = [
   {
     field: 'extractWindowMessages', kind: 'number', min: 1, step: 1,
     label: { zh: '抽取窗口（条消息）', en: 'Extraction window (messages)' },
-    hint: { zh: '一次抽取最多读最近多少条对话消息。', en: 'How many recent conversation messages one extraction reads.' },
+    hint: { zh: '一次抽取最多读最近多少条对话消息。配合「周期性抽取间隔」使用：按一个间隔的增量来定，而不是按整段会话。', en: 'How many recent conversation messages one extraction reads. Size it for one periodic interval, not for a whole conversation.' },
   },
   {
     field: 'extractMaxInputChars', kind: 'number', min: 1, step: 1000,
@@ -115,6 +115,11 @@ const FIELDS = [
     field: 'extractMaxMemories', kind: 'number', min: 1, step: 1,
     label: { zh: '每次抽取条数上限', en: 'Memories per extraction' },
     hint: { zh: '一次抽取最多写入多少条记忆。', en: 'Maximum memories one extraction pass may store.' },
+  },
+  {
+    field: 'extractIntervalMinutes', kind: 'number', min: 0, step: 5,
+    label: { zh: '周期性抽取间隔（分钟）', en: 'Periodic extraction interval (minutes)' },
+    hint: { zh: '每隔这么久检查一次所有打开的会话，只要有新内容且会话当时空闲就抽一段——长会话因此不会因为「只在停止输入后抽一次」而丢掉中间的内容。没有新内容时不产生模型调用；仍受错峰时段与额度闸门限制。0 关闭周期检查。', en: 'How often to check every open session and mine a slice when there is new material and the session is momentarily idle — so a long working session does not lose its middle to a single end-of-session pass. A session with nothing new costs no model call; peak hours and the quota gate still apply. 0 disables the check.' },
   },
   {
     field: 'minIdleHours', kind: 'number', min: 0, step: 0.5,
