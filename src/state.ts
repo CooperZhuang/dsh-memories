@@ -135,6 +135,13 @@ export class StateStore {
       this.db.exec(`
         PRAGMA journal_mode = WAL;
         PRAGMA synchronous = NORMAL;
+        -- The default autocheckpoint is 1000 pages (4 MB at the default page
+        -- size), which for this store means the write-ahead log is allowed to
+        -- grow to thirty times the size of the database: measured on a real
+        -- store, 143 KB of tables beside a 4.12 MB WAL sitting exactly at the
+        -- threshold. Checkpointing every 64 pages keeps the WAL proportional to
+        -- what actually changed, and this database sees a few writes per pass.
+        PRAGMA wal_autocheckpoint = 64;
         CREATE TABLE IF NOT EXISTS sessions (
           id TEXT PRIMARY KEY,
           last_seq INTEGER NOT NULL DEFAULT 0,
@@ -210,6 +217,24 @@ export class StateStore {
   /** Whether SQLite is backing this store. */
   get durable(): boolean {
     return this.db !== undefined
+  }
+
+  /**
+   * The write-ahead-log checkpoint threshold in pages, as this connection sees it.
+   *
+   * Exposed because the value is per-connection and therefore invisible to any
+   * other handle: a fresh connection reports the compiled-in default and would
+   * happily "confirm" a policy this store does not use.
+   */
+  get walAutocheckpoint(): number {
+    const db = this.db
+    if (db === undefined) return 0
+    try {
+      const row = db.prepare('PRAGMA wal_autocheckpoint').get() as { wal_autocheckpoint?: number } | undefined
+      return Number(row?.wal_autocheckpoint ?? 0)
+    } catch {
+      return 0
+    }
   }
 
   /** Close the database handle; safe to call twice. */

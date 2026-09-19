@@ -3,8 +3,29 @@
  *
  * @module dsh-memories/workspace
  */
-import { dirname, resolve } from 'node:path'
+import { dirname, resolve, sep } from 'node:path'
 import { stat } from 'node:fs/promises'
+
+/**
+ * Whether one path is another, or lives underneath it.
+ *
+ * Case-insensitive on Windows, because two spellings of one directory are one
+ * directory there and the comparison decides whether a directory counts as the
+ * harness home.
+ *
+ * @param parent - the containing directory.
+ * @param path - the path to test.
+ * @returns true when `path` is `parent` or inside it.
+ */
+export function isWithin(parent: string, path: string): boolean {
+  const base = resolve(parent)
+  const target = resolve(path)
+  if (target === base) return true
+  const prefix = base.endsWith(sep) ? base : `${base}${sep}`
+  return process.platform === 'win32'
+    ? target.toLowerCase().startsWith(prefix.toLowerCase())
+    : target.startsWith(prefix)
+}
 
 /** Whether a filesystem error means "absent". */
 function isMissing(error: unknown): boolean {

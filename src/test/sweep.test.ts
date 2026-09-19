@@ -9,11 +9,13 @@
  * @module dsh-memories/test/sweep.test
  */
 import assert from 'node:assert/strict'
+import { existsSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { MemoriesRuntime } from '../index.js'
+import { projectSlug } from '../storage.js'
 import type { MemoriesConfig } from '../config.js'
 import type { Session } from '@deepseek-ai/dsh-session'
 
@@ -90,6 +92,25 @@ test('the sweep covers every workspace on disk, not only the active one', async 
   assert.deepEqual((await runtime.store.listArchived('project', root)).map((entry) => entry.id), ['stale-project-fact'])
 })
 
+test('the sweep removes project directories that hold nothing recoverable', async (t) => {
+  const { runtime, dir } = await fixture(t)
+  const archivedRoot = 'C:\\Code\\abandoned'
+  const emptyRoot = 'C:\\Code\\never-used'
+  // One workspace produced a memory that retention then archived; another left a
+  // slug behind without ever producing one. A real store had 12 of its 19 project
+  // directories like this, six of them without even a descriptor.
+  await runtime.store.upsert({ scope: 'project', title: 'Stale project fact', body: 'x', tags: [] }, archivedRoot, 'auto', NOW - 400 * DAY)
+  await runtime.store.writeProjectDescriptor(emptyRoot, NOW)
+  assert.equal((await runtime.store.listProjects()).length, 2)
+
+  await runtime.sweepNow(NOW)
+
+  assert.deepEqual(await runtime.store.listProjects(), [projectSlug(archivedRoot)], 'only the empty directory is gone')
+  assert.deepEqual((await runtime.store.listArchived('project', archivedRoot)).map((entry) => entry.id), ['stale-project-fact'],
+    'the archived workspace keeps its directory: an archive is restorable data')
+  assert.equal(existsSync(join(dir, 'projects', projectSlug(emptyRoot))), false)
+})
+
 test('retention is off when maxUnusedDays is 0', async (t) => {
   const { runtime } = await fixture(t, { maxUnusedDays: 0 })
   await runtime.store.upsert({ scope: 'global', title: 'Ancient fact', body: 'x', tags: [] }, undefined, 'auto', 1)
@@ -107,6 +128,38 @@ test('an archived memory can be listed and restored through the runtime', async 
   assert.match(await runtime.restore(session, 'ancient-fact'), /Restored ancient-fact into global/u)
   assert.equal((await runtime.store.list('global', undefined, { fresh: true })).length, 1)
   assert.match(await runtime.restore(session, 'ancient-fact'), /No archived memory/u)
+})
+
+test('the sweep and the background pass each report themselves in one line', async (t) => {
+  const lines: string[] = []
+  const capturing = {
+    get: () => undefined,
+    logger: {
+      info: (format: string, ...args: unknown[]) => lines.push(`${format} ${args.join(' ')}`),
+      warn: (format: string, ...args: unknown[]) => lines.push(`${format} ${args.join(' ')}`),
+      debug: (format: string, ...args: unknown[]) => lines.push(`${format} ${args.join(' ')}`),
+    },
+  } as never
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-report-'))
+  const runtime = new MemoriesRuntime(capturing, { memoriesDir: dir, autoExtract: true })
+  t.after(() => {
+    runtime.dispose()
+    return rm(dir, { recursive: true, force: true })
+  })
+
+  await runtime.sweepNow(NOW)
+  // The host formats `%d`/`%s` downstream, so the stub sees the template plus its
+  // arguments; what matters here is that the line exists at all.
+  const sweep = lines.find((line) => line.startsWith('dsh-memories: sweep:'))
+  assert.ok(sweep !== undefined, 'a sweep says what it did even when that is nothing')
+  assert.match(sweep, /archived %d memories across %d project scopes, pruned %d empty project/u)
+
+  lines.length = 0
+  // No tracked session: the pass has nothing to do, and the point is that the
+  // file still answers "did the extractor run, and why did it do nothing".
+  await runtime.runPeriodicPass()
+  assert.ok(lines.some((line) => line.startsWith('dsh-memories: extract pass:')),
+    'a pass with no work still leaves a line')
 })
 
 test('stats reports the recall and retention configuration', async (t) => {

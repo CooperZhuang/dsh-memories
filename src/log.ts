@@ -12,14 +12,23 @@
  * Two consequences shape this module:
  *
  * 1. A sink that wants warnings must declare its own threshold. {@link createLogExporter}
- *    sets `levels.default = 3`, which overrides the composition's default, and
- *    then filters by `logLevel` itself.
+ *    sets `levels.default = 3` and names this plugin's logger, which overrides
+ *    the composition's default for our lines.
  * 2. Nothing else in a stock profile reads the ring buffer, so "turn up the log
  *    level" alone changes nothing. The file sink is what makes the plugin's own
  *    decisions observable after the fact.
  *
+ * Because an exporter is process-wide, "only our lines" needs stating twice: the
+ * name raises our own threshold, and `levels.default = 0` lowers every other
+ * logger's to `error`. Without that second half the host's fallback (`logger.level
+ * ?? 1`) lets another plugin's `warn` into this file, which is how a plugin log
+ * ends up full of `web-server` ECONNRESET lines.
+ *
  * Every failure here is swallowed: a log that cannot be written must never fail
- * an extraction, a consolidation, or a turn.
+ * an extraction, a consolidation, or a turn. Swallowed is not the same as
+ * invisible — {@link createFileSink} reports each failed write through
+ * `onWriteError`, which is the only way a user can learn that the file they are
+ * reading has stopped being written.
  *
  * @module dsh-memories/log
  */
@@ -83,15 +92,21 @@ export interface LogSink {
  * alternative (a log library, or an unbounded file) is worse for a plugin that
  * writes at most a few lines per pass.
  *
+ * A write failure is reported through `onWriteError` rather than thrown: the log
+ * must never fail a pass, but the caller still has to be able to tell a user that
+ * the file stopped growing. The callback fires once per failure, not per retry.
+ *
  * @param path - absolute log path; an empty string disables the sink.
  * @param maxBytes - size at which the file is rotated.
+ * @param onWriteError - called with the reason a write failed.
  * @returns the sink, or `undefined` when the directory cannot be created.
  */
-export function createFileSink(path: string, maxBytes = LOG_MAX_BYTES): LogSink | undefined {
+export function createFileSink(path: string, maxBytes = LOG_MAX_BYTES, onWriteError?: (reason: string) => void): LogSink | undefined {
   if (path.trim().length === 0) return undefined
   try {
     mkdirSync(dirname(path), { recursive: true })
-  } catch {
+  } catch (error) {
+    onWriteError?.(describeError(error))
     return undefined
   }
   return {
@@ -103,11 +118,18 @@ export function createFileSink(path: string, maxBytes = LOG_MAX_BYTES): LogSink 
           renameSync(path, `${path}.1`)
         }
         appendFileSync(path, `${line}\n`, 'utf8')
-      } catch {
-        // A log that cannot be written is not worth failing a pass over.
+      } catch (error) {
+        // A log that cannot be written is not worth failing a pass over — but it
+        // is worth saying out loud, because the file is now silently stale.
+        onWriteError?.(describeError(error))
       }
     },
   }
+}
+
+/** One-line description of a caught value. */
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }
 
 /**
@@ -152,17 +174,21 @@ export function ownsMessage(message: Message, name = LOG_NAME): boolean {
 /**
  * Build the exporter that writes to a sink.
  *
- * `levels` is the whole reason this object exists: cordis filters each message
+ * `levels` is the whole reason this object exists. cordis filters each message
  * per exporter against `exporter.levels?.[name] ?? exporter.levels?.default ??
  * logger.level ?? 1`, and the composition's only default exporter declares no
  * levels, so the threshold falls back to `1` and every `warn` and `debug` line is
- * discarded before a sink sees it. Naming THIS logger in the map raises its
- * threshold without touching what the host does with anybody else's — an
- * exporter is process-wide, and a `default: 3` here would hand this plugin every
- * other plugin's debug traffic too.
+ * discarded before a sink sees it. The map therefore carries both directions:
  *
- * `export` still checks the name, because messages that pass the host's fallback
- * threshold (`error` and `info`) from other plugins do reach every exporter.
+ * - `[name]: 3` raises THIS logger's threshold, so the plugin's own `warn` and
+ *   `debug` reach the file.
+ * - `default: 0` lowers every OTHER logger's threshold to `error`, so a foreign
+ *   plugin's `warn` cannot land in this plugin's file. Without it the fallback
+ *   threshold of `1` lets `web-server` connection noise in — measured on a real
+ *   profile, not assumed.
+ *
+ * `export` still checks the name, because messages that pass the threshold arrive
+ * from every exporter and the file should be this plugin's record alone.
  *
  * The verbosity thunk returns a plain string because that is what the settings
  * schema declares; an unrecognized value normalizes to `info` here exactly as it
@@ -176,7 +202,7 @@ export function ownsMessage(message: Message, name = LOG_NAME): boolean {
 export function createLogExporter(sink: LogSink, level: () => string, name = LOG_NAME): Exporter {
   const exporter: Exporter = {
     colors: false,
-    levels: { [name]: 3 },
+    levels: { [name]: 3, default: 0 },
     export: (message: Message): void => {
       if (!ownsMessage(message, name)) return
       if (!allows(toLogLevel(level()), message.type)) return

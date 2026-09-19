@@ -12,7 +12,7 @@
 import assert from 'node:assert/strict'
 import { Context } from '@deepseek-ai/cordis'
 import type { Message } from '@deepseek-ai/cordis'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -72,7 +72,26 @@ test('the file sink appends, rotates one generation, and refuses an unusable pat
   // rather than handed a sink that throws on the first write.
   const blocker = join(dir, 'blocker')
   await writeFile(blocker, 'not a directory', 'utf8')
-  assert.equal(createFileSink(join(blocker, 'x.log')), undefined)
+  const failures: string[] = []
+  assert.equal(createFileSink(join(blocker, 'x.log'), undefined, (reason) => failures.push(reason)), undefined)
+  assert.equal(failures.length, 1, 'an unusable path is reported, not swallowed')
+})
+
+test('a write that fails after opening is reported, because the file is then stale', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-log-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  // The sink opens (the parent exists) but every append fails: the path is a
+  // directory. This is the case a user cannot see from the file itself — it
+  // simply stops growing, and nothing in it says why.
+  const asDirectory = join(dir, 'taken')
+  await mkdir(asDirectory, { recursive: true })
+  const failures: string[] = []
+  const sink = createFileSink(asDirectory, undefined, (reason) => failures.push(reason))
+  assert.ok(sink !== undefined, 'the parent exists, so the sink is created')
+  sink.write('one')
+  sink.write('two')
+  assert.equal(failures.length, 2, 'each failed write is reported once')
+  assert.ok(failures.every((reason) => reason.length > 0), 'with a reason a user can act on')
 })
 
 test('logPath keeps the log inside the harness home', () => {
@@ -90,11 +109,14 @@ test('a real cordis sink records warn and debug, which the host would otherwise 
   const exporter = createLogExporter(sink, () => level)
   // The declaration that makes the difference: without a threshold for this
   // logger the host falls back to 1 and everything below `info` is discarded
-  // before reaching us. Scoping it to the name is equally deliberate — an
-  // exporter is process-wide, and `default: 3` would hand this file every other
-  // plugin's debug traffic too.
+  // before reaching us.
   assert.equal(exporter.levels?.[LOG_NAME], 3)
-  assert.equal(exporter.levels?.default, undefined)
+  // And the other direction, which is what keeps this file OURS: an exporter is
+  // process-wide, so naming only our logger leaves every other logger on the
+  // host's fallback threshold — which is how `web-server` ECONNRESET warnings
+  // ended up in this file on a real profile. `default: 0` closes that door
+  // without touching what the host does with anyone else's messages.
+  assert.equal(exporter.levels?.default, 0, 'foreign loggers are held at error, not at the host fallback')
   ctx.logger.exporter(exporter)
 
   const log = new MemoryLog(pluginLogger(ctx.logger), () => true)
@@ -102,22 +124,28 @@ test('a real cordis sink records warn and debug, which the host would otherwise 
   log.info('stored %d memories', 2)
   log.decision('archived %s', 'ancient')
   log.debug('quiet detail')
-  // Somebody else's line must not land in this plugin's file.
+  // Somebody else's line must not land in this plugin's file — at ANY level.
+  // Our own `error` line is the interesting one: `default: 0` means a foreign
+  // logger is held to `error`, and the name check then drops even that, so the
+  // file is ours alone rather than "ours plus other plugins' failures".
   ctx.logger('web-server').warn('ECONNRESET from another plugin')
-  // A line of ours that went out through the service rather than the named
-  // logger carries the fiber's name, so the host applies its own fallback
-  // threshold to it — which delivers `info` but drops `warn`. The name check is
-  // why every call site uses the named logger; the prefix is only insurance for
-  // what the host did deliver.
-  ctx.logger.info('dsh-memories: service-level line %d', 3)
+  ctx.logger('web-server').error('another plugin failed')
+  // A line of ours that went out through the service instead of the named logger
+  // carries the fiber's name, so `default: 0` holds it at `error` as well. It is
+  // therefore only recorded at error — which is why every call site goes through
+  // `pluginLogger`'s named logger, and why the prefix check exists only to rescue
+  // what the host already delivered rather than to widen the threshold.
+  ctx.logger.info('dsh-memories: service-level info %d', 3)
+  ctx.logger.error('dsh-memories: service-level error %d', 4)
 
   const written = await readFile(path, 'utf8')
   assert.match(written, /\[warn\] .*careful 1/u, 'a warning must reach the file')
   assert.match(written, /\[info\] .*stored 2 memories/u)
   assert.match(written, /\[info\] .*archived ancient/u, 'tracing raises a decision to info')
   assert.match(written, /\[debug\] .*quiet detail/u)
-  assert.match(written, /service-level line 3/u, 'a prefixed line is ours even from the service')
+  assert.match(written, /service-level error 4/u, 'a prefixed line at error is ours even from the service')
   assert.doesNotMatch(written, /another plugin/u, 'only this plugin\'s lines belong in its file')
+  assert.doesNotMatch(written, /service-level info 3/u, 'the fallback entry does not admit foreign-level noise')
 
   // The verbosity is read per line, so a settings change applies immediately.
   level = 'error'

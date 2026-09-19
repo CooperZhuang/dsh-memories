@@ -31,6 +31,13 @@ test('the state store uses the built-in SQLite driver', async (t) => {
   assert.equal(store.degradedReason, undefined)
 })
 
+test('the write-ahead log checkpoints far more often than the 1000-page default', async (t) => {
+  const { store } = await tempStore(t)
+  // The default lets a 143 KB database sit beside a 4 MB WAL. This store is a
+  // few writes per pass, so it has no reason to carry a log that large.
+  assert.equal(store.walAutocheckpoint, 64)
+})
+
 test('watermarks survive a reopen', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-state-reopen-'))
   const first = new StateStore(statePath(dir))

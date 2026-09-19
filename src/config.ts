@@ -30,6 +30,20 @@ export const DEFAULT_MAX_SUMMARY_BYTES = 4096
 /** Default cap on entries listed in the injected summary per scope. */
 export const DEFAULT_MAX_SUMMARY_ENTRIES = 12
 
+/**
+ * Default number of those entries reserved for memories never listed before.
+ *
+ * Three, because the reservation is a queue that drains: once an entry has been
+ * listed it leaves the pool, and unused slots fall back to the ranking, so the
+ * steady-state cost is one slot per newly written memory. It only ever costs
+ * more than that while there is a backlog of never-listed memories — which is
+ * exactly when showing them matters. Measured on a real store, two slots pushed
+ * the correction of an already-listed memory to the *next* session and three
+ * showed both in the first one. `0` restores pure ranking, which on a saturated
+ * scope is a fixed point that never shows anything new.
+ */
+export const DEFAULT_SUMMARY_FRESH_SLOTS = 3
+
 /** Default cap on stored entries per scope before the oldest are evicted. */
 export const DEFAULT_MAX_ENTRIES_PER_SCOPE = 200
 
@@ -45,11 +59,43 @@ export const DEFAULT_DEDUPE_SIMILARITY = 0.7
 /** Default recall mode: how much of a conversation pays for cross-session memory. */
 export const DEFAULT_RECALL_MODE = 'on-demand'
 
-/** Default minimum search score a recall delta must reach before it is injected. */
-export const DEFAULT_RECALL_MIN_SCORE = 20
+/**
+ * Default minimum relevance a recall delta must reach.
+ *
+ * 20 was the old value and it silently disabled Chinese recall: a Chinese
+ * paraphrase that shares two bigrams with a title scores around 9-12, so nothing
+ * ever cleared it. The floor is now a strictness knob, and the PRECISION lives in
+ * `recallMinTerms` — the structural evidence gate, which a score threshold cannot
+ * replace. 9 is just above one shared bigram in a title (8) so that a single
+ * common word is never sufficient on its own.
+ */
+export const DEFAULT_RECALL_MIN_SCORE = 9
 
 /** Default cap on recall deltas injected into one conversation. */
-export const DEFAULT_RECALL_MAX_PER_CONVERSATION = 3
+export const DEFAULT_RECALL_MAX_PER_CONVERSATION = 4
+
+/**
+ * Default byte budget for one recall delta block.
+ *
+ * Sized for the several short entries a single turn can legitimately match, not
+ * for one: the frame and the preamble cost roughly 250 bytes, and a one-line
+ * entry costs about 90. At 800 a two-entry block would not fit, which is why
+ * this is not 400 as it was when a delta could only ever hold one memory.
+ */
+export const DEFAULT_RECALL_MAX_BYTES = 1_200
+
+/** Default minimum length of a user turn worth a recall decision. */
+export const DEFAULT_RECALL_MIN_QUERY_CHARS = 2
+
+/**
+ * Default number of distinct strong-field terms a recall needs.
+ *
+ * Two is what makes a paraphrased question reachable without letting a shared
+ * common word in: "这个插件的日志在哪里" shares 插件 and 日志 with a memory titled
+ * "插件日志的查看方式" (two terms, credited), while "该插件是否有日志" shares only
+ * 插件 with a title about plugin registration order (one term, not credited).
+ */
+export const DEFAULT_RECALL_MIN_TERMS = 2
 
 /**
  * Every valid recall mode.
@@ -150,12 +196,20 @@ export const MemoriesSettingsSchema = z.object({
   maxSummaryBytes: z.number().default(DEFAULT_MAX_SUMMARY_BYTES).description('Byte budget for the memory summary injected once per conversation. 0 disables injection and leaves only the memory tool.'),
   /** Max entries listed per scope in the injected summary. */
   maxSummaryEntries: z.number().default(DEFAULT_MAX_SUMMARY_ENTRIES).description('How many memories each scope lists in the injected summary.'),
+  /** How many of those entries are reserved for never-listed memories. */
+  summaryFreshSlots: z.number().default(DEFAULT_SUMMARY_FRESH_SLOTS).description('How many of each scope\'s summary entries are reserved for memories that have never been listed before, preferring ones written deliberately over extracted ones. 0 leaves selection to the ranking alone, which on a full scope never shows anything new.'),
   /** How the injected summary is refreshed as the conversation moves on. */
   recallMode: z.string().default(DEFAULT_RECALL_MODE).description('once injects the summary once per conversation; on-demand also injects a small delta when the current turn clearly matches a memory; off disables injection and leaves only the memory tool.'),
-  /** Minimum search score a recall delta must reach. */
-  recallMinScore: z.number().default(DEFAULT_RECALL_MIN_SCORE).description('Minimum search score a memory must reach before it is injected as a recall delta.'),
+  /** Minimum relevance a recall delta must reach. */
+  recallMinScore: z.number().default(DEFAULT_RECALL_MIN_SCORE).description('Minimum relevance a memory must reach before it is injected as a recall delta. A strictness knob, not the precision gate: recallMinTerms is what keeps generic overlap out. Raise it to demand a stronger lexical match.'),
   /** Cap on recall deltas injected into one conversation. */
-  recallMaxPerConversation: z.number().default(DEFAULT_RECALL_MAX_PER_CONVERSATION).description('Maximum recall deltas injected into one conversation. 0 disables them.'),
+  recallMaxPerConversation: z.number().default(DEFAULT_RECALL_MAX_PER_CONVERSATION).description('Maximum recall deltas injected into one conversation, counted per memory. 0 disables them.'),
+  /** Byte budget for one recall delta block. */
+  recallMaxBytes: z.number().default(DEFAULT_RECALL_MAX_BYTES).description('Byte budget for one on-demand recall block. 0 disables recall deltas.'),
+  /** Shortest user turn worth a recall decision. */
+  recallMinQueryChars: z.number().default(DEFAULT_RECALL_MIN_QUERY_CHARS).description('Shortest user turn, in characters, that may trigger a recall delta. Short acknowledgements are skipped instead of scanning the store.'),
+  /** Distinct strong-field terms a recall needs before it is credited. */
+  recallMinTerms: z.number().default(DEFAULT_RECALL_MIN_TERMS).description('Distinct query terms that must land in the title, keys, tags, or appliesTo before a memory may be recalled on demand. This is what keeps a Chinese turn from recalling every memory that shares a common word like 插件 or 日志. 1 makes the relevance floor the only gate, which is noticeably noisier for Chinese; 0 disables the check.'),
   /** Max stored entries per scope; the least-recently-updated are evicted. */
   maxEntriesPerScope: z.number().default(DEFAULT_MAX_ENTRIES_PER_SCOPE).description('Stored memories per scope; past this cap the least recently used are deleted.'),
   /** Days an unused memory survives before it is archived. `0` disables archival. */
@@ -223,9 +277,13 @@ export type MemoriesSettings = Schemastery.TypeT<typeof MemoriesSettingsSchema>
 export const MEMORIES_SETTINGS_DEFAULTS: MemoriesSettings = {
   maxSummaryBytes: DEFAULT_MAX_SUMMARY_BYTES,
   maxSummaryEntries: DEFAULT_MAX_SUMMARY_ENTRIES,
+  summaryFreshSlots: DEFAULT_SUMMARY_FRESH_SLOTS,
   recallMode: DEFAULT_RECALL_MODE,
   recallMinScore: DEFAULT_RECALL_MIN_SCORE,
   recallMaxPerConversation: DEFAULT_RECALL_MAX_PER_CONVERSATION,
+  recallMaxBytes: DEFAULT_RECALL_MAX_BYTES,
+  recallMinQueryChars: DEFAULT_RECALL_MIN_QUERY_CHARS,
+  recallMinTerms: DEFAULT_RECALL_MIN_TERMS,
   maxEntriesPerScope: DEFAULT_MAX_ENTRIES_PER_SCOPE,
   maxUnusedDays: DEFAULT_MAX_UNUSED_DAYS,
   dedupeSimilarity: DEFAULT_DEDUPE_SIMILARITY,
@@ -281,6 +339,7 @@ export interface MemoriesConfig {
   /** Legacy flat spellings, accepted so an existing row keeps working. */
   maxSummaryBytes?: number
   maxSummaryEntries?: number
+  summaryFreshSlots?: number
   maxEntriesPerScope?: number
   maxUnusedDays?: number
   dedupeSimilarity?: number
@@ -288,6 +347,9 @@ export interface MemoriesConfig {
   recallMode?: string
   recallMinScore?: number
   recallMaxPerConversation?: number
+  recallMaxBytes?: number
+  recallMinQueryChars?: number
+  recallMinTerms?: number
   autoExtract?: boolean
   autoExtractIdleMs?: number
   extractWindowMessages?: number
@@ -375,9 +437,13 @@ export function normalizeSettings(input: Partial<MemoriesSettings> | undefined):
   return {
     maxSummaryBytes: positive(value.maxSummaryBytes, DEFAULT_MAX_SUMMARY_BYTES, 0),
     maxSummaryEntries: positive(value.maxSummaryEntries, DEFAULT_MAX_SUMMARY_ENTRIES),
+    summaryFreshSlots: positive(value.summaryFreshSlots, DEFAULT_SUMMARY_FRESH_SLOTS, 0),
     recallMode: toRecallMode(value.recallMode),
     recallMinScore: positive(value.recallMinScore, DEFAULT_RECALL_MIN_SCORE, 0),
     recallMaxPerConversation: positive(value.recallMaxPerConversation, DEFAULT_RECALL_MAX_PER_CONVERSATION, 0),
+    recallMaxBytes: positive(value.recallMaxBytes, DEFAULT_RECALL_MAX_BYTES, 0),
+    recallMinQueryChars: positive(value.recallMinQueryChars, DEFAULT_RECALL_MIN_QUERY_CHARS, 0),
+    recallMinTerms: positive(value.recallMinTerms, DEFAULT_RECALL_MIN_TERMS, 0),
     maxEntriesPerScope: positive(value.maxEntriesPerScope, DEFAULT_MAX_ENTRIES_PER_SCOPE),
     maxUnusedDays: positive(value.maxUnusedDays, DEFAULT_MAX_UNUSED_DAYS, 0),
     dedupeSimilarity: clampUnit(value.dedupeSimilarity, DEFAULT_DEDUPE_SIMILARITY),

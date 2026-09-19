@@ -10,9 +10,9 @@ import { join } from 'node:path'
 import test from 'node:test'
 import { MemoryStore, formatEntry, parseEntry, projectSlug, slugify } from '../storage.js'
 import { browseMemories, scoreEntry, searchMemories } from '../search.js'
-import { rankForSummary, renderMemorySummary } from '../render.js'
+import { rankForSummary, renderMemorySummary, selectForSummary } from '../render.js'
 import { DEFAULT_MAX_SUMMARY_BYTES, consolidationRouteOf, normalizeSettings, resolveConfig } from '../config.js'
-import { findProjectRoot } from '../workspace.js'
+import { findProjectRoot, isWithin } from '../workspace.js'
 import type { MemoryEntry } from '../types.js'
 
 /** Create a temporary memories directory. */
@@ -375,6 +375,109 @@ test('summary ranks a frequently used entry above a stale one', () => {
   const stale = entry({ id: 'stale', scope: 'global', title: 'Stale', body: 'old', updatedAt: now - 86_400_000 * 400 })
   const used = entry({ id: 'used', scope: 'global', title: 'Used', body: 'hot', updatedAt: now - 86_400_000 * 400, uses: 6, lastUsedAt: now })
   assert.deepEqual(rankForSummary([stale, used], now).map((value) => value.id), ['used', 'stale'])
+})
+
+test('being listed in the summary does not renew an entry against a newer one', () => {
+  const now = 1_000_000_000_000
+  const DAY_MS = 86_400_000
+  // The incumbent was read twice and is being listed right now, but nobody has
+  // touched it in 200 days. Counting the listing as attention would pin its
+  // recency at "now" and keep it ahead of everything written afterwards.
+  const listed = entry({
+    id: 'listed', scope: 'global', title: 'Listed', body: 'long-standing',
+    updatedAt: now - 200 * DAY_MS, lastUsedAt: now - 200 * DAY_MS, lastSurfacedAt: now, uses: 2,
+  })
+  const fresh = entry({ id: 'fresh', scope: 'global', title: 'Fresh', body: 'written just now', updatedAt: now })
+  assert.deepEqual(rankForSummary([listed, fresh], now).map((value) => value.id), ['fresh', 'listed'])
+})
+
+test('a saturated scope still lists a never-surfaced entry that ranking would drop', () => {
+  const now = 1_000_000_000_000
+  const incumbents = Array.from({ length: 20 }, (_, index) => entry({
+    id: `old-${index}`, scope: 'global', title: `Old ${index}`, body: 'been here a while',
+    updatedAt: now - 86_400_000, lastUsedAt: now, lastSurfacedAt: now, uses: 6,
+  }))
+  const correction = entry({
+    id: 'correction', scope: 'global', title: 'The correction', body: 'this replaces one of them',
+    updatedAt: now, source: 'tool',
+  })
+  const entries = [...incumbents, correction]
+
+  const ranked = rankForSummary(entries, now)
+  assert.ok(!ranked.slice(0, 12).some((value) => value.id === 'correction'),
+    'the ranking alone keeps the correction out, which is the failure being fixed')
+  assert.ok(ranked.findIndex((value) => value.id === 'correction') >= 12, 'and it sits below the cut')
+
+  const selected = selectForSummary(entries, 12, { freshSlots: 2, now })
+  assert.equal(selected.length, 12)
+  assert.equal(selected[0]?.id, 'correction', 'a reserved entry comes first so byte pressure cannot drop it')
+  assert.ok(selected.some((value) => value.id === 'correction'), 'the reserved slot lets it in exactly once')
+
+  // Zero slots restores pure ranking, so the knob is what does the work.
+  assert.ok(!selectForSummary(entries, 12, { freshSlots: 0, now }).some((value) => value.id === 'correction'))
+})
+
+test('reserved slots prefer an explicit write and never take the whole list', () => {
+  const now = 1_000_000_000_000
+  const unseen = Array.from({ length: 15 }, (_, index) => entry({
+    id: `auto-${index}`, scope: 'global', title: `Extracted ${index}`, body: 'guessed',
+    updatedAt: now - index * 1_000, source: 'auto',
+  }))
+  const explicit = entry({
+    id: 'explicit', scope: 'global', title: 'A person said so', body: 'authoritative',
+    updatedAt: now - 86_400_000, source: 'user',
+  })
+  const incumbents = Array.from({ length: 20 }, (_, index) => entry({
+    id: `old-${index}`, scope: 'global', title: `Old ${index}`, body: 'been here a while',
+    updatedAt: now, lastUsedAt: now, lastSurfacedAt: now, uses: 6,
+  }))
+  const selected = selectForSummary([...incumbents, ...unseen, explicit], 12, { freshSlots: 2, now })
+  assert.equal(selected.length, 12)
+  assert.ok(selected.some((value) => value.id === 'explicit'), 'the explicit write wins the reservation')
+  assert.ok(selected.some((value) => value.id === 'auto-0'), 'the second slot goes to the newest extracted entry')
+  assert.ok(selected.filter((value) => value.uses === 0).length < 12, 'the reservation does not take the whole list')
+})
+
+test('every entry is listed when a scope fits, and nothing is listed at zero', () => {
+  const now = 1_000_000_000_000
+  const entries = [
+    entry({ id: 'a', scope: 'global', title: 'A', body: 'x', updatedAt: now }),
+    entry({ id: 'b', scope: 'global', title: 'B', body: 'y', updatedAt: now - 1 }),
+  ]
+  assert.deepEqual(selectForSummary(entries, 5, { freshSlots: 2, now }).map((value) => value.id), ['a', 'b'])
+  assert.deepEqual(selectForSummary(entries, 0, { freshSlots: 2, now }), [])
+})
+
+test('a summary note is carried inside the byte budget', () => {
+  const scopes = [{
+    label: 'global',
+    heading: 'Global memories',
+    total: 2,
+    entries: [
+      entry({ id: 'a', scope: 'global', title: 'A', body: 'x' }),
+      entry({ id: 'b', scope: 'global', title: 'B', body: 'y' }),
+    ],
+  }]
+  const note = 'Pending skill drafts (2): promote-me, discard-me — promote with /memories promote <name>.'
+  const text = renderMemorySummary(scopes, { maxBytes: 4_000, maxEntriesPerScope: 10, note })
+  assert.ok(text !== undefined)
+  assert.match(text, /Pending skill drafts \(2\)/u)
+  assert.ok(Buffer.byteLength(text, 'utf8') <= 4_000)
+  // Even a budget that suits only the frame keeps the note inside it.
+  const tight = renderMemorySummary(scopes, { maxBytes: 700, maxEntriesPerScope: 10, note })
+  assert.ok(tight !== undefined)
+  assert.ok(Buffer.byteLength(tight, 'utf8') <= 700)
+})
+
+test('isWithin treats a directory as inside itself and ignores case on Windows', () => {
+  const parent = process.platform === 'win32' ? 'C:\\Code\\Alpha' : '/code/alpha'
+  const child = join(parent, 'sub', 'deep')
+  assert.equal(isWithin(parent, parent), true)
+  assert.equal(isWithin(parent, child), true)
+  assert.equal(isWithin(child, parent), false)
+  const sibling = process.platform === 'win32' ? 'C:\\Code\\Alphabet' : '/code/alphabet'
+  assert.equal(isWithin(parent, sibling), false, 'a shared prefix is not containment')
+  if (process.platform === 'win32') assert.equal(isWithin(parent, 'c:\\code\\alpha\\sub'), true)
 })
 
 test('summary renders both scopes and stays inside its byte budget', () => {

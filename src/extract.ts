@@ -181,13 +181,19 @@ function resolveRoute(
  * Parse the model's JSON reply into the session summary and its drafts,
  * tolerating a code fence.
  *
+ * Every usable draft in the reply is validated even once the cap is reached, so
+ * the caller can report how many were dropped. A pass that always lands exactly
+ * on the cap looks identical to a pass that found exactly that many facts, and
+ * the difference is the only signal that `extractMaxMemories` is the knob
+ * limiting what the plugin remembers.
+ *
  * @param text - the model's reply.
  * @param maxMemories - how many drafts to keep.
  * @param sessionId - session the drafts came from, recorded as provenance.
- * @returns the drafts plus the evidence summary (empty when the reply had none).
+ * @returns the drafts, the evidence summary, and how many were over the cap.
  */
-export function parseExtraction(text: string, maxMemories: number, sessionId: string): { drafts: MemoryDraft[]; summary: string } {
-  const result = { drafts: [] as MemoryDraft[], summary: '' }
+export function parseExtraction(text: string, maxMemories: number, sessionId: string): { drafts: MemoryDraft[]; summary: string; dropped: number } {
+  const result = { drafts: [] as MemoryDraft[], summary: '', dropped: 0 }
   const trimmed = text.trim().replace(/^```(?:json)?\s*/iu, '').replace(/```$/u, '').trim()
   const start = trimmed.indexOf('{')
   const end = trimmed.lastIndexOf('}')
@@ -205,8 +211,8 @@ export function parseExtraction(text: string, maxMemories: number, sessionId: st
   }
   const raw = envelope.memories
   if (!Array.isArray(raw)) return result
+  const usable: MemoryDraft[] = []
   for (const item of raw) {
-    if (result.drafts.length >= maxMemories) break
     if (typeof item !== 'object' || item === null) continue
     const record = item as Record<string, unknown>
     const scope = record['scope']
@@ -225,7 +231,7 @@ export function parseExtraction(text: string, maxMemories: number, sessionId: st
     const appliesTo = typeof record['appliesTo'] === 'string'
       ? redactSecrets(record['appliesTo'].replace(/\s+/gu, ' ').trim()).slice(0, 160)
       : ''
-    result.drafts.push({
+    usable.push({
       scope: scope as MemoryScope,
       kind: toMemoryKind(record['kind']),
       title: cleanTitle,
@@ -236,6 +242,8 @@ export function parseExtraction(text: string, maxMemories: number, sessionId: st
       sourceSession: sessionId,
     })
   }
+  result.drafts = usable.slice(0, Math.max(0, maxMemories))
+  result.dropped = usable.length - result.drafts.length
   return result
 }
 
@@ -267,6 +275,8 @@ export type ExtractionOutcome =
     readonly drafts: readonly MemoryDraft[]
     /** What the session was about, stored as the evidence behind the drafts. */
     readonly summary: string
+    /** Usable drafts the reply offered beyond `maxMemories`, reported to the caller. */
+    readonly dropped: number
     readonly route: { provider: string; model: string }
   }
   | { readonly kind: 'none'; readonly reason: 'empty-window' | 'no-route' | 'empty-reply' }
@@ -317,5 +327,5 @@ export async function runExtraction(llm: LlmRuntime, request: ExtractionRequest)
     .join('\n')
   const parsed = parseExtraction(text, request.maxMemories, request.session.id)
   if (parsed.drafts.length === 0) return { kind: 'none', reason: 'empty-reply' }
-  return { kind: 'memories', drafts: parsed.drafts, summary: parsed.summary, route }
+  return { kind: 'memories', drafts: parsed.drafts, summary: parsed.summary, dropped: parsed.dropped, route }
 }

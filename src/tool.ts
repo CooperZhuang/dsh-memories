@@ -158,13 +158,20 @@ export function registerMemoryTool(ctx: Context, runtime: MemoriesRuntime): () =
             ...args.keys === undefined ? {} : { keys: args.keys },
             ...args.appliesTo === undefined ? {} : { appliesTo: args.appliesTo },
           }, 'tool')
-          const hint = args.scope === 'project'
+          // The runtime may have stored a project draft globally: a session with
+          // no workspace of its own has no project scope, and reporting the scope
+          // the caller asked for would describe a memory that does not exist.
+          const scope = result.entry.scope
+          const moved = scope === args.scope
+            ? ''
+            : ` This session has no workspace of its own, so it was stored as ${scope}.`
+          const hint = scope === 'project'
             ? ' If this fact also applies to unrelated projects, write a global copy of it too.'
             : ''
           return {
             ok: true,
             action: args.action,
-            message: `${result.action === 'created' ? 'Remembered' : 'Updated'} ${args.scope} memory "${result.entry.title}" (id=${result.entry.id}).${hint}`,
+            message: `${result.action === 'created' ? 'Remembered' : 'Updated'} ${scope} memory "${result.entry.title}" (id=${result.entry.id}).${hint}${moved}`,
             results: [toResult(result.entry)],
           }
         }

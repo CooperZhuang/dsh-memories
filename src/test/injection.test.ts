@@ -24,7 +24,7 @@ const stubContext = {
 } as never
 
 /** A session stand-in: header, id, header fold, and a controllable history. */
-function stubSession(cwd: string, history: readonly unknown[] = []): Session {
+function stubSession(cwd: string | undefined, history: readonly unknown[] = []): Session {
   let seq = 1
   return {
     id: 'test-session',
@@ -146,4 +146,63 @@ test('the injected summary never exceeds its configured byte budget', async (t) 
   assert.ok(summary !== undefined)
   assert.ok(Buffer.byteLength(summary, 'utf8') <= 700)
   t.after(() => rm(dir, { recursive: true, force: true }))
+})
+
+test('the harness home is not a workspace, so its sessions have no project scope', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'dsh-memories-home-'))
+  const dir = join(home, 'memories')
+  const runtime = new MemoriesRuntime(stubContext, { dshHome: home, memoriesDir: dir, autoExtract: false })
+  t.after(() => runtime.dispose())
+  t.after(() => rm(home, { recursive: true, force: true }))
+
+  const agent = stubAgent(stubSession(home))
+  assert.equal(await runtime.projectRoot(agent.session), undefined, 'the harness home has no project scope')
+
+  // A project draft from such a session is stored globally rather than dropped:
+  // the extractor cannot know the session has no workspace.
+  const stored = await runtime.write(agent.session, { scope: 'project', title: 'Mixed fact', body: 'From a home-directory session.', tags: [] }, 'tool')
+  assert.equal(stored.entry.scope, 'global')
+  assert.deepEqual(await runtime.store.listProjects(), [], 'no project bucket is created for the harness home')
+
+  // A subdirectory of the harness home is still the harness home.
+  const nested = stubAgent(stubSession(join(home, 'logs')))
+  assert.equal(await runtime.projectRoot(nested.session), undefined)
+
+  // A real repository underneath another root keeps its own scope.
+  const workspace = await mkdtemp(join(tmpdir(), 'dsh-memories-ws-'))
+  const inside = stubAgent(stubSession(workspace))
+  assert.equal(await runtime.projectRoot(inside.session), workspace)
+  t.after(() => rm(workspace, { recursive: true, force: true }))
+})
+
+test('a session with no recorded cwd has no project scope either', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-nocwd-'))
+  const runtime = new MemoriesRuntime(stubContext, { memoriesDir: dir, autoExtract: false })
+  t.after(() => runtime.dispose())
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const session = stubSession(undefined)
+  assert.equal(await runtime.projectRoot(session), undefined, 'no cwd means no workspace, not "wherever the host runs"')
+  assert.match(await runtime.stats(session), /project:none: 0 memories/u)
+})
+
+test('a scope that has filled up still shows a memory written after it filled', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-saturated-'))
+  const runtime = new MemoriesRuntime(stubContext, { memoriesDir: dir, autoExtract: false })
+  t.after(() => runtime.dispose())
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const agent = stubAgent(stubSession(dir))
+  const now = Date.now()
+
+  // Twenty long-standing, well-read entries: each one outranks anything new.
+  for (let index = 0; index < 20; index += 1) {
+    const { entry } = await runtime.write(agent.session, { scope: 'global', title: `Old fact ${index}`, body: 'Been here for months.', tags: [] }, 'auto')
+    await runtime.store.writeCounters(entry, undefined, { uses: 6, lastUsedAt: now, surfacedAt: now })
+  }
+  // The correction arrives last, reads zero, and has never been listed.
+  await runtime.write(agent.session, { scope: 'global', title: 'The correction', body: 'This supersedes one of the old facts.', tags: [] }, 'tool')
+
+  const summary = await runtime.summary(agent.session)
+  assert.ok(summary !== undefined)
+  assert.match(summary, /The correction/u, 'the reserved slot is what makes a new memory visible')
+  assert.match(summary, /… 9 more not shown|… \d+ more not shown/u, 'the block still says how much it hides')
 })

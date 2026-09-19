@@ -218,9 +218,24 @@ export function normalizeKey(value: string): string {
   return value.trim().toLowerCase().replace(/[,\s]+/gu, ' ').trim().slice(0, 48)
 }
 
-/** Split text into a token set for similarity comparison. */
+/**
+ * Split text into a token set for similarity comparison.
+ *
+ * Single-character tokens are kept, deliberately. Dropping them is tempting —
+ * "a", "1", "9" all look like noise — but they are exactly what distinguishes
+ * two memories that share the rest of their wording, and this token set decides
+ * whether one of them gets deleted. With them gone, "Old fact 1" and "Old fact
+ * 2" both reduce to {old, fact} and are treated as one memory; measured on a
+ * real store, nine of twenty distinct numbered entries were destroyed that way,
+ * and the same shape covers "端口 3080" against "端口 8080". A missed merge costs
+ * one slot in the summary; a false merge costs the memory, because the loser is
+ * deleted rather than archived.
+ *
+ * @param value - raw text.
+ * @returns its lowercased tokens.
+ */
 function tokenSet(value: string): Set<string> {
-  return new Set(value.toLowerCase().split(/[^\p{L}\p{N}_]+/u).filter((token) => token.length > 1))
+  return new Set(value.toLowerCase().split(/[^\p{L}\p{N}_]+/u).filter((token) => token.length > 0))
 }
 
 /** Jaccard overlap of two token sets; `0` when either side is empty. */
@@ -253,6 +268,34 @@ function fingerprint(value: string): string {
   return value.toLowerCase().replace(/\s+/gu, ' ').trim()
 }
 
+/** A character that is part of a Latin or digit word, for phrase boundaries. */
+const WORD_CHAR = /[0-9a-z]/iu
+
+/**
+ * Whether one normalized field contains another as a whole phrase.
+ *
+ * A plain `includes` is wrong here, and expensively so: losers of this rule are
+ * DELETED, not archived. "Old fact 19" contains "Old fact 1", so a numbered
+ * family of memories collapses into whichever member is longest — measured on a
+ * real store, four distinct entries became two.
+ *
+ * CJK has no word boundaries, so a CJK neighbour does not block a match (記憶
+ * inside 記憶庫 is still the same phrase); a Latin or digit neighbour does.
+ *
+ * @param haystack - the normalized field, longer or shorter.
+ * @param needle - the normalized phrase to look for.
+ * @returns true when the phrase occurs with boundaries on both sides.
+ */
+function containsPhrase(haystack: string, needle: string): boolean {
+  if (needle.length === 0) return false
+  for (let at = haystack.indexOf(needle); at >= 0; at = haystack.indexOf(needle, at + 1)) {
+    const before = at === 0 ? undefined : haystack[at - 1]
+    const after = haystack[at + needle.length]
+    if ((before === undefined || !WORD_CHAR.test(before)) && (after === undefined || !WORD_CHAR.test(after))) return true
+  }
+  return false
+}
+
 /**
  * Collapse entries that say the same thing under different ids.
  *
@@ -260,9 +303,10 @@ function fingerprint(value: string): string {
  * the store would slowly fill with near-copies that all compete for the bounded
  * summary budget. Two entries collide only when BOTH their normalized title and
  * their normalized body match, or when one of them contains the other's title
- * and body — a deliberately narrow rule, because collapsing on the body alone
- * would merge genuinely distinct memories that share wording. The most recently
- * updated entry wins and the losers are deleted.
+ * and body as phrases — a deliberately narrow rule, because collapsing on the
+ * body alone would merge genuinely distinct memories that share wording, and a
+ * plain substring test would swallow "Old fact 1" into "Old fact 19". The most
+ * recently updated entry wins and the losers are deleted.
  *
  * @param entries - entries in one scope, newest first.
  * @param store - owning store, used to delete the losers.
@@ -287,8 +331,8 @@ async function dedupeEntries(
     const body = fingerprint(entry.body)
     const clash = winners.find((candidate) =>
       (candidate.title === title && candidate.body === body)
-      || (candidate.title.length > 0 && title.includes(candidate.title) && body.includes(candidate.body))
-      || (title.length > 0 && candidate.title.includes(title) && candidate.body.includes(body))
+      || (candidate.title.length > 0 && containsPhrase(title, candidate.title) && containsPhrase(body, candidate.body))
+      || (title.length > 0 && containsPhrase(candidate.title, title) && containsPhrase(candidate.body, body))
       || (similarity > 0 && isNearDuplicate(entry, candidate.entry, similarity)))
     if (clash === undefined) {
       winners.push({ title, body, entry })
@@ -494,6 +538,50 @@ export class MemoryStore {
   /** Drop the cached index of one scope. */
   invalidate(scope: MemoryScope, projectRoot: string | undefined): void {
     this.cache.delete(this.scopeDir(scope, projectRoot))
+  }
+
+  /**
+   * Delete project directories that hold nothing recoverable.
+   *
+   * A workspace that is renamed, moved, or simply never produces a memory leaves
+   * its slug behind: measured on a real store, 12 of 19 project directories were
+   * empty and 6 of those had no descriptor at all — one workspace even existed
+   * under two slugs, its memories split between them.
+   *
+   * The test is "no markdown anywhere under the directory", which covers entries,
+   * archives, and anything a future version files there. An archive alone is
+   * enough to keep the directory: that is the file a human would restore from.
+   * Recreating a slug is free, because it is derived from the workspace path, so
+   * deleting an empty one cannot lose anything that a later write would not
+   * recreate.
+   *
+   * @returns the slugs that were removed, for the caller to report.
+   */
+  async pruneEmptyProjects(): Promise<readonly string[]> {
+    const removed: string[] = []
+    for (const slug of await this.listProjects()) {
+      const dir = join(this.memoriesDir, 'projects', slug)
+      let files: string[]
+      try {
+        const dirents = await readdir(dir, { recursive: true, withFileTypes: true })
+        files = dirents.filter((dirent) => dirent.isFile()).map((dirent) => dirent.name)
+      } catch (error) {
+        if (isMissing(error)) continue
+        throw error
+      }
+      if (files.some((name) => name.endsWith('.md'))) continue
+      try {
+        await rm(dir, { recursive: true, force: true })
+      } catch {
+        // A directory another process is holding open is reported as kept, not as
+        // pruned: this count is the only thing a reader sees, and a sweep that
+        // claims work it did not do is worse than one that does nothing.
+        continue
+      }
+      this.cache.delete(dir)
+      removed.push(slug)
+    }
+    return removed
   }
 
   /**

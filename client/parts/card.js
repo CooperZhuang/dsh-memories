@@ -42,6 +42,11 @@ const FIELDS = [
     hint: { zh: '摘要里每个作用域列出多少条记忆。', en: 'How many memories each scope lists in the summary.' },
   },
   {
+    field: 'summaryFreshSlots', kind: 'number', min: 0, step: 1,
+    label: { zh: '新记忆保底条数', en: 'Fresh-memory slots' },
+    hint: { zh: '每个作用域预留几条给从未被注入过的记忆，且优先人手或模型显式写入的。作用域存满后纯按排序等于永远只展示同一批老记忆，新写的（包括用来纠正旧结论的那条）永远排不进来；设为 0 即恢复纯排序。', en: 'How many of each scope\'s entries are reserved for memories never listed before, preferring ones written deliberately over extracted ones. On a full scope pure ranking shows the same old set forever, so a correction never makes it in; 0 restores pure ranking.' },
+  },
+  {
     field: 'recallMode', kind: 'select',
     options: [
       { value: 'once', label: { zh: '仅一次', en: 'Once' } },
@@ -52,14 +57,29 @@ const FIELDS = [
     hint: { zh: 'once 只在会话开始时注入一次摘要；on-demand 额外在当前话题明显命中记忆时补一小块；off 完全关闭注入，只留记忆工具。', en: 'once injects the summary at the start of the conversation; on-demand also adds a small block when the current turn clearly matches a memory; off disables injection and leaves only the memory tool.' },
   },
   {
-    field: 'recallMinScore', kind: 'number', min: 0, step: 5,
+    field: 'recallMinScore', kind: 'number', min: 0, step: 1,
     label: { zh: '按需注入的相关度下限', en: 'Recall relevance floor' },
-    hint: { zh: '补注需要达到的相关度分数；标题、别名或标签命中即可达到。0 表示只要沾边就补。', en: 'Relevance a memory must reach to be injected on demand; a title, key, or tag hit clears it. 0 accepts any match.' },
+    hint: { zh: '补注需要达到的相关度分数，是一个"更严/更松"的旋钮。真正的精度由下面「补注所需命中词数」把关：中文提问共享两个词大约得 9–12 分，所以默认 9；只共用「日志」这类一个常见词大约 8 分，因此单靠相关度是拦不住的。', en: 'Relevance a memory must reach to be injected on demand. This is a strictness knob; precision comes from the strong-term requirement below. A Chinese paraphrase sharing two bigrams scores about 9-12, and one shared common word about 8, which is why the default sits at 9.' },
   },
   {
     field: 'recallMaxPerConversation', kind: 'number', min: 0, step: 1,
-    label: { zh: '每会话补注次数上限', en: 'Recall deltas per conversation' },
-    hint: { zh: '一个会话最多补注几次；0 关闭按需补注，只保留一次摘要。', en: 'Maximum on-demand blocks per conversation. 0 keeps only the once-per-conversation summary.' },
+    label: { zh: '每会话补注条数上限', en: 'Recalled memories per conversation' },
+    hint: { zh: '一个会话最多补注多少条记忆；0 关闭按需补注，只保留一次摘要。', en: 'Maximum memories injected on demand in one conversation. 0 keeps only the once-per-conversation summary.' },
+  },
+  {
+    field: 'recallMaxBytes', kind: 'number', min: 0, step: 100,
+    label: { zh: '补注字节上限', en: 'Recall block byte budget' },
+    hint: { zh: '单次按需补注块的字节上限，0 表示关闭按需补注。', en: 'Byte budget for one on-demand recall block. 0 disables recall deltas.' },
+  },
+  {
+    field: 'recallMinQueryChars', kind: 'number', min: 0, step: 1,
+    label: { zh: '触发补注的最短发问长度', en: 'Shortest turn worth recalling' },
+    hint: { zh: '用户消息短于该字符数时不判定补注（例如「好」「继续」），避免为无意义的回合扫描整个记忆库。', en: 'A user turn shorter than this is skipped instead of scanning the store, so bare acknowledgements cost nothing.' },
+  },
+  {
+    field: 'recallMinTerms', kind: 'number', min: 1, step: 1,
+    label: { zh: '补注所需命中词数', en: 'Strong terms required to recall' },
+    hint: { zh: '一条记忆要被按需补注，除了达到相关度下限，还必须在标题、别名、标签或「何时有用」里命中这么多个不同的提问词。中文提问尤其需要：只共用「插件」「日志」这类常见词不算证据，共享两个词才算。设为 1 就只按相关度打分判断（会明显更容易误补）。', en: 'Distinct query terms that must land in the title, keys, tags, or appliesTo before a memory may be recalled. This is what stops a Chinese turn from recalling everything that shares a common word; set it to 1 to gate on relevance alone.' },
   },
   {
     field: 'maxEntriesPerScope', kind: 'number', min: 1, step: 1,

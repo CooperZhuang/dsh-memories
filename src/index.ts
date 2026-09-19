@@ -32,11 +32,12 @@ import type { MemoriesConfig, MemoriesSettings, ResolvedConfig } from './config.
 import type { SettingsProvider } from '@deepseek-ai/dsh-settings'
 import { MemoryStore, slugify } from './storage.js'
 import { StateStore, importLegacyState, statePath } from './state.js'
-import { browseMemories, relevanceOf, scoreEntry, searchMemories } from './search.js'
-import type { ScopeEntries } from './search.js'
-import { MEMORY_OPEN, rankForSummary, renderEntry, renderHit, renderMemorySummary, renderRecall, renderScopeListing } from './render.js'
+import { browseMemories, explainEntry, searchMemories } from './search.js'
+import type { MatchEvidence, ScopeEntries } from './search.js'
+import { isSubstantiveTurn } from './query.js'
+import { MEMORY_OPEN, rankForSummary, renderEntry, renderHit, renderMemorySummary, renderRecall, renderScopeListing, selectForSummary } from './render.js'
 import type { SummaryScope } from './render.js'
-import { findProjectRoot } from './workspace.js'
+import { findProjectRoot, isWithin } from './workspace.js'
 import { planRetention, retentionKey } from './retention.js'
 import { MemoryLog, createFileSink, createLogExporter, pluginLogger } from './log.js'
 import { collectWindow, runExtraction } from './extract.js'
@@ -45,7 +46,7 @@ import { applyPlan, denyToolsFor, runConsolidation, selectForConsolidation } fro
 import { discardDraft, listDrafts, promote, writeDraft } from './skills.js'
 import type { ConsolidationTarget, SubagentSeam } from './consolidate.js'
 import { MEMORY_KINDS } from './types.js'
-import type { MemoryEntry, MemoryKind, MemoryScope, SessionMode } from './types.js'
+import type { MemoryDraft, MemoryEntry, MemoryKind, MemoryScope, SessionMode } from './types.js'
 import { registerMemoryTool } from './tool.js'
 import { REMOTE_CONTRIBUTION, REMOTE_SERVICE, createRemoteService } from './remote.js'
 import type { TypertRegistryLike } from './remote.js'
@@ -59,8 +60,27 @@ const EXIT_FLUSH_TIMEOUT_MS = 8_000
 /** State key holding the last periodic sweep, so it survives a restart. */
 const SWEEP_META_KEY = 'sweep-at'
 
-/** Hard byte budget for one on-demand recall block. */
-const RECALL_MAX_BYTES = 400
+/**
+ * How far above the recall floor a single shared run must score to be enough.
+ *
+ * A turn that is essentially one keyword ("端口 3080") shares one run and
+ * deserves its memory; a turn that merely brushes past a memory shares one run
+ * among many words and does not. The score is what separates them, so the
+ * requirement is a multiple of the caller's own floor rather than a second
+ * absolute number to keep in sync.
+ */
+const QUALIFIED_SCORE_FACTOR = 2
+
+/**
+ * Model-facing label of a session that has no workspace of its own.
+ *
+ * Sessions opened in the harness home itself (or with no recorded `cwd`) are not
+ * working in a project, and giving them one produced a scope that mixed
+ * unrelated repositories: measured on a real store, one such bucket held 14
+ * memories from five different projects and injected all of them into every
+ * session started there.
+ */
+const NO_PROJECT_LABEL = 'project:none'
 
 /**
  * Services this plugin requires at activation: the tool registry (for the
@@ -113,7 +133,7 @@ export class MemoriesRuntime {
   private readonly llm: LlmRuntime | undefined
   /** The subagent seam, read once; absent in a deployment without delegation. */
   private readonly subagents: SubagentSeam | undefined
-  private readonly rootCache = new WeakMap<Session, Promise<string>>()
+  private readonly rootCache = new WeakMap<Session, Promise<string | undefined>>()
   /** Sessions whose conversation already carries the memory block. */
   private readonly injected = new WeakSet<Session>()
   /** Recall deltas already injected into each conversation. */
@@ -127,7 +147,9 @@ export class MemoriesRuntime {
   private readonly log: MemoryLog
   /**
    * Why the configured log file is not being written, when it could not be
-   * opened. Set by the composition, surfaced by `/memories stats`.
+   * opened or a write failed. Set by the composition, surfaced by `/memories
+   * stats` — the only reachable diagnostic, since the broken channel cannot
+   * report itself.
    */
   logSinkError: string | undefined
 
@@ -159,19 +181,45 @@ export class MemoriesRuntime {
     this.state.close()
   }
 
-  /** Resolve (and cache) one session's workspace root. */
-  async projectRoot(session: Session): Promise<string> {
+  /**
+   * Resolve (and cache) one session's workspace root.
+   *
+   * `undefined` means the session has no project scope at all — see
+   * {@link NO_PROJECT_LABEL} — which is a different thing from "the lookup
+   * failed": every caller treats it as "this conversation has no workspace".
+   *
+   * @param session - session whose workspace to resolve.
+   * @returns the workspace root, or `undefined` when the session has none.
+   */
+  async projectRoot(session: Session): Promise<string | undefined> {
     const cached = this.rootCache.get(session)
-    if (cached !== undefined) return cached
-    const cwd = session.header.cwd ?? process.cwd()
-    const pending = findProjectRoot(cwd, this.deployment.projectRootMarkers)
+    if (cached !== undefined) return await cached
+    const pending = this.resolveProjectRoot(session)
     this.rootCache.set(session, pending)
-    return pending
+    return await pending
+  }
+
+  /** Decide one session's project scope; see {@link NO_PROJECT_LABEL}. */
+  private async resolveProjectRoot(session: Session): Promise<string | undefined> {
+    const cwd = session.header.cwd?.trim()
+    // A session with no recorded cwd is not a project: the host's own working
+    // directory is where the harness happens to run, not where the conversation
+    // works, and scoping to it merged unrelated repositories into one bucket.
+    if (cwd === undefined || cwd.length === 0) return undefined
+    const root = await findProjectRoot(cwd, this.deployment.projectRootMarkers)
+    // The harness home is not a project either. `findProjectRoot` falls back to
+    // the starting directory when it finds no marker, so a session started in
+    // `$DSH_HOME` would otherwise own a scope shared by everything worked on
+    // from there — measured: 14 memories from five unrelated projects.
+    return isWithin(this.deployment.dshHome, root) ? undefined : root
   }
 
   /** Load one scope's entries plus its model-facing labels. */
   async scopeState(scope: MemoryScope, session: Session): Promise<ScopeState> {
     const root = scope === 'project' ? await this.projectRoot(session) : undefined
+    if (scope === 'project' && root === undefined) {
+      return { scope, label: NO_PROJECT_LABEL, heading: 'Project memories (none)', entries: [] }
+    }
     const entries = await this.store.list(scope, root)
     const target = this.store.target(scope, root)
     return {
@@ -207,6 +255,7 @@ export class MemoriesRuntime {
   /** Read one entry by scope and id, recording the hit. */
   async read(session: Session, scope: MemoryScope, id: string, record = true): Promise<MemoryEntry | undefined> {
     const root = scope === 'project' ? await this.projectRoot(session) : undefined
+    if (scope === 'project' && root === undefined) return undefined
     const entry = await this.store.read(scope, root, id)
     if (entry === undefined || !record) return entry
     return this.touchEntry(entry, root)
@@ -228,22 +277,45 @@ export class MemoriesRuntime {
   async recordUsage(session: Session, entries: readonly MemoryEntry[]): Promise<void> {
     if (entries.length === 0) return
     const root = await this.projectRoot(session)
-    await Promise.all(entries.map((entry) => this.touchEntry(entry, entry.scope === 'project' ? root : undefined)))
+    // An entry can only be marked against a scope that exists right now, and a
+    // session without a workspace has no project scope to mark.
+    const markable = entries.filter((entry) => entry.scope === 'global' || root !== undefined)
+    await Promise.all(markable.map((entry) => this.touchEntry(entry, entry.scope === 'project' ? root : undefined)))
   }
 
-  /** Write one entry, choosing the scope. */
+  /**
+   * Store one draft, choosing the scope.
+   *
+   * The whole draft shape is accepted, not a reduced one: `kind`, `keys`, and
+   * `appliesTo` are what make a memory findable and what say when it matters, so
+   * a caller that has them must not have to drop them at this seam.
+   *
+   * A project draft from a session with no workspace is stored globally rather
+   * than refused: the extractor cannot know the session has none, and dropping
+   * the fact would lose it silently. The rewrite is logged, because the scope it
+   * lands in is what decides who sees it later.
+   */
   async write(
     session: Session,
-    draft: { scope: MemoryScope; title: string; body: string; tags: readonly string[] },
+    draft: MemoryDraft,
     source: MemoryEntry['source'],
   ) {
-    const root = draft.scope === 'project' ? await this.projectRoot(session) : undefined
-    return await this.store.upsert(draft, root, source)
+    return await this.persist(session, draft, source)
+  }
+
+  /** The one place a draft becomes an entry, so the scope rule has one home. */
+  private async persist(session: Session, draft: MemoryDraft, source: MemoryEntry['source']) {
+    if (draft.scope === 'global') return await this.store.upsert(draft, undefined, source)
+    const root = await this.projectRoot(session)
+    if (root !== undefined) return await this.store.upsert(draft, root, source)
+    this.log.decision('dsh-memories: session %s has no workspace, storing %s as global', session.id, draft.title)
+    return await this.store.upsert({ ...draft, scope: 'global' }, undefined, source)
   }
 
   /** Delete one entry. */
   async forget(session: Session, scope: MemoryScope, id: string): Promise<boolean> {
     const root = scope === 'project' ? await this.projectRoot(session) : undefined
+    if (scope === 'project' && root === undefined) return false
     return await this.store.remove(scope, root, id)
   }
 
@@ -265,6 +337,11 @@ export class MemoriesRuntime {
    * names are marked as surfaced, which is what keeps retention from archiving a
    * memory that works so well it never needs a search.
    *
+   * Which entries those are is decided by `selectForSummary`, not by the ranker
+   * alone: on a scope with more entries than slots the ranking is a fixed point,
+   * so pure ranking would list the same memories forever and never surface
+   * anything new — including an explicit correction of one of them.
+   *
    * @param session - session whose scopes to summarize.
    * @returns the framed block plus the entries it lists, or `undefined`.
    */
@@ -272,19 +349,45 @@ export class MemoriesRuntime {
     if (this.settings.maxSummaryBytes <= 0) return undefined
     if (this.settings.recallMode === 'off') return undefined
     const states = await this.allScopes(session)
-    const scopes: SummaryScope[] = states.map((state) => ({
+    const selected = states.map((state) => selectForSummary(state.entries, this.settings.maxSummaryEntries, {
+      freshSlots: this.settings.summaryFreshSlots,
+    }))
+    const scopes: SummaryScope[] = states.map((state, index) => ({
       label: state.label,
       heading: state.heading,
-      entries: state.entries,
+      entries: selected[index] ?? [],
+      // The full count, not the listed one, so the block still says how much it
+      // is not showing.
       total: state.entries.length,
     }))
+    const note = await this.draftNote()
     const text = renderMemorySummary(scopes, {
       maxBytes: this.settings.maxSummaryBytes,
       maxEntriesPerScope: this.settings.maxSummaryEntries,
+      ...note === undefined ? {} : { note },
     })
     if (text === undefined) return undefined
-    const surfaced = states.flatMap((state) => state.entries.slice(0, this.settings.maxSummaryEntries))
-    return { text, surfaced }
+    return { text, surfaced: selected.flat() }
+  }
+
+  /**
+   * The one line this plugin wants in the summary but cannot express as a memory.
+   *
+   * Staged skill drafts are the only state that needs a human: consolidation
+   * produces them, they are invisible to the model (the harness scans its own
+   * skill roots, not the memory store), and nothing else ever mentions them
+   * again. Measured on a real store: 13 drafts had accumulated over a week and
+   * none had ever been promoted, because the only notice was a line in one
+   * session's consolidation reply.
+   *
+   * @returns the note, or `undefined` when nothing is waiting.
+   */
+  private async draftNote(): Promise<string | undefined> {
+    const drafts = await listDrafts(this.store.memoriesDir).catch(() => [])
+    if (drafts.length === 0) return undefined
+    const names = drafts.slice(0, 3).map((draft) => draft.name).join(', ')
+    const more = drafts.length > 3 ? `, +${drafts.length - 3} more` : ''
+    return `Pending skill drafts (${drafts.length}): ${names}${more} — promote with /memories promote <name> or discard with /memories discard <name>.`
   }
 
   /**
@@ -301,9 +404,12 @@ export class MemoriesRuntime {
     if (entries.length === 0) return
     const seen = this.seenIds(session)
     const root = await this.projectRoot(session)
+    // A project entry cannot be marked in a scope that does not exist; the
+    // counter still moves, only the markdown mirror is skipped.
     await Promise.all(entries.map(async (entry) => {
       seen.add(entry.id)
       const at = this.state.bumpSurfaced(entry.scope, entry.id)
+      if (entry.scope === 'project' && root === undefined) return
       if (entry.lastSurfacedAt >= at - 3_600_000) return
       await this.store.writeCounters(entry, entry.scope === 'project' ? root : undefined, {
         uses: entry.uses,
@@ -408,42 +514,79 @@ export class MemoriesRuntime {
     // The budget is checked before the session switch because it lives in memory:
     // once the cap is reached, no step pays for a state-database read again.
     const used = this.recallCounts.get(session) ?? 0
-    if (used >= this.settings.recallMaxPerConversation) return undefined
+    const remaining = this.settings.recallMaxPerConversation - used
+    if (remaining <= 0) return undefined
     if (this.sessionOff(session)) return undefined
     const query = this.latestUserText(session)
-    if (query === undefined) return undefined
+    // A one-word acknowledgement has nothing a memory could be about; skipping it
+    // also avoids a full store scan on every "好" the user types.
+    if (query === undefined || !isSubstantiveTurn(query)) return undefined
     const seen = this.seenIds(session)
     const states = await this.allScopes(session)
-    let best: { entry: MemoryEntry; score: number; relevance: number } | undefined
-    let near: { id: string; relevance: number } | undefined
+    const eligible: { entry: MemoryEntry; relevance: number; score: number; best: string; evidence: MatchEvidence }[] = []
+    let near: { id: string; relevance: number; terms: number } | undefined
     for (const state of states) {
       for (const entry of state.entries) {
         if (seen.has(entry.id)) continue
-        const score = scoreEntry(entry, query)
-        const relevance = relevanceOf(entry, query)
-        // The gate is a RELEVANCE floor, not the decayed score: a title, key, or
-        // tag hit. Recency then decides which eligible memory wins, so an old
-        // but exact memory is still reachable in conversation.
-        if (relevance < this.settings.recallMinScore) {
+        const why = explainEntry(entry, query)
+        // Two gates, and they answer different questions.
+        //
+        // The FLOOR is the caller's knob: the relevance a memory has to reach at
+        // all.
+        //
+        // CREDIT is the structural gate, and a score threshold cannot replace it
+        // for Chinese. Measured on a real 54-memory store, "该插件是否有日志"
+        // shares the isolated bigram 插件 with a memory about an unrelated
+        // cost-meter bug and scores 12 — above any floor low enough to admit a
+        // paraphrase. Credit therefore asks for substantive terms: a Latin word of
+        // three characters or more, or a CJK pair inside a shared run of three or
+        // more, which is the only Chinese term a merely common pair cannot fake.
+        // A whole-query hit stands alone, one such term is enough when the score is
+        // decisive (a one-keyword turn like "端口 3080"), and otherwise two are
+        // required.
+        const distinctive = why.relevance >= this.settings.recallMinScore * QUALIFIED_SCORE_FACTOR
+        const credited = why.evidence.phrase
+          || why.evidence.strongTerms >= this.settings.recallMinTerms
+          || (why.evidence.strongTerms >= 1 && distinctive)
+        if (why.relevance < this.settings.recallMinScore || !credited) {
           // Remember the closest miss, so "why was nothing recalled?" has an
           // answer in the log instead of being a silence.
-          if (relevance > 0 && (near === undefined || relevance > near.relevance)) near = { id: entry.id, relevance }
+          if (why.relevance > 0 && (near === undefined || why.relevance > near.relevance)) {
+            near = { id: entry.id, relevance: why.relevance, terms: why.evidence.strongTerms }
+          }
           continue
         }
-        if (best === undefined || score > best.score) best = { entry, score, relevance }
+        eligible.push({ entry, ...why })
       }
     }
-    if (best === undefined) {
-      this.log.decision('dsh-memories: session %s recalled nothing (closest: %s at relevance %.1f, gate %.0f)',
-        session.id, near?.id ?? 'none', near?.relevance ?? 0, this.settings.recallMinScore)
+    if (eligible.length === 0) {
+      this.log.decision('dsh-memories: session %s recalled nothing (closest: %s at relevance %.1f with %d strong terms; needs relevance ≥%.0f and either %d strong terms, one substantive term above %.0f, or an exact phrase)',
+        session.id, near?.id ?? 'none', near?.relevance ?? 0, near?.terms ?? 0,
+        this.settings.recallMinScore, this.settings.recallMinTerms,
+        this.settings.recallMinScore * QUALIFIED_SCORE_FACTOR)
       return undefined
     }
-    const text = renderRecall([best.entry], RECALL_MAX_BYTES)
+    // Ranked by the decayed score, so recency and the entry's own track record
+    // break ties between equally relevant memories.
+    eligible.sort((left, right) => right.score - left.score
+      || right.entry.updatedAt - left.entry.updatedAt
+      || left.entry.title.localeCompare(right.entry.title))
+    const picked: { entry: MemoryEntry; relevance: number; score: number; best: string; evidence: MatchEvidence }[] = []
+    for (const candidate of eligible) {
+      if (picked.length >= remaining) break
+      // `renderRecall` is the budget's authority: if one more entry would not fit,
+      // it returns `undefined` and the block keeps the entries already chosen.
+      if (renderRecall([...picked, candidate].map((item) => item.entry), this.settings.recallMaxBytes) === undefined) break
+      picked.push(candidate)
+    }
+    if (picked.length === 0) return undefined
+    const text = renderRecall(picked.map((item) => item.entry), this.settings.recallMaxBytes)
     if (text === undefined) return undefined
-    this.log.decision('dsh-memories: session %s recalled %s (relevance %.1f, score %.1f)',
-      session.id, best.entry.id, best.relevance, best.score)
-    this.recallCounts.set(session, used + 1)
-    await this.markSurfaced(session, [best.entry])
+    this.log.decision('dsh-memories: session %s recalled %s (relevance %.1f, score %.1f, via %j)',
+      session.id, picked.map((item) => item.entry.id).join(', '),
+      picked[0]!.relevance, picked[0]!.score, (picked[0]!.best ?? '').slice(0, 80))
+    this.recallCounts.set(session, used + picked.length)
+    await this.markSurfaced(session, picked.map((item) => item.entry))
     return createUserMessage({
       content: [{ type: 'text', text }],
       // The same form as the summary block; `carriesRecall` tells them apart by
@@ -475,6 +618,7 @@ export class MemoriesRuntime {
           .map((block) => block.text ?? '')
           .join('\n')
           .trim()
+        if (text.length < this.settings.recallMinQueryChars) return undefined
         if (text.length > 0) return text.slice(0, 2_000)
       }
     } catch {
@@ -683,11 +827,21 @@ export class MemoriesRuntime {
    * racing the conversation.
    *
    * A session with nothing new costs no model call.
+   *
+   * The pass reports itself in one line. Without it the log could only be read
+   * for what happened, never for why nothing did: every gate that skips work
+   * (quota pause, no new material, an ineligible or already-running session)
+   * left no trace at the level the file is configured for, and "is the
+   * background extractor alive at all?" had no answer.
    */
   async runPeriodicPass(): Promise<void> {
     if (!this.settings.autoExtract) return
     if (!(this.settings.extractIntervalMinutes > 0)) return
-    if (this.backgroundPaused()) return
+    if (this.backgroundPaused()) {
+      this.log.decision('dsh-memories: periodic extraction skipped, background passes are %s', this.backgroundLine())
+      return
+    }
+    const counts = { tracked: 0, mined: 0, stored: 0, idle: 0, skipped: 0, failed: 0 }
     for (const reference of [...this.tracked]) {
       if (this.lifecycle.signal.aborted) return
       const agent = reference.deref()
@@ -695,17 +849,49 @@ export class MemoriesRuntime {
         this.tracked.delete(reference)
         continue
       }
+      counts.tracked += 1
       const session = agent.session
-      if (!this.eligible(session)) continue
-      if (this.extracting.has(session.id)) continue
-      if (this.hasNothingNew(session)) continue
+      if (!this.eligible(session)) {
+        counts.skipped += 1
+        continue
+      }
+      if (this.extracting.has(session.id)) {
+        counts.skipped += 1
+        continue
+      }
+      if (this.hasNothingNew(session)) {
+        counts.idle += 1
+        continue
+      }
       try {
-        await this.afterPass(agent, await this.mine(agent, { ignoreIdleWindow: true }))
+        const stored = await this.mine(agent, { ignoreIdleWindow: true })
+        // A pass that ran but stored nothing was deferred, not mined: the reason
+        // is in its own decision line, and only a real pass counts here.
+        if (stored > 0) {
+          counts.mined += 1
+          counts.stored += stored
+        } else {
+          counts.skipped += 1
+        }
+        await this.afterPass(agent, stored)
       } catch (error) {
+        counts.failed += 1
         this.log.warn('dsh-memories: periodic extraction failed for session %s: %o', session.id, error)
       }
     }
+    this.reportPass(counts)
     await this.sweepIfDue()
+  }
+
+  /**
+   * Record one periodic pass: at info when it changed something or failed, and at
+   * decision level when there was simply nothing to do (which is most ticks).
+   */
+  private reportPass(counts: { tracked: number; mined: number; stored: number; idle: number; skipped: number; failed: number }): void {
+    const line = 'dsh-memories: extract pass: %d tracked, %d mined (%d stored), %d nothing new, %d skipped, %d failed'
+    const args = [counts.tracked, counts.mined, counts.stored, counts.idle, counts.skipped, counts.failed] as const
+    if (counts.mined > 0 || counts.failed > 0) this.log.info(line, ...args)
+    else this.log.decision(line, ...args)
   }
 
   /**
@@ -929,7 +1115,7 @@ export class MemoriesRuntime {
       const window = collectWindow(session, afterSeq, this.settings.extractWindowMessages, this.settings.extractMaxInputChars)
       if (window.lastSeq === undefined || window.text.trim().length === 0) return 0
       const root = await this.projectRoot(session)
-      const projectLabel = this.store.target('project', root).label
+      const projectLabel = root === undefined ? NO_PROJECT_LABEL : this.store.target('project', root).label
       // A settle-window pass deliberately does NOT inherit the plugin lifecycle
       // signal: the plugin is disposed as the process shuts down, and tying the
       // pass to that signal would abort exactly the pass a one-shot run needs.
@@ -961,7 +1147,7 @@ export class MemoriesRuntime {
       } else {
         const stored: string[] = []
         for (const draft of outcome.drafts) {
-          const result = await this.store.upsert(draft, draft.scope === 'project' ? root : undefined, 'auto')
+          const result = await this.persist(session, draft, 'auto')
           stored.push(result.entry.id)
         }
         // The evidence note is part of the result, not a nice-to-have: without it
@@ -976,11 +1162,19 @@ export class MemoriesRuntime {
           this.log.warn('dsh-memories: could not write the evidence note for session %s: %o', key, error)
         })
         this.log.info('dsh-memories: stored %d memories from session %s (%s)', outcome.drafts.length, key, stored.join(', '))
+        // A pass that always lands on the cap is a pass whose ceiling is the
+        // binding constraint. Saying so is the only way anybody can tell that
+        // `extractMaxMemories` is the knob to raise — measured on a real store,
+        // 50 of 54 passes stopped exactly there and nothing ever said so.
+        if (outcome.dropped > 0) {
+          this.log.info('dsh-memories: the extractor offered %d more than the cap of %d, so they were dropped (raise extractMaxMemories to keep them)',
+            outcome.dropped, this.settings.extractMaxMemories)
+        }
       }
       this.state.putSession(key, {
         lastSeq: window.lastSeq,
         at: Date.now(),
-        root,
+        ...root === undefined ? {} : { root },
         activityAt: Date.now(),
         ...outcome.kind === 'memories' ? { contributed: true } : {},
       })
@@ -1055,7 +1249,10 @@ export class MemoriesRuntime {
     const root = job.root ?? sessionRoot
     try {
       const global = await this.store.list('global', undefined, { fresh: true })
-      const project = await this.store.list('project', root, { fresh: true })
+      // A job recorded against a workspace can outlive the session that queued
+      // it, and a session may have no workspace at all; either way there is
+      // simply no project scope to merge into.
+      const project = root === undefined ? [] : await this.store.list('project', root, { fresh: true })
       const reviewed = new Map(this.state.retentionRows().map((row) => [`${row.scope}\u0000${row.id}`, row.consolidatedAt]))
       const entries = selectForConsolidation([...global, ...project], reviewed, this.settings.consolidateMaxEntries)
       const unreviewed = entries.filter((entry) => (reviewed.get(retentionKey(entry.scope, entry.id)) ?? 0) === 0).length
@@ -1069,7 +1266,7 @@ export class MemoriesRuntime {
         parent,
         ...consolidationRouteOf(this.settings),
         entries,
-        projectLabel: this.store.target('project', root).label,
+        projectLabel: root === undefined ? NO_PROJECT_LABEL : this.store.target('project', root).label,
         maxUpserts: this.settings.consolidateMaxEntries,
         // Only names the registry actually has: `tools.restrict()` rejects an
         // unknown name, and this deny list is cross-platform.
@@ -1165,12 +1362,29 @@ export class MemoriesRuntime {
   async sweepNow(now = Date.now()): Promise<number> {
     this.state.putMeta(SWEEP_META_KEY, String(now))
     let archived = await this.retain('global', undefined, now)
+    let scopes = 0
     for (const slug of await this.store.listProjects()) {
       const descriptor = await this.store.readProjectDescriptor(slug)
       if (descriptor === undefined) continue
+      // A scope rooted in the harness home is one this plugin no longer creates
+      // (see `resolveProjectRoot`); it is kept until retention empties it, and
+      // saying so here is the only way a reader learns where those memories went.
+      if (isWithin(this.deployment.dshHome, descriptor.root)) {
+        this.log.decision('dsh-memories: project scope %s is inside the harness home; it is no longer injected and its entries will age out', slug)
+        continue
+      }
+      scopes += 1
       archived += await this.retain('project', descriptor.root, now)
     }
-    if (archived > 0) this.log.info('dsh-memories: archived %d unused memories', archived)
+    const removed = await this.store.pruneEmptyProjects().catch(() => [])
+    for (const slug of removed) {
+      this.log.decision('dsh-memories: removed empty project directory %s', slug)
+    }
+    // One line per sweep, always: it is the only evidence that retention runs at
+    // all, and a sweep that never archives anything is exactly what somebody
+    // wondering "why is my store still this big" needs to see.
+    this.log.info('dsh-memories: sweep: archived %d memories across %d project scopes, pruned %d empty project director%s',
+      archived, scopes, removed.length, removed.length === 1 ? 'y' : 'ies')
     return archived
   }
 
@@ -1270,6 +1484,9 @@ export class MemoriesRuntime {
   /** List one scope's archived entries. */
   async archived(session: Session, scope: MemoryScope): Promise<string> {
     const root = scope === 'project' ? await this.projectRoot(session) : undefined
+    if (scope === 'project' && root === undefined) {
+      return renderScopeListing({ scope, label: `${NO_PROJECT_LABEL} archive`, entries: [] })
+    }
     const entries = await this.store.listArchived(scope, root)
     return renderScopeListing({ scope, label: `${this.store.target(scope, root).label} archive`, entries })
   }
@@ -1284,6 +1501,7 @@ export class MemoriesRuntime {
   async restore(session: Session, id: string): Promise<string> {
     for (const scope of ['project', 'global'] as const) {
       const root = scope === 'project' ? await this.projectRoot(session) : undefined
+      if (scope === 'project' && root === undefined) continue
       if (await this.store.restore(scope, root, id)) {
         return `Restored ${slugify(id)} into ${this.store.target(scope, root).label}.`
       }
@@ -1302,12 +1520,15 @@ export class MemoriesRuntime {
   /** A one-line status used by `/memories` and diagnostics. */
   async stats(session: Session): Promise<string> {
     const states = await this.allScopes(session)
+    const drafts = await listDrafts(this.store.memoriesDir).catch(() => [])
     const lines = [
       `memory home: ${this.store.memoriesDir}`,
       ...states.map((scope) => `${scope.label}: ${scope.entries.length} memories`),
       `auto-extract: ${this.settings.autoExtract ? `on (every ${formatDelay(this.settings.extractIntervalMinutes * 60_000)}${this.settings.minIdleHours > 0 ? ` + ${formatDelay(extractionDelayMs(this.settings))} quiet to settle` : ''}, ≤${this.settings.maxAgeDays}d old)` : 'off'}`,
       `peak-hours: ${this.peakLine()}`,
-      `recall: ${this.settings.recallMode} (score ≥${this.settings.recallMinScore}, ≤${this.settings.recallMaxPerConversation} per conversation)`,
+      `recall: ${this.settings.recallMode} (relevance ≥${this.settings.recallMinScore} plus ${this.settings.recallMinTerms} terms or a shared run, ≤${this.settings.recallMaxPerConversation} memories and ≤${this.settings.recallMaxBytes}B per conversation)`,
+      `summary: ≤${this.settings.maxSummaryEntries} per scope with ${this.settings.summaryFreshSlots} reserved for never-listed memories`,
+      `skills: ${drafts.length === 0 ? 'no staged drafts' : `${drafts.length} staged draft${drafts.length === 1 ? '' : 's'} waiting (promote with /memories promote <name>)`}`,
       `retention: ${this.settings.maxUnusedDays > 0 ? `archive after ${this.settings.maxUnusedDays}d unused` : 'off'}${this.sweepLine()}`,
       `session mode: ${this.sessionMode(session)}`,
       `logging: ${this.settings.logLevel}${this.settings.traceMaintenance ? ' + maintenance trace' : ''} → ${this.logDestination()}`,
@@ -1464,7 +1685,13 @@ export function apply(ctx: Context, config: MemoriesConfig = {}): void {
   // for this plugin's logger name only raises that threshold for our lines, and
   // the file then records whatever `logLevel` allows — which is what makes a
   // failed extraction, a quota refusal, or a retention decision observable.
-  const sink = createFileSink(deployment.logFile)
+  const sink = createFileSink(deployment.logFile, undefined, (reason) => {
+    // A failed write is the one failure the log file cannot report about itself:
+    // the very channel is broken. Record it on the runtime so `/memories stats`
+    // (and the settings card, which reads the same field) can say the file is
+    // stale instead of leaving a user to trust something that stopped growing.
+    runtime.logSinkError = `write failed: ${reason}`
+  })
   if (sink !== undefined) {
     ctx.logger.exporter(createLogExporter(sink, () => current.logLevel))
   } else if (deployment.logFile.trim().length > 0) {
@@ -1504,7 +1731,11 @@ export function apply(ctx: Context, config: MemoriesConfig = {}): void {
   void runtime.sweepIfDue().catch((error: unknown) => {
     log.warn('dsh-memories: startup sweep failed: %o', error)
   })
-  log.info(
+  // Activation facts belong at `debug`, not at the file's default verbosity: a
+  // hot reload writes this line on every edit, and measured over nine days it
+  // was a quarter of the whole log while saying nothing a reader could act on.
+  // `/memories stats` reports the same facts on demand.
+  log.debug(
     'dsh-memories: store at %s autoExtract=%s idle=%d settings=%s log=%s',
     runtime.store.memoriesDir,
     String(runtime.settings.autoExtract),

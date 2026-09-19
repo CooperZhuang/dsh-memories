@@ -121,6 +121,11 @@ test('parseExtraction accepts a bare object, a fenced object, and rejects junk',
     memories: [1, 2, 3, 4].map((index) => ({ scope: 'global', title: `t${index}`, body: `b${index}` })),
   }), 2, 'session-1')
   assert.equal(capped.drafts.length, 2)
+  // What the cap threw away is reported, not silently lost: a pass that always
+  // lands exactly on the cap is otherwise indistinguishable from one that found
+  // exactly that many memories, which hides the knob that limits the store.
+  assert.equal(capped.dropped, 2)
+  assert.equal(parseExtraction('{"memories":[{"scope":"global","title":"only","body":"one"}]}', 5, 's').dropped, 0)
 })
 
 test('parseExtraction redacts secrets inside extracted memories and the summary', () => {

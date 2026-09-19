@@ -109,6 +109,40 @@ test('keys round-trip through the file and are found by search', async (t) => {
   assert.ok(relevanceOf(parsed as MemoryEntry, 'monorepo') > 20, 'the alias clears the relevance floor')
 })
 
+test('memories differing only by a single-character token stay separate', async (t) => {
+  const { store, dir } = await tempStore()
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  store.similarityLimit = () => 0.7
+  await store.upsert({ scope: 'global', title: 'Old fact 1', body: 'Been here for months.', tags: [] }, undefined, 'auto', 1_000)
+  // Dropping one-character tokens would reduce both titles to {old, fact} and
+  // make this a duplicate of the first — a merge that deletes a real memory.
+  const second = await store.upsert({ scope: 'global', title: 'Old fact 2', body: 'Been here for months.', tags: [] }, undefined, 'auto', 2_000)
+  assert.equal(second.entry.supersedes, undefined, 'the digit is what tells the two apart')
+  assert.equal((await store.list('global', undefined, { fresh: true })).length, 2)
+  assert.equal(isNearDuplicate({ title: 'Old fact 1', body: 'same' }, { title: 'Old fact 2', body: 'same' }, 0.7), false)
+})
+
+test('a numbered family of memories is not collapsed by substring containment', async (t) => {
+  const { store, dir } = await tempStore()
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  // "Old fact 19" contains "Old fact 1", and the collision rule deletes its
+  // loser, so a raw substring test turned four distinct memories into two.
+  for (const title of ['Old fact 1', 'Old fact 19', 'Old fact 190', 'The correction']) {
+    await store.upsert({ scope: 'global', title, body: 'Been here for months.', tags: [] }, undefined, 'auto')
+  }
+  const listed = await store.list('global', undefined, { fresh: true })
+  assert.deepEqual(listed.map((entry) => entry.id).sort(), ['old-fact-1', 'old-fact-19', 'old-fact-190', 'the-correction'])
+})
+
+test('a longer restatement still collapses into the shorter one', async (t) => {
+  const { store, dir } = await tempStore()
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  await store.upsert({ scope: 'global', title: 'Use pnpm', body: 'The repo uses pnpm.', tags: [] }, undefined, 'auto', 1_000)
+  await store.upsert({ scope: 'global', title: 'Use pnpm for this repo', body: 'The repo uses pnpm. Never npm.', tags: [] }, undefined, 'auto', 2_000)
+  const listed = await store.list('global', undefined, { fresh: true })
+  assert.deepEqual(listed.map((entry) => entry.id), ['use-pnpm-for-this-repo'], 'the fuller statement wins and the shorthand goes')
+})
+
 test('a rewrite that omits keys keeps the stored ones', async (t) => {
   const { store, dir } = await tempStore()
   t.after(() => rm(dir, { recursive: true, force: true }))
