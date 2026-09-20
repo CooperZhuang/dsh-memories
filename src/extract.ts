@@ -36,7 +36,7 @@ export const EXTRACT_SYSTEM = [
   'Do NOT record: transient task state, one-off debugging output, secrets, API keys, tokens, credentials, personal data, restatements of the code the assistant just wrote, or anything already stated in the transcript as a question rather than a fact.',
   '',
   'Write every title and body in Simplified Chinese. Keep paths, commands, identifiers, product names and error strings exactly as they are.',
-  'The injected summary shows only the title and roughly the first 200 characters of the body, so lead with the trigger and the decision; put the detail after.',
+  'The injected summary shows only the title and roughly the first 100 characters of the body (the budget forces short previews), so lead with the trigger and the decision; put the detail after.',
   'Never record a number that moves on its own (test counts, file or row counts, "ahead by N commits", a version that will be bumped). Record the command that produces the number instead, or mark the value 截至 <date>.',
   'A problem that is already fixed is recorded as fixed ("已修 in <commit>"); never leave it reading as an open problem.',
   '',

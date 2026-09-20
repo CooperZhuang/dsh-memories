@@ -149,9 +149,24 @@ export function selectForSummary(
   const chosen: MemoryEntry[] = []
   const chosenIds = new Set<string>()
   if (reserve > 0) {
+    // Among never-surfaced entries, prefer a deliberately written one, then one
+    // this conversation actually names, then the newest. Without the topical
+    // step the reserved slot spent itself on arbitrary new material: measured
+    // over 13 scopes it was the single slot that missed the "explicit or
+    // topically relevant" bar in every one of them.
+    const relevance = new Map<string, number>()
+    const needle = options.query?.trim() ?? ''
+    if (needle.length > 0) {
+      for (const entry of entries) {
+        const score = relevanceOf(entry, needle)
+        if (score >= TOPIC_LIFT_MIN_SCORE) relevance.set(entry.id, score)
+      }
+    }
     const unseen = entries
       .filter((entry) => entry.lastSurfacedAt <= 0)
-      .sort((left, right) => explicitFirst(right, left) || recencyOf(right) - recencyOf(left)
+      .sort((left, right) => explicitFirst(right, left)
+        || (relevance.get(right.id) ?? 0) - (relevance.get(left.id) ?? 0)
+        || recencyOf(right) - recencyOf(left)
         || left.title.localeCompare(right.title))
     for (const entry of unseen) {
       if (chosen.length >= reserve) break

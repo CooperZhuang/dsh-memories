@@ -36,7 +36,7 @@ export const CONSOLIDATE_SYSTEM = [
   '- Keep the kind honest: "preference" for how the user wants work done, "failure" for something that went wrong, "procedure" for an ordered recipe, "knowledge" for a non-obvious technique, "fact" for background.',
   '- Do not record secrets, credentials, transient task state, or restatements of code.',
   '- Write every title, body and appliesTo in Simplified Chinese, keeping paths, commands, identifiers and product names exactly as they are. A memory the model wrote in Chinese must not come back in English.',
-  '- The injected summary shows only the title and roughly the first 200 characters of the body, so lead with the trigger and the decision; put the detail after. This matters most when merging: the merged body must open with the one thing a future session needs.',
+  '- The injected summary shows only the title and roughly the first 100 characters of the body (the budget forces short previews), so lead with the trigger and the decision; put the detail after. This matters most when merging: the merged body must open with the one thing a future session needs.',
   '- Always provide "appliesTo": a short phrase in the user\'s words saying when the memory matters ("准备推送代码之前"). When you rewrite a memory that already has one, carry it over unless the rewrite makes it wrong.',
   '- Never record a number that moves on its own (test counts, file or row counts, "ahead by N commits", a version that will be bumped). Record the command that produces the number instead, or mark the value 截至 <date>.',
   '- A problem that is already fixed is recorded as fixed ("已修 in <commit>"); never leave it reading as an open problem.',
