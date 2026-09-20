@@ -42,6 +42,16 @@ const FIELDS = [
     hint: { zh: '摘要里每个作用域列出多少条记忆。', en: 'How many memories each scope lists in the summary.' },
   },
   {
+    field: 'globalSummaryEntries', kind: 'number', min: 0, step: 1,
+    label: { zh: '全局段摘要条数', en: 'Global entries' },
+    hint: { zh: '全局段最多列几条。两个作用域共用一份字节预算、全局段先渲染，不设上限时全局会吃掉项目段用不完的部分（实测某 2 条记忆的项目会话里全局占了 87%）。设为 0 则不注入全局段。', en: 'How many the GLOBAL section may list. Both scopes share one byte budget and global renders first, so without a cap it absorbs whatever the project half leaves (measured: 87% of a small project\'s summary). 0 removes the global section.' },
+  },
+  {
+    field: 'globalSummaryBytes', kind: 'number', min: 0, step: 100,
+    label: { zh: '全局段字节预算', en: 'Global bytes' },
+    hint: { zh: '全局段单独占多少字节（在总预算之内）。只限条数不够：中文一条约 600 字节，4 条就吃掉 4KB 的 60%，实测全局段仍占 45–81%；按字节预留才真正给项目段留出位置。设为 0 则不注入全局段。', en: 'Byte budget for the GLOBAL section, inside the total. A count cap is not enough — four Chinese entries cost ~2.6 KB of a 4 KB block, and the global half still took 45–81% until bytes were reserved. 0 removes the global section.' },
+  },
+  {
     field: 'summaryFreshSlots', kind: 'number', min: 0, step: 1,
     label: { zh: '新记忆保底条数', en: 'Fresh-memory slots' },
     hint: { zh: '每个作用域预留几条给从未被注入过的记忆，且优先人手或模型显式写入的。作用域存满后纯按排序等于永远只展示同一批老记忆，新写的（包括用来纠正旧结论的那条）永远排不进来；设为 0 即恢复纯排序。', en: 'How many of each scope\'s entries are reserved for memories never listed before, preferring ones written deliberately over extracted ones. On a full scope pure ranking shows the same old set forever, so a correction never makes it in; 0 restores pure ranking.' },

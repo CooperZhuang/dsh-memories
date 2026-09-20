@@ -9,7 +9,7 @@
  * @module dsh-memories/test/dedupe-keys.test
  */
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rename, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -59,6 +59,77 @@ test('a re-worded memory supersedes its predecessor instead of joining it', asyn
   const listed = await store.list('global', undefined, { fresh: true })
   assert.deepEqual(listed.map((entry) => entry.id), [second.entry.id])
   assert.equal(await store.read('global', undefined, first.entry.id), undefined)
+})
+
+test('Chinese memories are comparable, so a paraphrase is recognised', () => {
+  const left = { title: '规格型号比对只比实质内容', body: '去空格、去全半角标点、转大写之后再比较。' }
+  const same = { title: '规格型号比较只比实质内容', body: '去空格、去全半角标点、转大写之后再比较。' }
+  const other = { title: '未支付轮询分档', body: '未支付订单的轮询改成两档加抖动。' }
+  // Splitting CJK on non-letters left a whole sentence as one token, which made
+  // every pair of Chinese memories incomparable. Character shingles fix that.
+  assert.equal(isNearDuplicate(left, same, 0.7), true)
+  assert.equal(isNearDuplicate(left, other, 0.7), false)
+})
+
+test('one title is one memory, and the loser is archived rather than deleted', async (t) => {
+  const { store, dir } = await tempStore()
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  store.similarityLimit = () => 0.7
+
+  // Character-for-character identical titles with bodies in different languages:
+  // measured on a real store this pair survived for months, because the body
+  // check vetoed the merge that the titles were asking for.
+  const first = await store.upsert({
+    scope: 'global',
+    title: '手写摘取规则',
+    body: '同形归一必须带左侧词边界，否则机打税号会被抢走。形态闸门不能要求成本中心是固定位数。',
+    tags: [],
+  }, undefined, 'auto', 1_000)
+  const second = await store.upsert({
+    scope: 'global',
+    title: '手写摘取规则',
+    body: 'Lookalike normalization needs a left word boundary, or printed tax ids are hijacked.',
+    tags: [],
+  }, undefined, 'auto', 2_000, 'handwriting-crop-third')
+
+  assert.notEqual(first.entry.id, second.entry.id, 'two files exist to begin with')
+  const listed = await store.list('global', undefined, { fresh: true })
+  assert.equal(listed.length, 1, 'one title is one memory')
+
+  // A judgement made without a model's help must be reversible: the loser is
+  // archived, so `/memories restore` can bring back a false merge.
+  const archived = await store.listArchived('global', undefined)
+  assert.equal(archived.length, 1, 'the loser is archived, not destroyed')
+})
+
+test('an id that ends in a dash is still addressable', async (t) => {
+  const { store, dir } = await tempStore()
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const created = await store.upsert({
+    scope: 'global',
+    title: 'Dashed entry',
+    body: 'A body.',
+    tags: [],
+  }, undefined, 'auto', 1_000)
+
+  // A collision suffix can leave a trailing `-`, which slugify strips — so the
+  // canonical spelling does not exist and every id-addressed call misses it.
+  await rename(join(dir, 'entries', `${created.entry.id}.md`), join(dir, 'entries', `${created.entry.id}-.md`))
+  const dashed = `${created.entry.id}-`
+  assert.ok(await store.read('global', undefined, dashed) !== undefined, 'the exact file name is found')
+  // A rewrite must land in that same file, not beside it: writing `${id}.md`
+  // would silently turn an update into a duplicate.
+  await store.upsert({
+    scope: 'global',
+    title: 'Dashed entry renamed',
+    body: 'A rewritten body.',
+    tags: [],
+  }, undefined, 'auto', 2_000, dashed)
+  const names = (await readdir(join(dir, 'entries'))).filter((name) => name.endsWith('.md'))
+  assert.deepEqual(names, [`${created.entry.id}-.md`], 'one file, updated in place')
+  assert.equal(await store.archive('global', undefined, dashed), true, 'and it can be archived')
+  assert.equal((await store.list('global', undefined, { fresh: true })).length, 0)
+  assert.equal((await store.listArchived('global', undefined)).length, 1)
 })
 
 test('the near-duplicate rule is off until it is configured', async (t) => {

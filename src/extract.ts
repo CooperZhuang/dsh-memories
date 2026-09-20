@@ -35,9 +35,15 @@ export const EXTRACT_SYSTEM = [
   'Record: stable user preferences and working style; project architecture and conventions; build/test/deploy commands; environment and tooling facts; non-obvious gotchas; decisions and their reasons.',
   'Do NOT record: transient task state, one-off debugging output, secrets, API keys, tokens, credentials, personal data, restatements of the code the assistant just wrote, or anything already stated in the transcript as a question rather than a fact.',
   '',
+  'Write every title and body in Simplified Chinese. Keep paths, commands, identifiers, product names and error strings exactly as they are.',
+  'The injected summary shows only the title and roughly the first 200 characters of the body, so lead with the trigger and the decision; put the detail after.',
+  'Never record a number that moves on its own (test counts, file or row counts, "ahead by N commits", a version that will be bumped). Record the command that produces the number instead, or mark the value 截至 <date>.',
+  'A problem that is already fixed is recorded as fixed ("已修 in <commit>"); never leave it reading as an open problem.',
+  '',
   'Choose the scope of each memory:',
   '- "global": true across every project (how the user likes to work, general preferences, machine/tooling facts).',
   '- "project": true only for this workspace (its architecture, commands, conventions, gotchas).',
+  'A fact that names a specific employer, product, customer, repository path, drive letter or internal host is NEVER global, however generally it is phrased — global memories are injected into every unrelated project.',
   '',
   'Each memory has a short imperative title (max 80 characters), a 1-3 sentence body, up to 5 lowercase keyword tags, and 1-5 search keys: the aliases and keyphrases a future session would actually type (for example "monorepo" for a pnpm-workspace fact).',
   'Give each memory a kind, because the kinds are recalled differently:',
@@ -46,7 +52,7 @@ export const EXTRACT_SYSTEM = [
   '- "procedure": an ordered recipe for a recurring task.',
   '- "knowledge": a non-obvious technique worth reusing.',
   '- "fact": durable background that is none of the above.',
-  'Add "appliesTo" (a short phrase saying when the memory matters) when the title does not make it obvious.',
+  'Always provide "appliesTo": a short phrase in the user\'s words saying when this memory matters ("准备推送代码之前"). It is the field that lets a paraphrased turn find the memory, and it is required.',
   'Prefer few high-value memories over many trivial ones. Return at most the requested number.',
   'Also write "summary": one paragraph (2-4 sentences) saying what this session was about — the task, the decisions, and anything that would help someone judge the memories above later. It is stored as the evidence behind them.',
   'Reply with JSON only, no prose and no code fence: {"summary":string,"memories":[{"scope":"global"|"project","kind":string,"title":string,"body":string,"tags":string[],"appliesTo":string}]}',
@@ -65,7 +71,7 @@ export const EXTRACT_JSON_SCHEMA = {
       items: {
         type: 'object',
         additionalProperties: false,
-        required: ['scope', 'title', 'body'],
+        required: ['scope', 'title', 'body', 'appliesTo'],
         properties: {
           scope: { type: 'string', enum: ['global', 'project'] },
           kind: { type: 'string', enum: ['fact', 'preference', 'knowledge', 'failure', 'procedure'] },
@@ -255,6 +261,16 @@ export interface ExtractionRequest {
   readonly window: ExtractWindow
   /** Model-facing label of the project scope, for the prompt. */
   readonly projectLabel: string
+  /**
+   * Titles already stored in the scopes this pass may write to.
+   *
+   * The extractor is otherwise blind to what is already known, so it re-derives
+   * the same lesson from overlapping windows and stores it under a new title.
+   * Measured on a real store, one session's handwriting-extraction lesson was
+   * stored twice — once in Chinese, once in English — because each pass phrased
+   * the title differently and ids come from titles.
+   */
+  readonly knownTitles?: readonly string[]
   /** Explicit route override. */
   readonly provider?: string
   readonly model?: string
@@ -295,9 +311,16 @@ export async function runExtraction(llm: LlmRuntime, request: ExtractionRequest)
   if (request.window.text.trim().length === 0) return { kind: 'none', reason: 'empty-window' }
   const route = resolveRoute(request.session, request.provider, request.model, request.fallbackRoute ?? {})
   if (route === undefined) return { kind: 'none', reason: 'no-route' }
+  const known = request.knownTitles ?? []
   const framed = [
     `Workspace scope label: ${request.projectLabel}`,
     `Extract at most ${request.maxMemories} memories from this transcript.`,
+    ...known.length === 0 ? [] : [
+      '',
+      'Memories already stored in the scopes this pass writes to:',
+      ...known.map((title) => `- ${title}`),
+      'If the transcript adds to (or corrects) one of those, reuse its EXACT title so that entry is updated instead of duplicated. Only invent a new title for a genuinely new fact.',
+    ],
     '',
     request.window.text,
   ].join('\n')

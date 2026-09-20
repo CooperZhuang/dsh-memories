@@ -166,7 +166,9 @@ test('the extraction JSON schema is closed and requires the documented fields', 
   assert.equal(EXTRACT_JSON_SCHEMA.additionalProperties, false)
   // The summary is required too: it becomes the evidence note behind the drafts.
   assert.deepEqual([...EXTRACT_JSON_SCHEMA.required], ['summary', 'memories'])
-  assert.deepEqual([...EXTRACT_JSON_SCHEMA.properties.memories.items.required], ['scope', 'title', 'body'])
+  // `appliesTo` is required because it is the field that lets a paraphrased turn
+  // find the memory again; half the store was unsearchable without it.
+  assert.deepEqual([...EXTRACT_JSON_SCHEMA.properties.memories.items.required], ['scope', 'title', 'body', 'appliesTo'])
 })
 
 test('runExtraction sends the transcript and returns parsed drafts', async () => {

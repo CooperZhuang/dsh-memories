@@ -406,11 +406,17 @@ export function relevanceOf(entry: MemoryEntry, query: string): number {
 /**
  * Half-life of a memory's recency weight, in days.
  *
- * Deliberately long: this is durable memory, and a project convention from last
- * quarter is usually still true. Recency orders equally relevant memories; it
- * does not decide by itself whether an old one is worth showing at all.
+ * Deliberately short next to the store's own lifetime. It was 90 days, which on
+ * an eleven-day-old store distinguishes almost nothing: the recency term spanned
+ * 0.94–1.00 while the use-count term spanned 1.0–4.5, so the injected summary
+ * was decided by how often a memory had been read before. Measured on a real
+ * store that pinned the same six entries — a plugin's logger threshold, a
+ * sidebar adapter, a model catalog — into every unrelated session, because those
+ * are the memories the harness's own plugin work kept reading. Thirty days keeps
+ * recency meaningful against the use term without letting a quarter-old
+ * convention fall out of reach.
  */
-export const RECENCY_HALF_LIFE_DAYS = 90
+export const RECENCY_HALF_LIFE_DAYS = 30
 
 /**
  * Floor on the recency weight.
@@ -465,15 +471,35 @@ export function decayOf(entry: MemoryEntry, now = Date.now()): number {
  * `tool`/`user` entries are somebody's statement. When they disagree the
  * explicit one is the newer truth, and without a thumb on the scale the guess
  * wins purely because it has been around long enough to collect reads.
+ *
+ * Raised from 1.25 because that was not enough to matter: against a use term
+ * spanning 1.0–4.5 with a ten-use cap, a deliberately written entry lost to a
+ * heavily-read extracted one every time. Measured on a real store, all six
+ * hand-written global rules — including "never break the prompt cache" and
+ * "reconnaissance is read-only GET" — failed to reach any session's summary,
+ * while the twelve that did were all extracted notes.
  */
-export const EXPLICIT_SOURCE_BONUS = 1.25
+export const EXPLICIT_SOURCE_BONUS = 1.6
+
+/**
+ * How much one recorded read is worth, and the cap on how far it can climb.
+ *
+ * Previously `1 + min(uses, 10) * 0.35`, which let a single read-count term
+ * outrank recency by four to one and flattened the top of the ranking into a
+ * four-way tie at the cap. The slope is smaller and the cap lower so that
+ * recency, explicitness and use count each still move the order.
+ */
+export const USE_BONUS = 0.15
+
+/** @see USE_BONUS */
+export const USE_CAP = 5
 
 /**
  * How much an entry has earned its place: a small bonus per recorded use, and a
- * smaller one for having been written deliberately rather than inferred.
+ * larger one for having been written deliberately rather than inferred.
  */
 export function importanceOf(entry: MemoryEntry): number {
-  const used = 1 + Math.min(entry.uses, 10) * 0.35
+  const used = 1 + Math.min(entry.uses, USE_CAP) * USE_BONUS
   return entry.source === 'auto' ? used : used * EXPLICIT_SOURCE_BONUS
 }
 

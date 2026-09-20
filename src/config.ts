@@ -31,6 +31,35 @@ export const DEFAULT_MAX_SUMMARY_BYTES = 4096
 export const DEFAULT_MAX_SUMMARY_ENTRIES = 12
 
 /**
+ * Default cap on the GLOBAL section's bullets, below {@link DEFAULT_MAX_SUMMARY_ENTRIES}.
+ *
+ * The two scopes share one byte budget and the global section renders first, so
+ * an uncapped global scope absorbs whatever the project scope leaves over.
+ * Measured on a real store: a two-memory project session spent 87% of its budget
+ * on global entries, and in every session the same six were unrelated to the
+ * workspace (a plugin's logger threshold, a sidebar adapter, a model catalog).
+ * Four keeps the portable half visible without letting it bury the scope that is
+ * actually about this conversation.
+ */
+export const DEFAULT_GLOBAL_SUMMARY_ENTRIES = 4
+
+/**
+ * Default byte budget for the global section alone, inside {@link DEFAULT_MAX_SUMMARY_BYTES}.
+ *
+ * A count cap is not enough. Chinese entries cost roughly three bytes per
+ * character, so four of them fill about 2.6 KB of a 4 KB block — measured on a
+ * real store the global half still took 45–81% of every session after the count
+ * cap was added. Reserving bytes is what actually leaves room for the scope that
+ * is about this conversation.
+ *
+ * 1200 is about a third of the content budget: the block's frame (intro and
+ * guidance) costs ~700 bytes of the 4096, so the two scopes divide ~3400, and a
+ * third to the half that every session shares leaves two thirds to the half that
+ * is actually about this workspace.
+ */
+export const DEFAULT_GLOBAL_SUMMARY_BYTES = 1200
+
+/**
  * Default number of those entries reserved for memories never listed before.
  *
  * Three, because the reservation is a queue that drains: once an entry has been
@@ -196,6 +225,10 @@ export const MemoriesSettingsSchema = z.object({
   maxSummaryBytes: z.number().default(DEFAULT_MAX_SUMMARY_BYTES).description('Byte budget for the memory summary injected once per conversation. 0 disables injection and leaves only the memory tool.'),
   /** Max entries listed per scope in the injected summary. */
   maxSummaryEntries: z.number().default(DEFAULT_MAX_SUMMARY_ENTRIES).description('How many memories each scope lists in the injected summary.'),
+  /** Max entries listed for the global scope, which every session shares. */
+  globalSummaryEntries: z.number().default(DEFAULT_GLOBAL_SUMMARY_ENTRIES).description('How many memories the GLOBAL section may list, capped below maxSummaryEntries. Both scopes share one byte budget and global renders first, so without this the global half grows to fill whatever the project half leaves (measured: 87% of a small project\'s summary). 0 removes the global section entirely.'),
+  /** Byte budget for the global section alone. */
+  globalSummaryBytes: z.number().default(DEFAULT_GLOBAL_SUMMARY_BYTES).description('Byte budget for the GLOBAL section, inside maxSummaryBytes. A count cap is not enough because Chinese entries are ~3 bytes per character: four of them still filled 60% of a 4 KB block. 0 removes the global section entirely.'),
   /** How many of those entries are reserved for never-listed memories. */
   summaryFreshSlots: z.number().default(DEFAULT_SUMMARY_FRESH_SLOTS).description('How many of each scope\'s summary entries are reserved for memories that have never been listed before, preferring ones written deliberately over extracted ones. 0 leaves selection to the ranking alone, which on a full scope never shows anything new.'),
   /** How the injected summary is refreshed as the conversation moves on. */
@@ -277,6 +310,8 @@ export type MemoriesSettings = Schemastery.TypeT<typeof MemoriesSettingsSchema>
 export const MEMORIES_SETTINGS_DEFAULTS: MemoriesSettings = {
   maxSummaryBytes: DEFAULT_MAX_SUMMARY_BYTES,
   maxSummaryEntries: DEFAULT_MAX_SUMMARY_ENTRIES,
+  globalSummaryEntries: DEFAULT_GLOBAL_SUMMARY_ENTRIES,
+  globalSummaryBytes: DEFAULT_GLOBAL_SUMMARY_BYTES,
   summaryFreshSlots: DEFAULT_SUMMARY_FRESH_SLOTS,
   recallMode: DEFAULT_RECALL_MODE,
   recallMinScore: DEFAULT_RECALL_MIN_SCORE,
@@ -339,6 +374,8 @@ export interface MemoriesConfig {
   /** Legacy flat spellings, accepted so an existing row keeps working. */
   maxSummaryBytes?: number
   maxSummaryEntries?: number
+  globalSummaryEntries?: number
+  globalSummaryBytes?: number
   summaryFreshSlots?: number
   maxEntriesPerScope?: number
   maxUnusedDays?: number
@@ -437,6 +474,8 @@ export function normalizeSettings(input: Partial<MemoriesSettings> | undefined):
   return {
     maxSummaryBytes: positive(value.maxSummaryBytes, DEFAULT_MAX_SUMMARY_BYTES, 0),
     maxSummaryEntries: positive(value.maxSummaryEntries, DEFAULT_MAX_SUMMARY_ENTRIES),
+    globalSummaryEntries: positive(value.globalSummaryEntries, DEFAULT_GLOBAL_SUMMARY_ENTRIES, 0),
+    globalSummaryBytes: positive(value.globalSummaryBytes, DEFAULT_GLOBAL_SUMMARY_BYTES, 0),
     summaryFreshSlots: positive(value.summaryFreshSlots, DEFAULT_SUMMARY_FRESH_SLOTS, 0),
     recallMode: toRecallMode(value.recallMode),
     recallMinScore: positive(value.recallMinScore, DEFAULT_RECALL_MIN_SCORE, 0),

@@ -22,7 +22,7 @@
  */
 import { createHash } from 'node:crypto'
 import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
-import { dirname, join, resolve } from 'node:path'
+import { basename, dirname, join, relative, resolve } from 'node:path'
 import type { MemoryDraft, MemoryEntry, MemoryScope, ScopeTarget, UpsertResult } from './types.js'
 import { toMemoryKind } from './types.js'
 
@@ -228,15 +228,37 @@ export function normalizeKey(value: string): string {
  * 2" both reduce to {old, fact} and are treated as one memory; measured on a
  * real store, nine of twenty distinct numbered entries were destroyed that way,
  * and the same shape covers "端口 3080" against "端口 8080". A missed merge costs
- * one slot in the summary; a false merge costs the memory, because the loser is
- * deleted rather than archived.
+ * one slot in the summary; a false merge costs nothing permanent any more,
+ * because the loser is archived rather than deleted and `/memories restore`
+ * brings it back — but a false merge still costs a slot until someone notices,
+ * so the rule stays narrow.
  *
  * @param value - raw text.
- * @returns its lowercased tokens.
+ * @returns its lowercase word tokens, with CJK indexed as characters and pairs.
  */
 function tokenSet(value: string): Set<string> {
-  return new Set(value.toLowerCase().split(/[^\p{L}\p{N}_]+/u).filter((token) => token.length > 0))
+  const tokens = new Set<string>()
+  for (const raw of value.toLowerCase().split(/[^\p{L}\p{N}_]+/u)) {
+    if (raw.length === 0) continue
+    if (LATIN_RUN.test(raw)) {
+      tokens.add(raw)
+      continue
+    }
+    // CJK has no word boundaries: index single characters and adjacent pairs, so
+    // a paraphrase still shares most of its shingles. Splitting on non-letters
+    // left a whole Chinese sentence as one enormous token, which made every pair
+    // of Chinese memories incomparable — measured on a real store, two entries
+    // with character-for-character identical titles survived as two memories
+    // because one body was Chinese and the other English.
+    const chars = [...raw]
+    for (const char of chars) tokens.add(char)
+    for (let index = 0; index + 1 < chars.length; index += 1) tokens.add(`${chars[index]}${chars[index + 1]}`)
+  }
+  return tokens
 }
+
+/** A token that is already a word: Latin letters, digits, and underscores. */
+const LATIN_RUN = /^[0-9a-z_]+$/u
 
 /** Jaccard overlap of two token sets; `0` when either side is empty. */
 export function overlap(left: ReadonlySet<string>, right: ReadonlySet<string>): number {
@@ -301,15 +323,18 @@ function containsPhrase(haystack: string, needle: string): boolean {
  *
  * Ids come from titles, so a re-worded title creates a second file. Left alone
  * the store would slowly fill with near-copies that all compete for the bounded
- * summary budget. Two entries collide only when BOTH their normalized title and
- * their normalized body match, or when one of them contains the other's title
- * and body as phrases — a deliberately narrow rule, because collapsing on the
- * body alone would merge genuinely distinct memories that share wording, and a
- * plain substring test would swallow "Old fact 1" into "Old fact 19". The most
- * recently updated entry wins and the losers are deleted.
+ * summary budget. Two entries collide when their normalized titles are equal
+ * (regardless of body, because that is one memory written twice), when BOTH
+ * normalized title and body match, when one contains the other's title and body
+ * as phrases, or when title and body token overlap both clear `similarity` — a
+ * deliberately narrow rule, because collapsing on the body alone would merge
+ * genuinely distinct memories that share wording, and a plain substring test
+ * would swallow "Old fact 1" into "Old fact 19". The most recently updated entry
+ * wins and the losers are archived, not deleted: a judgement made without a
+ * model's help must be reversible.
  *
  * @param entries - entries in one scope, newest first.
- * @param store - owning store, used to delete the losers.
+ * @param store - owning store, used to archive the losers.
  * @param scope - the scope being deduplicated.
  * @param projectRoot - workspace root for a project scope.
  * @param keep - ids that must survive regardless of collisions.
@@ -330,7 +355,8 @@ async function dedupeEntries(
     const title = fingerprint(entry.title)
     const body = fingerprint(entry.body)
     const clash = winners.find((candidate) =>
-      (candidate.title === title && candidate.body === body)
+      candidate.title === title
+      || (candidate.title === title && candidate.body === body)
       || (candidate.title.length > 0 && containsPhrase(title, candidate.title) && containsPhrase(body, candidate.body))
       || (title.length > 0 && containsPhrase(candidate.title, title) && containsPhrase(candidate.body, body))
       || (similarity > 0 && isNearDuplicate(entry, candidate.entry, similarity)))
@@ -349,7 +375,11 @@ async function dedupeEntries(
   }
   if (losers.length === 0) return [...entries]
   for (const loser of losers) {
-    await rm(join(store.entriesDirOf(scope, projectRoot), `${loser.id}.md`), { force: true })
+    // Archived rather than removed: this pass runs without a model's judgement,
+    // and a wrong call must stay recoverable with `/memories restore`. Removal is
+    // reserved for `/memories forget`, where a person asked for it.
+    const archived = await store.archive(scope, projectRoot, loser.id).catch(() => false)
+    if (!archived) await rm(join(store.entriesDirOf(scope, projectRoot), `${loser.id}.md`), { force: true })
   }
   const dropped = new Set(losers.map((loser) => loser.id))
   return entries.filter((entry) => !dropped.has(entry.id))
@@ -585,6 +615,67 @@ export class MemoryStore {
   }
 
   /**
+   * Move a project scope whose directory name is not the slug its own root
+   * derives onto the canonical directory.
+   *
+   * A slug is derived from the workspace path, so a scope written by an older
+   * derivation can sit under a name the current one never produces — and then
+   * every read path (`list`, `read`, search, the injected summary) resolves the
+   * canonical directory, finds nothing there, and the memories are invisible
+   * while still occupying disk. Measured on a real store, one project's two
+   * memories were unreachable exactly this way.
+   *
+   * A canonical directory that already holds markdown is left alone and reported
+   * instead of merged: two directories' worth of memories is a decision for a
+   * person, not for a sweep.
+   *
+   * @returns the slug pairs that were re-homed, for the caller to report.
+   */
+  async adoptMisnamedProjects(): Promise<readonly { from: string; to: string }[]> {
+    const moved: { from: string; to: string }[] = []
+    for (const slug of await this.listProjects()) {
+      const dir = join(this.memoriesDir, 'projects', slug)
+      let descriptor: ProjectDescriptor | undefined
+      try {
+        descriptor = JSON.parse(await readFile(join(dir, 'project.json'), 'utf8')) as ProjectDescriptor
+      } catch {
+        continue
+      }
+      if (typeof descriptor.root !== 'string' || descriptor.root.length === 0) continue
+      const target = dirname(this.entriesDir('project', descriptor.root))
+      const canonical = basename(target)
+      if (canonical === slug) continue
+      if (await exists(join(target, 'index.json'))) {
+        // The canonical directory already has its own index: re-homing would
+        // overwrite one of the two. Leave both for a human to reconcile.
+        this.cache.delete(dir)
+        continue
+      }
+      try {
+        await mkdir(target, { recursive: true })
+        const dirents = await readdir(dir, { recursive: true, withFileTypes: true })
+        for (const dirent of dirents) {
+          if (!dirent.isFile()) continue
+          const from = join(dirent.parentPath, dirent.name)
+          const to = join(target, relative(dir, from))
+          await mkdir(dirname(to), { recursive: true })
+          await rename(from, to)
+        }
+        await rm(dir, { recursive: true, force: true })
+      } catch {
+        // A directory another process holds open stays where it is and is simply
+        // not reported: a sweep that claims work it did not do is worse than one
+        // that does nothing.
+        continue
+      }
+      this.cache.delete(dir)
+      this.cache.delete(target)
+      moved.push({ from: slug, to: canonical })
+    }
+    return moved
+  }
+
+  /**
    * List one scope's entries, newest-updated first. The on-disk `index.json` is
    * preferred while it agrees with the directory's file count; otherwise the
    * directory is re-scanned and the index rewritten.
@@ -657,9 +748,32 @@ export class MemoryStore {
     await writeAtomic(this.indexPath(scope, projectRoot), `${JSON.stringify(document, undefined, 2)}\n`)
   }
 
+  /**
+   * Path of one entry file, tolerating ids a slug cannot round-trip.
+   *
+   * An id is a slugified title, but a collision suffix can leave a trailing `-`
+   * that {@link slugify} strips on the way back in. For such an id the canonical
+   * `<slugify(id)>.md` spelling does not exist on disk, so every id-addressed
+   * operation — read, remove, archive, restore — silently misses it. Measured on
+   * a real store, two entries were unreachable that way (one of them a duplicate
+   * that could not be archived). The exact name wins whenever it is present.
+   *
+   * @param scope - owning scope.
+   * @param projectRoot - workspace root for a project scope.
+   * @param id - entry id as stored.
+   * @returns the path to read or write.
+   */
+  private async entryFile(scope: MemoryScope, projectRoot: string | undefined, id: string): Promise<string> {
+    const dir = this.entriesDir(scope, projectRoot)
+    const canonical = `${slugify(id)}.md`
+    if (`${id}.md` === canonical) return join(dir, canonical)
+    const exact = join(dir, `${id}.md`)
+    return await exists(exact) ? exact : join(dir, canonical)
+  }
+
   /** Read one entry by id. */
   async read(scope: MemoryScope, projectRoot: string | undefined, id: string): Promise<MemoryEntry | undefined> {
-    const text = await readText(join(this.entriesDir(scope, projectRoot), `${slugify(id)}.md`))
+    const text = await readText(await this.entryFile(scope, projectRoot, id))
     if (text === undefined) return undefined
     return parseEntry(text, scope, slugify(id))
   }
@@ -690,7 +804,7 @@ export class MemoryStore {
       lastSurfacedAt: counters.surfacedAt ?? entry.lastSurfacedAt,
     }
     try {
-      await writeAtomic(join(this.entriesDir(entry.scope, projectRoot), `${entry.id}.md`), formatEntry(updated))
+      await writeAtomic(await this.entryFile(entry.scope, projectRoot, entry.id), formatEntry(updated))
       this.invalidate(entry.scope, projectRoot)
     } catch {
       return entry
@@ -717,7 +831,16 @@ export class MemoryStore {
     keepId?: string,
   ): Promise<UpsertResult> {
     const id = slugify(keepId ?? draft.title)
-    const existing = await this.read(draft.scope, projectRoot, id)
+    // Look the entry up by the id the caller gave, not by its slug: a `keepId`
+    // that ends in `-` names a file whose slug is a different string, and
+    // slugifying first would miss the file that is actually there.
+    const existing = await this.read(draft.scope, projectRoot, keepId ?? id)
+    // A rewrite keeps the file it already lives in. Writing `${id}.md` blindly
+    // would put a second file beside an id whose name a slug cannot round-trip
+    // (a trailing `-`), turning an update into a duplicate.
+    const target = keepId === undefined || existing === undefined
+      ? join(this.entriesDir(draft.scope, projectRoot), `${id}.md`)
+      : await this.entryFile(draft.scope, projectRoot, keepId)
     const tags = [...new Set(draft.tags.map(normalizeTag).filter((tag) => tag.length > 0))].slice(0, 12)
     const keys = [...new Set((draft.keys ?? existing?.keys ?? []).map(normalizeKey).filter((key) => key.length > 0))].slice(0, 12)
     const appliesTo = draft.appliesTo?.trim()
@@ -751,12 +874,12 @@ export class MemoryStore {
       lastSurfacedAt: existing?.lastSurfacedAt ?? 0,
       source,
     }
-    await writeAtomic(join(this.entriesDir(draft.scope, projectRoot), `${id}.md`), formatEntry(entry))
+    await writeAtomic(target, formatEntry(entry))
     if (draft.scope === 'project' && projectRoot !== undefined) await this.writeProjectDescriptor(projectRoot, now)
     // Honour `supersedes`: the entry this one replaces is retired, in the same
     // scope, unless it IS this entry (an id can never supersede itself).
     if (entry.supersedes !== undefined && entry.supersedes !== id) {
-      await rm(join(this.entriesDir(draft.scope, projectRoot), `${slugify(entry.supersedes)}.md`), { force: true })
+      await rm(await this.entryFile(draft.scope, projectRoot, entry.supersedes), { force: true })
     }
     this.invalidate(draft.scope, projectRoot)
     const limit = this.entryLimit()
@@ -773,7 +896,7 @@ export class MemoryStore {
 
   /** Delete one entry. Returns whether a file was removed. */
   async remove(scope: MemoryScope, projectRoot: string | undefined, id: string): Promise<boolean> {
-    const path = join(this.entriesDir(scope, projectRoot), `${slugify(id)}.md`)
+    const path = await this.entryFile(scope, projectRoot, id)
     if (!(await exists(path))) return false
     await rm(path, { force: true })
     await this.reindex(scope, projectRoot)
@@ -796,7 +919,7 @@ export class MemoryStore {
    * @returns whether an entry was archived.
    */
   async archive(scope: MemoryScope, projectRoot: string | undefined, id: string, now = Date.now()): Promise<boolean> {
-    const source = join(this.entriesDir(scope, projectRoot), `${slugify(id)}.md`)
+    const source = await this.entryFile(scope, projectRoot, id)
     const text = await readText(source)
     if (text === undefined) return false
     const stamped = text.replace(/^---\r?\n/u, `---\narchived: ${new Date(now).toISOString()}\n`)

@@ -22,6 +22,8 @@
  * @module dsh-memories
  */
 import { createUserMessage, isQuotaExceededError, QUOTA_EXCEEDED_CODE } from '@deepseek-ai/dsh-llm'
+import { homedir } from 'node:os'
+import { resolve } from 'node:path'
 import type { LlmRuntime, UserMessage } from '@deepseek-ai/dsh-llm'
 import type { Agent, SessionStartSource } from '@deepseek-ai/dsh-agent'
 import type { Session } from '@deepseek-ai/dsh-session'
@@ -81,6 +83,47 @@ const QUALIFIED_SCORE_FACTOR = 2
  * session started there.
  */
 const NO_PROJECT_LABEL = 'project:none'
+
+/**
+ * How many existing titles one extraction prompt carries.
+ *
+ * Enough to cover a well-kept scope, bounded because these lines compete with
+ * the transcript for the prompt: the extractor only needs to recognise that a
+ * fact is already known so it reuses the entry's title instead of inventing a
+ * second one.
+ */
+const KNOWN_TITLE_LIMIT = 80
+
+/** Case-insensitive path equality on Windows, exact elsewhere. */
+function samePath(left: string, right: string): boolean {
+  const base = resolve(right)
+  const target = resolve(left)
+  return process.platform === 'win32' ? base.toLowerCase() === target.toLowerCase() : base === target
+}
+
+/**
+ * Whether a directory is somewhere a session was *started from*, not a project.
+ *
+ * {@link findProjectRoot} falls back to the starting directory when it finds no
+ * root marker, so any directory a session happens to open in becomes a scope
+ * forever. Two of them must never become one: the harness home (plugin work,
+ * profiles, logs) and the user's home directory itself. Measured on a real
+ * store, the harness home alone had collected 14 memories from five unrelated
+ * projects.
+ *
+ * Descendants of the home directory are deliberately allowed through: a game's
+ * save folder under `%LOCALAPPDATA%` is a real workspace with work worth
+ * remembering, while the home directory itself is not. The OS temp tree is
+ * allowed through too, because half-finished work there is still work.
+ *
+ * @param root - the candidate workspace root.
+ * @param dshHome - the harness home directory.
+ * @returns true when the directory must not own a project scope.
+ */
+export function isCatchAllDirectory(root: string, dshHome: string): boolean {
+  if (isWithin(dshHome, root)) return true
+  return samePath(root, homedir())
+}
 
 /**
  * Services this plugin requires at activation: the tool registry (for the
@@ -207,11 +250,13 @@ export class MemoriesRuntime {
     // works, and scoping to it merged unrelated repositories into one bucket.
     if (cwd === undefined || cwd.length === 0) return undefined
     const root = await findProjectRoot(cwd, this.deployment.projectRootMarkers)
-    // The harness home is not a project either. `findProjectRoot` falls back to
-    // the starting directory when it finds no marker, so a session started in
-    // `$DSH_HOME` would otherwise own a scope shared by everything worked on
-    // from there — measured: 14 memories from five unrelated projects.
-    return isWithin(this.deployment.dshHome, root) ? undefined : root
+    // A directory that is not a project is not a scope either: the harness home,
+    // the user's home directory itself, and the OS temp tree are places a
+    // session is *started from*, not things it works on. `findProjectRoot` falls
+    // back to the starting directory when it finds no marker, so without this a
+    // session opened there owns a scope shared by everything worked on from it —
+    // measured: 14 memories from five unrelated projects under `$DSH_HOME`.
+    return isCatchAllDirectory(root, this.deployment.dshHome) ? undefined : root
   }
 
   /** Load one scope's entries plus its model-facing labels. */
@@ -305,11 +350,72 @@ export class MemoriesRuntime {
 
   /** The one place a draft becomes an entry, so the scope rule has one home. */
   private async persist(session: Session, draft: MemoryDraft, source: MemoryEntry['source']) {
-    if (draft.scope === 'global') return await this.store.upsert(draft, undefined, source)
+    if (draft.scope === 'global') {
+      // A global memory is injected into every unrelated project, so a draft
+      // that cites a workspace we already keep memories for belongs to that
+      // workspace instead. Matching on the recorded root PATH (not on a project
+      // name) keeps this precise: generic memories legitimately cite paths, and
+      // only a path inside a known project is evidence of where a fact lives.
+      const owner = await this.projectOwningPath(draft)
+      if (owner !== undefined) {
+        this.log.decision('dsh-memories: global draft %s names %s, storing it there instead',
+          draft.title, this.store.target('project', owner).label)
+        return await this.store.upsert({ ...draft, scope: 'project' }, owner, source)
+      }
+      return await this.store.upsert(draft, undefined, source)
+    }
     const root = await this.projectRoot(session)
     if (root !== undefined) return await this.store.upsert(draft, root, source)
     this.log.decision('dsh-memories: session %s has no workspace, storing %s as global', session.id, draft.title)
     return await this.store.upsert({ ...draft, scope: 'global' }, undefined, source)
+  }
+
+  /**
+   * Find the project scope whose root directory a global draft cites.
+   *
+   * Scoping is where a memory earns or loses its reach: an employer, product or
+   * repository fact parked in global follows the user into every unrelated
+   * project. The extractor is asked to make that call and sometimes gets it
+   * wrong, so the store's own project descriptors are the second opinion — a
+   * global draft that quotes a known project's path is filed with that project.
+   *
+   * @param draft - the draft about to be stored.
+   * @returns the owning project root, or `undefined` when nothing matches.
+   */
+  private async projectOwningPath(draft: MemoryDraft): Promise<string | undefined> {
+    const text = `${draft.title} ${draft.body}`
+    if (!/[A-Za-z]:\\/u.test(text)) return undefined
+    const haystack = text.toLowerCase()
+    for (const slug of await this.store.listProjects()) {
+      const descriptor = await this.store.readProjectDescriptor(slug)
+      if (descriptor === undefined) continue
+      if (descriptor.root.toLowerCase().length >= 4 && haystack.includes(descriptor.root.toLowerCase())) {
+        return descriptor.root
+      }
+    }
+    return undefined
+  }
+
+  /**
+   * Titles already stored in the scopes one extraction pass may write to.
+   *
+   * Project titles come first: they are the ones a pass in this workspace is
+   * most likely to be re-deriving, so they are the ones that must survive the
+   * cap. Extraction is otherwise blind to what is already known, which is how one
+   * session's lesson ended up stored twice — once in Chinese, once in English.
+   *
+   * @param root - the session's project root, when it has one.
+   * @returns existing titles, capped for the prompt.
+   */
+  private async knownTitles(root: string | undefined): Promise<readonly string[]> {
+    const titles: string[] = []
+    if (root !== undefined) {
+      const project = await this.store.list('project', root).catch(() => [] as MemoryEntry[])
+      for (const entry of project) titles.push(entry.title)
+    }
+    const global = await this.store.list('global', undefined).catch(() => [] as MemoryEntry[])
+    for (const entry of global) titles.push(entry.title)
+    return titles.slice(0, KNOWN_TITLE_LIMIT)
   }
 
   /** Delete one entry. */
@@ -345,12 +451,16 @@ export class MemoriesRuntime {
    * @param session - session whose scopes to summarize.
    * @returns the framed block plus the entries it lists, or `undefined`.
    */
-  private async summaryWithSurfaced(session: Session): Promise<{ text: string; surfaced: readonly MemoryEntry[] } | undefined> {
+  private async summaryWithSurfaced(session: Session, query?: string): Promise<{ text: string; surfaced: readonly MemoryEntry[] } | undefined> {
     if (this.settings.maxSummaryBytes <= 0) return undefined
     if (this.settings.recallMode === 'off') return undefined
     const states = await this.allScopes(session)
     const selected = states.map((state) => selectForSummary(state.entries, this.settings.maxSummaryEntries, {
       freshSlots: this.settings.summaryFreshSlots,
+      // The opening turn is the only topic signal available this early, and it
+      // is what keeps a globally scoped memory that shares nothing with this
+      // conversation from outranking one that does.
+      ...query === undefined || query.length === 0 ? {} : { query },
     }))
     const scopes: SummaryScope[] = states.map((state, index) => ({
       label: state.label,
@@ -359,6 +469,12 @@ export class MemoriesRuntime {
       // The full count, not the listed one, so the block still says how much it
       // is not showing.
       total: state.entries.length,
+      // Every session shares the global half, so it gets its own smaller cap —
+      // in entries and in bytes, because a count cap alone still let it take
+      // most of the block once the entries were Chinese.
+      ...state.scope === 'global'
+        ? { maxEntries: this.settings.globalSummaryEntries, maxBytes: this.settings.globalSummaryBytes }
+        : {},
     }))
     const note = await this.draftNote()
     const text = renderMemorySummary(scopes, {
@@ -451,7 +567,7 @@ export class MemoriesRuntime {
       this.injected.add(session)
       return undefined
     }
-    const summary = await this.summaryWithSurfaced(session)
+    const summary = await this.summaryWithSurfaced(session, this.openingQuery(session))
     if (summary === undefined) return undefined
     this.injected.add(session)
     await this.markSurfaced(session, summary.surfaced)
@@ -484,6 +600,38 @@ export class MemoriesRuntime {
     } catch {
       return false
     }
+  }
+
+  /**
+   * The conversation's opening user text, as a topic signal for injection.
+   *
+   * The summary is built before the model has seen anything, so this is the only
+   * evidence about what the session is actually for. Plugin-sourced user
+   * messages (the injected block itself) are skipped, and the result is capped
+   * because it is a relevance hint, not the transcript.
+   *
+   * @param session - session being injected.
+   * @returns the first real user text, or `undefined` when there is none yet.
+   */
+  private openingQuery(session: Session): string | undefined {
+    try {
+      for (const message of session.deriveMessages()) {
+        if (message.role !== 'user') continue
+        if (message.source.kind === 'plugin') continue
+        const blocks = message.content as readonly { type: string; text?: string }[]
+        const text = blocks
+          .filter((block) => block.type === 'text' && typeof block.text === 'string')
+          .map((block) => block.text ?? '')
+          .join(' ')
+          .replace(/\s+/gu, ' ')
+          .trim()
+        if (text.length > 0) return text.slice(0, 400)
+      }
+    } catch {
+      // A history this process cannot project just means no topic hint.
+      return undefined
+    }
+    return undefined
   }
 
   /** Re-arm injection for one session (used on `clear`/`compact` restarts). */
@@ -1116,6 +1264,7 @@ export class MemoriesRuntime {
       if (window.lastSeq === undefined || window.text.trim().length === 0) return 0
       const root = await this.projectRoot(session)
       const projectLabel = root === undefined ? NO_PROJECT_LABEL : this.store.target('project', root).label
+      const knownTitles = await this.knownTitles(root)
       // A settle-window pass deliberately does NOT inherit the plugin lifecycle
       // signal: the plugin is disposed as the process shuts down, and tying the
       // pass to that signal would abort exactly the pass a one-shot run needs.
@@ -1126,6 +1275,7 @@ export class MemoriesRuntime {
           session,
           window,
           projectLabel,
+          ...knownTitles.length === 0 ? {} : { knownTitles },
           ...this.settings.extractProvider.length > 0 && this.settings.extractModel.length > 0
             ? { provider: this.settings.extractProvider, model: this.settings.extractModel }
             : {},
@@ -1375,6 +1525,10 @@ export class MemoriesRuntime {
       }
       scopes += 1
       archived += await this.retain('project', descriptor.root, now)
+    }
+    const rehomed = await this.store.adoptMisnamedProjects().catch(() => [])
+    for (const move of rehomed) {
+      this.log.decision('dsh-memories: re-homed project scope %s onto %s', move.from, move.to)
     }
     const removed = await this.store.pruneEmptyProjects().catch(() => [])
     for (const slug of removed) {

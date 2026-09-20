@@ -10,10 +10,10 @@
  */
 import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import { MemoriesRuntime } from '../index.js'
+import { MemoriesRuntime, isCatchAllDirectory } from '../index.js'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Session } from '@deepseek-ai/dsh-session'
 
@@ -175,8 +175,99 @@ test('the harness home is not a workspace, so its sessions have no project scope
   t.after(() => rm(workspace, { recursive: true, force: true }))
 })
 
-test('a session with no recorded cwd has no project scope either', async (t) => {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-nocwd-'))
+test('the global section is capped so it cannot bury the project scope', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-cap-'))
+  const workspace = await mkdtemp(join(tmpdir(), 'dsh-memories-ws-'))
+  const runtime = new MemoriesRuntime(stubContext, { memoriesDir: dir, autoExtract: false, globalSummaryEntries: 2 })
+  t.after(() => runtime.dispose())
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  t.after(() => rm(workspace, { recursive: true, force: true }))
+  const agent = stubAgent(stubSession(workspace))
+
+  for (let index = 0; index < 12; index += 1) {
+    await runtime.write(agent.session, { scope: 'global', title: `Portable fact ${index}`, body: 'True everywhere.', tags: [] }, 'auto')
+  }
+  await runtime.write(agent.session, { scope: 'project', title: 'This repo is special', body: 'Only true here.', tags: [] }, 'tool')
+
+  const summary = await runtime.summary(agent.session)
+  assert.ok(summary !== undefined)
+  const [globalPart, projectPart] = summary.split('\n## Project')
+  const globalBullets = (globalPart ?? '').split('\n').filter((line) => line.startsWith('- ') && !line.startsWith('- …'))
+  assert.equal(globalBullets.length, 2, 'the global half stops at its own cap')
+  assert.match(projectPart ?? '', /This repo is special/u, 'and the project half still appears')
+})
+
+test('the global half is bounded in bytes, not only in entries', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-gbytes-'))
+  const workspace = await mkdtemp(join(tmpdir(), 'dsh-memories-ws-'))
+  const runtime = new MemoriesRuntime(stubContext, {
+    memoriesDir: dir,
+    autoExtract: false,
+    globalSummaryEntries: 12,
+    globalSummaryBytes: 700,
+  })
+  t.after(() => runtime.dispose())
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  t.after(() => rm(workspace, { recursive: true, force: true }))
+  const agent = stubAgent(stubSession(workspace))
+
+  // Chinese entries cost about three bytes per character, so a count cap alone
+  // still let the global half take most of a 4 KB block.
+  for (let index = 0; index < 12; index += 1) {
+    await runtime.write(agent.session, {
+      scope: 'global',
+      title: `本机环境事实 ${index}`,
+      body: `这是一条很长的中文背景说明，用来确认真实字节数而不是字符数决定了注入预算的分配。第 ${index} 条。`,
+      tags: [],
+    }, 'auto')
+  }
+  await runtime.write(agent.session, { scope: 'project', title: 'This repo is special', body: 'Only true here.', tags: [] }, 'tool')
+
+  const summary = await runtime.summary(agent.session)
+  assert.ok(summary !== undefined)
+  const [globalPart] = summary.split('\n## Project')
+  assert.ok(Buffer.byteLength(globalPart ?? '', 'utf8') < 1_100, 'the global section stays inside its byte budget')
+  assert.match(summary, /This repo is special/u, 'and the project half is still there')
+})
+
+test('a global draft that names a known workspace is filed with that workspace', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-scopeguard-'))
+  const workspace = await mkdtemp(join(tmpdir(), 'dsh-memories-ws-'))
+  const runtime = new MemoriesRuntime(stubContext, { memoriesDir: dir, autoExtract: false })
+  t.after(() => runtime.dispose())
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  t.after(() => rm(workspace, { recursive: true, force: true }))
+  const agent = stubAgent(stubSession(workspace))
+
+  // The project scope has to exist for the guard to know about this workspace.
+  await runtime.write(agent.session, { scope: 'project', title: 'Repo layout', body: 'Sources under src.', tags: [] }, 'tool')
+
+  // A global memory follows the user into every unrelated project, so a draft
+  // that quotes this workspace's own path belongs to this workspace instead.
+  const misfiled = await runtime.write(agent.session, {
+    scope: 'global',
+    title: 'Invoice export rule',
+    body: `The exporter only reads ${workspace}\\invoices.`,
+    tags: [],
+  }, 'auto')
+  assert.equal(misfiled.entry.scope, 'project', 'the cited path decides the scope')
+
+  // A memory that names no workspace stays global.
+  const portable = await runtime.write(agent.session, {
+    scope: 'global',
+    title: 'Prefer pnpm',
+    body: 'Use pnpm rather than npm.',
+    tags: [],
+  }, 'tool')
+  assert.equal(portable.entry.scope, 'global')
+})
+
+test('the user home directory itself is not a workspace', () => {
+  assert.equal(isCatchAllDirectory(homedir(), 'C:\\harness-home'), true)
+  assert.equal(isCatchAllDirectory(join(homedir(), 'AppData', 'LocalLow', 'SomeGame'), 'C:\\harness-home'), false)
+})
+
+test('a session with no recorded cwd has no project scope either', async (t) => {  const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-nocwd-'))
   const runtime = new MemoriesRuntime(stubContext, { memoriesDir: dir, autoExtract: false })
   t.after(() => runtime.dispose())
   t.after(() => rm(dir, { recursive: true, force: true }))
