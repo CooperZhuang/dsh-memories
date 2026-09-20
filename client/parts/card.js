@@ -202,6 +202,11 @@ const FIELDS = [
     hint: { zh: '上面那个等待翻倍后的上限。', en: 'Upper bound as the wait doubles.' },
   },
   {
+    field: 'snapshotMaxAgeDays', kind: 'number', min: 0, step: 10,
+    label: { zh: '快照记忆保留天数', en: 'Snapshot lifetime (days)' },
+    hint: { zh: '标记为「快照」的记忆（某个时刻的读数：数量、通过率、当前状态）从测量那天算起多少天后归档，与「多久没被读到」无关——过期数字再被读一次也不会变对。0 关闭快照过期。', en: 'Days a memory marked durability=snapshot survives before it is archived, counted from when it was measured rather than from when it was last read. A stale number does not become right by being read. 0 disables snapshot expiry.' },
+  },
+  {
     field: 'extractProvider', kind: 'text',
     label: { zh: '抽取提供方', en: 'Extraction provider' },
     hint: { zh: '抽取用的提供方路由；留空则复用该会话已记录的请求路由。', en: "Provider route for extraction. Empty reuses the session's own logged route." },

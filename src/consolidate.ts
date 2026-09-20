@@ -16,6 +16,8 @@
  * @module dsh-memories/consolidate
  */
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
 import { toMemoryKind } from './types.js'
 import type { MemoryEntry, MemoryDraft, MemoryKind, MemoryScope } from './types.js'
 
@@ -38,7 +40,8 @@ export const CONSOLIDATE_SYSTEM = [
   '- Write every title, body and appliesTo in Simplified Chinese, keeping paths, commands, identifiers and product names exactly as they are. A memory the model wrote in Chinese must not come back in English.',
   '- The injected summary shows only the title and roughly the first 100 characters of the body (the budget forces short previews), so lead with the trigger and the decision; put the detail after. This matters most when merging: the merged body must open with the one thing a future session needs.',
   '- Always provide "appliesTo": a short phrase in the user\'s words saying when the memory matters ("准备推送代码之前"). When you rewrite a memory that already has one, carry it over unless the rewrite makes it wrong.',
-  '- Never record a number that moves on its own (test counts, file or row counts, "ahead by N commits", a version that will be bumped). Record the command that produces the number instead, or mark the value 截至 <date>.',
+  '- Never record a number that moves on its own (test counts, file or row counts, "ahead by N commits", a version that will be bumped). Record the command that produces the number instead, or mark the value 截至 <date>. When a number IS the point of the memory, set "durability":"snapshot" with "asOf" as the date it was measured, and carry both over when you rewrite such a memory.',
+  '- Never change a memory\'s "durability" or "asOf" by omission: a memory that already is a snapshot stays one unless the fact has become durable.',
   '- A problem that is already fixed is recorded as fixed ("已修 in <commit>"); never leave it reading as an open problem.',
   '- Write each body as 1-4 self-contained sentences. Titles are short and imperative.',
   '',
@@ -72,6 +75,8 @@ export const CONSOLIDATE_JSON_SCHEMA = {
           body: { type: 'string' },
           tags: { type: 'array', items: { type: 'string' } },
           appliesTo: { type: 'string' },
+          durability: { type: 'string', enum: ['durable', 'snapshot'] },
+          asOf: { type: 'string' },
         },
       },
     },
@@ -106,7 +111,7 @@ export interface SkillDraft {
 /** One consolidation proposal, already validated against the input. */
 export interface ConsolidationPlan {
   /** Memories to add or replace, keyed by the id they replace (or `undefined` to add). */
-  readonly upserts: readonly { id: string | null; scope: MemoryScope; kind: MemoryKind; title: string; body: string; tags: readonly string[]; keys?: readonly string[]; appliesTo?: string }[]
+  readonly upserts: readonly { id: string | null; scope: MemoryScope; kind: MemoryKind; title: string; body: string; tags: readonly string[]; keys?: readonly string[]; appliesTo?: string; durability?: 'durable' | 'snapshot'; asOf?: number }[]
   /** Ids to delete. */
   readonly retire: readonly string[]
   /** Skill drafts extracted from the memory set. */
@@ -178,6 +183,10 @@ export function parsePlan(text: string, knownIds: ReadonlySet<string>, maxUpsert
     const tags = Array.isArray(entry['tags']) ? entry['tags'].filter((tag): tag is string => typeof tag === 'string') : []
     const keys = Array.isArray(entry['keys']) ? entry['keys'].filter((key): key is string => typeof key === 'string') : []
     const appliesTo = typeof entry['appliesTo'] === 'string' ? entry['appliesTo'].replace(/\s+/gu, ' ').trim().slice(0, 160) : ''
+    // A plan that omits durability must not silently turn a snapshot durable:
+    // the upsert preserves the stored value, so only an explicit field is passed.
+    const snapshot = entry['durability'] === 'snapshot'
+    const parsedAsOf = typeof entry['asOf'] === 'string' ? Date.parse(entry['asOf']) : Number.NaN
     upserts.push({
       id,
       scope,
@@ -187,6 +196,7 @@ export function parsePlan(text: string, knownIds: ReadonlySet<string>, maxUpsert
       tags,
       keys,
       ...appliesTo.length > 0 ? { appliesTo } : {},
+      ...snapshot ? { durability: 'snapshot' as const, ...Number.isFinite(parsedAsOf) ? { asOf: parsedAsOf } : {} } : {},
     })
   }
   const rawRetire = Array.isArray(record['retire']) ? record['retire'] : []
@@ -405,6 +415,74 @@ export interface ConsolidationResult {
   readonly written: number
   readonly retired: number
   readonly notes: string
+}
+
+/** A plan waiting for a human, as stored between passes. */
+export interface PendingPlan {
+  /** The plan itself. */
+  readonly plan: ConsolidationPlan
+  /** Workspace root the plan was prepared for, or `''` for a global-only pass. */
+  readonly projectRoot: string
+  /** When the pass produced it. */
+  readonly at: number
+  /** Scope label shown to the reader. */
+  readonly label: string
+}
+
+/** Where a pending proposal lives, one per store. */
+export function pendingPlanPath(memoriesDir: string): string {
+  return join(memoriesDir, 'pending', 'consolidation.json')
+}
+
+/**
+ * Stage a plan instead of applying it.
+ *
+ * A background pass rewrites memories with no model of what it is destroying: on
+ * a real store one such pass erased the trigger phrase from 32 memories, demoted
+ * 8 hand-written rules to "extracted guess", and turned Chinese titles back into
+ * English — all silently, and all found only in a later audit. A proposal has the
+ * same power and none of the risk: nothing changes until a person says so.
+ *
+ * @param memoriesDir - the store root.
+ * @param pending - the plan and where it came from.
+ */
+export async function writePendingPlan(memoriesDir: string, pending: PendingPlan): Promise<void> {
+  const target = pendingPlanPath(memoriesDir)
+  await mkdir(dirname(target), { recursive: true })
+  await writeFile(target, `${JSON.stringify(pending, undefined, 2)}\n`, 'utf8')
+}
+
+/**
+ * Read the pending proposal, if any.
+ *
+ * @param memoriesDir - the store root.
+ * @returns the proposal, or `undefined` when there is none or it is unreadable.
+ */
+export async function readPendingPlan(memoriesDir: string): Promise<PendingPlan | undefined> {
+  try {
+    const text = await readFile(pendingPlanPath(memoriesDir), 'utf8')
+    const parsed = JSON.parse(text) as PendingPlan
+    if (typeof parsed !== 'object' || parsed === null || typeof parsed.plan !== 'object' || parsed.plan === null) return undefined
+    if (!Array.isArray(parsed.plan.upserts) || !Array.isArray(parsed.plan.retire)) return undefined
+    return parsed
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Drop the pending proposal.
+ *
+ * @param memoriesDir - the store root.
+ * @returns whether one was there.
+ */
+export async function clearPendingPlan(memoriesDir: string): Promise<boolean> {
+  try {
+    await rm(pendingPlanPath(memoriesDir), { force: true })
+    return true
+  } catch {
+    return false
+  }
 }
 
 /**

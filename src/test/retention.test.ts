@@ -43,6 +43,38 @@ function row(partial: Partial<RetentionRow> & Pick<RetentionRow, 'id'>): Retenti
   return { scope: 'global', uses: 0, lastUsedAt: 0, surfacedAt: 0, consolidatedAt: 0, ...partial }
 }
 
+test('a snapshot expires on when it was measured, not on when it was read', () => {
+  const snapshot = entry({
+    id: 'measured',
+    durability: 'snapshot',
+    asOf: NOW - 70 * DAY,
+    createdAt: NOW - 70 * DAY,
+    lastUsedAt: NOW - 1 * DAY,
+    lastSurfacedAt: NOW - 1 * DAY,
+  })
+  const fresh = entry({ id: 'recent', durability: 'snapshot', asOf: NOW - 5 * DAY, createdAt: NOW - 5 * DAY })
+  // Read yesterday, but the reading is 70 days old: being read does not make a
+  // number right again, which is why snapshots do not use the unused clock.
+  const decisions = planRetention([snapshot, fresh], [row({ id: 'measured', lastUsedAt: NOW - DAY })], {
+    maxUnusedDays: 90,
+    snapshotMaxAgeDays: 60,
+    now: NOW,
+  })
+  assert.deepEqual(decisions.map((decision) => decision.id), ['measured'])
+})
+
+test('a snapshot expiry of zero keeps snapshots forever', () => {
+  const snapshot = entry({ id: 'measured', durability: 'snapshot', asOf: NOW - 500 * DAY, createdAt: NOW - 500 * DAY, lastUsedAt: NOW })
+  const decisions = planRetention([snapshot], [], { maxUnusedDays: 90, snapshotMaxAgeDays: 0, now: NOW })
+  assert.deepEqual(decisions, [])
+})
+
+test('a pinned memory is never archived for being unused', () => {
+  const pinned = entry({ id: 'pinned', pinned: true, createdAt: NOW - 400 * DAY })
+  const decisions = planRetention([pinned], [], { maxUnusedDays: 90, snapshotMaxAgeDays: 60, now: NOW })
+  assert.deepEqual(decisions, [], 'a pin is a decision a schedule may not overrule')
+})
+
 test('an entry unused past the limit is archived, and its age is reported', () => {
   const decisions = planRetention([entry({ id: 'old', createdAt: NOW - 100 * DAY })], [], { maxUnusedDays: 90, now: NOW })
   assert.equal(decisions.length, 1)

@@ -8,16 +8,22 @@
  * @module dsh-memories/test/consolidate.test
  */
 import assert from 'node:assert/strict'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import test from 'node:test'
 import { assertObjectJsonSchema } from '@deepseek-ai/dsh-tools'
 import {
   CONSOLIDATE_DENY_TOOLS,
   CONSOLIDATE_JSON_SCHEMA,
+  clearPendingPlan,
   denyToolsFor,
   applyPlan,
   parsePlan,
+  readPendingPlan,
   renderConsolidationInput,
   runConsolidation,
+  writePendingPlan,
 } from '../consolidate.js'
 import type { ConsolidationTarget, SubagentSeam } from '../consolidate.js'
 import type { MemoryDraft, MemoryEntry, MemoryScope } from '../types.js'
@@ -185,6 +191,31 @@ test('runConsolidation reads the structured result when the provider returns one
     signal: new AbortController().signal,
   })
   assert.equal(plan?.upserts[0]?.title, 'From schema')
+})
+
+test('a proposal round-trips through disk and can be dropped', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-pending-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const plan = {
+    upserts: [{ id: 'a', scope: 'global' as const, kind: 'fact' as const, title: 'A', body: 'a', tags: [] }],
+    retire: ['b'],
+    skills: [],
+    notes: 'merged two',
+  }
+  // The proposal is the only artifact a background pass produces: nothing in the
+  // store changes until a person says so.
+  await writePendingPlan(dir, { plan, projectRoot: '', at: 1_700_000_000_000, label: 'global' })
+  const read = await readPendingPlan(dir)
+  assert.equal(read?.plan.retire[0], 'b')
+  assert.equal(read?.label, 'global')
+  assert.equal(await clearPendingPlan(dir), true)
+  assert.equal(await readPendingPlan(dir), undefined)
+})
+
+test('an absent or unreadable proposal reads as none', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-pending2-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  assert.equal(await readPendingPlan(dir), undefined)
 })
 
 test('applyPlan merges and retires through the target', async () => {

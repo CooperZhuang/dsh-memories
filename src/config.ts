@@ -82,6 +82,16 @@ export const DEFAULT_SWEEP_INTERVAL_HOURS = 12
 /** Default days an unused memory survives before it is archived; `0` disables archival. */
 export const DEFAULT_MAX_UNUSED_DAYS = 90
 
+/**
+ * Default days a `snapshot` memory survives before it is archived; `0` disables.
+ *
+ * A reading taken at one moment is wrong from the day after it was taken, and
+ * reading it does not make it right, so it cannot be judged by the unused clock
+ * that a convention is judged by. Sixty days is long enough to be useful as
+ * history and short enough that a stale number stops being quoted.
+ */
+export const DEFAULT_SNAPSHOT_MAX_AGE_DAYS = 60
+
 /** Default share of title/body tokens two memories must have in common to be merged. */
 export const DEFAULT_DEDUPE_SIMILARITY = 0.7
 
@@ -247,6 +257,8 @@ export const MemoriesSettingsSchema = z.object({
   maxEntriesPerScope: z.number().default(DEFAULT_MAX_ENTRIES_PER_SCOPE).description('Stored memories per scope; past this cap the least recently used are deleted.'),
   /** Days an unused memory survives before it is archived. `0` disables archival. */
   maxUnusedDays: z.number().default(DEFAULT_MAX_UNUSED_DAYS).description('Days an unused memory survives before it is archived. Archived entries are recoverable with /memories restore. 0 disables archival.'),
+  /** Days a snapshot memory survives regardless of use. `0` disables. */
+  snapshotMaxAgeDays: z.number().default(DEFAULT_SNAPSHOT_MAX_AGE_DAYS).description('Days a memory marked durability=snapshot survives before it is archived, counted from when it was measured rather than from when it was last read. A stale number is worse than no number, and being read does not make it right. 0 disables snapshot expiry.'),
   /** Token overlap above which a new memory supersedes an existing one. */
   dedupeSimilarity: z.number().default(DEFAULT_DEDUPE_SIMILARITY).description('Share of title and body tokens two memories must have in common before the newer one supersedes the older. 0 keeps only the exact-match rule.'),
   /** Hours between periodic maintenance sweeps. `0` disables the sweep. */
@@ -321,6 +333,7 @@ export const MEMORIES_SETTINGS_DEFAULTS: MemoriesSettings = {
   recallMinTerms: DEFAULT_RECALL_MIN_TERMS,
   maxEntriesPerScope: DEFAULT_MAX_ENTRIES_PER_SCOPE,
   maxUnusedDays: DEFAULT_MAX_UNUSED_DAYS,
+  snapshotMaxAgeDays: DEFAULT_SNAPSHOT_MAX_AGE_DAYS,
   dedupeSimilarity: DEFAULT_DEDUPE_SIMILARITY,
   sweepIntervalHours: DEFAULT_SWEEP_INTERVAL_HOURS,
   autoExtract: true,
@@ -379,6 +392,7 @@ export interface MemoriesConfig {
   summaryFreshSlots?: number
   maxEntriesPerScope?: number
   maxUnusedDays?: number
+  snapshotMaxAgeDays?: number
   dedupeSimilarity?: number
   sweepIntervalHours?: number
   recallMode?: string
@@ -485,6 +499,7 @@ export function normalizeSettings(input: Partial<MemoriesSettings> | undefined):
     recallMinTerms: positive(value.recallMinTerms, DEFAULT_RECALL_MIN_TERMS, 0),
     maxEntriesPerScope: positive(value.maxEntriesPerScope, DEFAULT_MAX_ENTRIES_PER_SCOPE),
     maxUnusedDays: positive(value.maxUnusedDays, DEFAULT_MAX_UNUSED_DAYS, 0),
+    snapshotMaxAgeDays: positive(value.snapshotMaxAgeDays, DEFAULT_SNAPSHOT_MAX_AGE_DAYS, 0),
     dedupeSimilarity: clampUnit(value.dedupeSimilarity, DEFAULT_DEDUPE_SIMILARITY),
     sweepIntervalHours: decimal(value.sweepIntervalHours, DEFAULT_SWEEP_INTERVAL_HOURS),
     autoExtract: value.autoExtract ?? true,

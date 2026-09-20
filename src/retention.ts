@@ -18,6 +18,11 @@ import type { MemoryEntry, MemoryScope, RetentionRow } from './types.js'
 export interface RetentionOptions {
   /** Days an unused memory survives. `0` disables retention entirely. */
   readonly maxUnusedDays: number
+  /**
+   * Days a `snapshot` survives regardless of use. `0` or absent disables
+   * snapshot expiry, which is how the rule behaved before the field existed.
+   */
+  readonly snapshotMaxAgeDays?: number
   /** Clock, injected for deterministic tests. */
   readonly now: number
 }
@@ -74,13 +79,26 @@ export function lastAttention(entry: MemoryEntry, row: RetentionRow | undefined)
  * @returns the entries to archive, longest-unused first.
  */
 export function planRetention(entries: readonly MemoryEntry[], rows: readonly RetentionRow[], options: RetentionOptions): RetentionDecision[] {
-  if (options.maxUnusedDays <= 0) return []
+  const snapshotMaxAgeDays = options.snapshotMaxAgeDays ?? 0
+  if (options.maxUnusedDays <= 0 && snapshotMaxAgeDays <= 0) return []
   const usage = new Map(rows.map((row) => [retentionKey(row.scope, row.id), row]))
   const limitMs = options.maxUnusedDays * 86_400_000
+  const snapshotMs = snapshotMaxAgeDays * 86_400_000
   const decisions: RetentionDecision[] = []
   for (const entry of entries) {
-    if (entry.source === 'user') continue
+    // A pinned memory is a decision a person made; a schedule is not entitled to
+    // overrule it, exactly like a `user`-sourced one.
+    if (entry.source === 'user' || entry.pinned === true) continue
     const attention = lastAttention(entry, usage.get(retentionKey(entry.scope, entry.id)))
+    if (snapshotMaxAgeDays > 0 && entry.durability === 'snapshot') {
+      // Measured against when it was taken, not when it was last read.
+      const ageMs = options.now - (entry.asOf ?? entry.createdAt)
+      if (ageMs > snapshotMs) {
+        decisions.push({ scope: entry.scope, id: entry.id, ageDays: ageMs / 86_400_000 })
+        continue
+      }
+    }
+    if (options.maxUnusedDays <= 0) continue
     const ageMs = options.now - attention
     if (ageMs <= limitMs) continue
     decisions.push({ scope: entry.scope, id: entry.id, ageDays: ageMs / 86_400_000 })

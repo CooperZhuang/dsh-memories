@@ -46,6 +46,27 @@ export interface MemoryEntry {
   readonly keys: readonly string[]
   /** When this memory is worth recalling, in the author's words. */
   readonly appliesTo?: string
+  /**
+   * How long the memory stays true.
+   *
+   * `durable` (the default) is a fact that does not move: a convention, a
+   * command, a design constraint. `snapshot` is a reading taken at one moment —
+   * a count, a pass rate, a state of the world — and is rendered with the date it
+   * was taken and archived once it is old enough, because a stale number is worse
+   * than no number: measured on a real store, 43% of entries carried one.
+   */
+  readonly durability?: MemoryDurability
+  /** When a `snapshot` was measured; ignored for `durable`. */
+  readonly asOf?: number
+  /**
+   * Keep this memory in the injected summary whenever it fits.
+   *
+   * The summary lists a handful of entries out of hundreds, so which ones appear
+   * is normally the ranking's decision. A pin is the user's decision instead: it
+   * is chosen before the fresh slots and before the ranking. Pins compete with
+   * each other only, so a scope cannot be flooded by them.
+   */
+  readonly pinned?: boolean
   /** Id of the memory this one replaces, when it supersedes one. */
   readonly supersedes?: string
   /**
@@ -94,6 +115,36 @@ export type MemoryKind =
 
 /** Every kind, in summary render order (actionable first). */
 export const MEMORY_KINDS: readonly MemoryKind[] = ['preference', 'failure', 'procedure', 'knowledge', 'fact']
+
+/**
+ * How long a memory stays true.
+ *
+ * The distinction exists because a number that was correct when written is the
+ * most dangerous kind of memory: it is specific, it is checkable, and it goes
+ * wrong on its own. A `snapshot` therefore carries the date it was measured and
+ * expires, instead of being repeated forever as though it were a rule.
+ */
+export type MemoryDurability =
+  /** A fact that does not move: a convention, a command, a constraint. */
+  | 'durable'
+  /** A reading taken at one moment: a count, a pass rate, a current state. */
+  | 'snapshot'
+
+/** Every durability value, for validation at the storage seam. */
+export const MEMORY_DURABILITIES: readonly MemoryDurability[] = ['durable', 'snapshot']
+
+/**
+ * Normalize a raw durability value.
+ *
+ * An absent value is `durable`, so every memory written before this field
+ * existed keeps its old meaning without a migration.
+ *
+ * @param value - the raw text, or `undefined`.
+ * @returns the durability.
+ */
+export function toMemoryDurability(value: string | undefined): MemoryDurability {
+  return value === 'snapshot' ? 'snapshot' : 'durable'
+}
 
 /** Heading text for each kind in the injected summary. */
 export const MEMORY_KIND_HEADINGS: Record<MemoryKind, string> = {
@@ -146,6 +197,12 @@ export interface MemoryDraft {
   readonly kind?: MemoryKind
   /** When this memory is worth recalling. */
   readonly appliesTo?: string
+  /** How long the memory stays true; see {@link MemoryEntry.durability}. */
+  readonly durability?: MemoryDurability
+  /** When a `snapshot` was measured. */
+  readonly asOf?: number
+  /** Whether the injected summary must list this memory whenever it fits. */
+  readonly pinned?: boolean
   /** Id of a memory this one replaces. */
   readonly supersedes?: string
   /** Session the draft came from, recorded as {@link MemoryEntry.sourceSession}. */

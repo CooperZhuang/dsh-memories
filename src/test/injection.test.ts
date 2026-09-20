@@ -296,6 +296,58 @@ test('a session with no recorded cwd has no project scope either', async (t) => 
   assert.match(await runtime.stats(session), /project:none: 0 memories/u)
 })
 
+test('an injected memory the turn is about earns a use', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-helped-'))
+  const runtime = new MemoriesRuntime(stubContext, { memoriesDir: dir, autoExtract: false })
+  t.after(() => runtime.dispose())
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const agent = stubAgent(stubSession(dir, [{
+    role: 'user',
+    source: { kind: 'user' },
+    content: [{ type: 'text', text: '发票 OCR 手写字段要怎么补摘？' }],
+  }]))
+
+  const stored = await runtime.write(agent.session, {
+    scope: 'global',
+    title: '发票 OCR 手写字段补摘',
+    body: '按版面语义抽字段，不要用首个正则命中。',
+    tags: ['ocr'],
+  }, 'tool')
+  assert.equal(stored.entry.uses, 0)
+
+  assert.ok(await runtime.injectionFor(agent) !== undefined, 'the block is injected first')
+  await runtime.creditInjectedUse(agent)
+  const after = await runtime.read(agent.session, 'global', stored.entry.id, false)
+  assert.ok((after?.uses ?? 0) >= 1, 'the conversation used the memory it was handed')
+
+  // Once per conversation: later steps must not keep inflating the count.
+  await runtime.creditInjectedUse(agent)
+  const again = await runtime.read(agent.session, 'global', stored.entry.id, false)
+  assert.equal(again?.uses, after?.uses)
+})
+
+test('a turn that only brushes past an injected memory earns nothing', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-helped2-'))
+  const runtime = new MemoriesRuntime(stubContext, { memoriesDir: dir, autoExtract: false })
+  t.after(() => runtime.dispose())
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const agent = stubAgent(stubSession(dir, [{
+    role: 'user',
+    source: { kind: 'user' },
+    content: [{ type: 'text', text: '把这次改动提交一下，然后继续说别的。' }],
+  }]))
+  const stored = await runtime.write(agent.session, {
+    scope: 'global',
+    title: '发票 OCR 手写字段补摘',
+    body: '按版面语义抽字段，不要用首个正则命中。',
+    tags: ['ocr'],
+  }, 'tool')
+  await runtime.injectionFor(agent)
+  await runtime.creditInjectedUse(agent)
+  const after = await runtime.read(agent.session, 'global', stored.entry.id, false)
+  assert.equal(after?.uses, 0, 'a shared common word must not count as use')
+})
+
 test('a scope that has filled up still shows a memory written after it filled', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-saturated-'))
   const runtime = new MemoriesRuntime(stubContext, { memoriesDir: dir, autoExtract: false })

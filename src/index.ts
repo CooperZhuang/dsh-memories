@@ -40,11 +40,12 @@ import { isSubstantiveTurn } from './query.js'
 import { MEMORY_OPEN, rankForSummary, renderEntry, renderHit, renderMemorySummary, renderRecall, renderScopeListing, selectForSummary } from './render.js'
 import type { SummaryScope } from './render.js'
 import { findProjectRoot, isWithin } from './workspace.js'
+import { citationRoots, citationWarning, missingCitations } from './citations.js'
 import { planRetention, retentionKey } from './retention.js'
 import { MemoryLog, createFileSink, createLogExporter, pluginLogger } from './log.js'
 import { collectWindow, runExtraction } from './extract.js'
 import { backgroundDelayMs, extractionDelayMs, formatDelay, parsePeakHours, peakDelayMs } from './schedule.js'
-import { applyPlan, denyToolsFor, runConsolidation, selectForConsolidation } from './consolidate.js'
+import { applyPlan, clearPendingPlan, denyToolsFor, readPendingPlan, runConsolidation, selectForConsolidation, writePendingPlan } from './consolidate.js'
 import { discardDraft, listDrafts, promote, writeDraft } from './skills.js'
 import type { ConsolidationTarget, SubagentSeam } from './consolidate.js'
 import { MEMORY_KINDS } from './types.js'
@@ -183,6 +184,8 @@ export class MemoriesRuntime {
   private readonly recallCounts = new WeakMap<Session, number>()
   /** Entry ids each conversation has already been shown. */
   private readonly surfacedIds = new WeakMap<Session, Set<string>>()
+  /** Injected ids this conversation has already credited as used. */
+  private readonly helpedIds = new WeakMap<Session, Set<string>>()
   private readonly idleTimers = new WeakMap<Agent, NodeJS.Timeout>()
   private readonly extracting = new Set<string>()
   private readonly lifecycle = new AbortController()
@@ -482,13 +485,87 @@ export class MemoriesRuntime {
         : {},
     }))
     const note = await this.draftNote()
+    // Check the citations of what is about to be shown, not of the whole store:
+    // a few paths per session is affordable, and a warning on a bullet nobody
+    // sees is worth nothing.
+    const flags = await this.citationFlags(session, selected.flat()).catch(() => new Map<string, string>())
     const text = renderMemorySummary(scopes, {
       maxBytes: this.settings.maxSummaryBytes,
       maxEntriesPerScope: this.settings.maxSummaryEntries,
       ...note === undefined ? {} : { note },
+      ...flags.size === 0 ? {} : { flags },
     })
     if (text === undefined) return undefined
     return { text, surfaced: selected.flat() }
+  }
+
+  /**
+   * Describe the consolidation proposal waiting for a decision.
+   *
+   * @returns a human-readable summary, or `undefined` when nothing is staged.
+   */
+  async pendingPlan(): Promise<string | undefined> {
+    const pending = await readPendingPlan(this.store.memoriesDir)
+    if (pending === undefined) return undefined
+    const lines = [
+      `Pending consolidation proposal for ${pending.label} (staged ${new Date(pending.at).toISOString()}):`,
+      `  ${pending.plan.upserts.length} memories would be rewritten, ${pending.plan.retire.length} retired.`,
+    ]
+    for (const item of pending.plan.upserts.slice(0, 12)) {
+      lines.push(`  write  ${item.id ?? '(new)'} → ${item.title}`)
+    }
+    for (const id of pending.plan.retire.slice(0, 12)) lines.push(`  retire ${id}`)
+    const extra = pending.plan.upserts.length + pending.plan.retire.length - Math.min(pending.plan.upserts.length, 12) - Math.min(pending.plan.retire.length, 12)
+    if (extra > 0) lines.push(`  … ${extra} more`)
+    lines.push('', pending.plan.notes.length > 0 ? `Agent notes: ${pending.plan.notes}` : 'No agent notes.')
+    lines.push('Apply with /memories apply, drop it with /memories reject.')
+    return lines.join('\n')
+  }
+
+  /**
+   * Apply the pending proposal against the store as it is now.
+   *
+   * The snapshot used for rollback is re-read at apply time rather than taken
+   * from the pass: time passed, and an entry edited since must not be reverted to
+   * a version nobody has.
+   *
+   * @param _parent - the agent asking; the proposal records its own workspace,
+   *   so this is only part of the command surface.
+   * @returns a human-readable summary, or `undefined` when nothing is staged.
+   */
+  async applyPendingPlan(_parent: Agent): Promise<string | undefined> {
+    const pending = await readPendingPlan(this.store.memoriesDir)
+    if (pending === undefined) return undefined
+    const root = pending.projectRoot.length > 0 ? pending.projectRoot : undefined
+    const global = await this.store.list('global', undefined, { fresh: true })
+    const project = root === undefined ? [] : await this.store.list('project', root, { fresh: true })
+    const entries = [...global, ...project]
+    try {
+      const result = await applyPlan(pending.plan, this.consolidationTarget(), root, {
+        entries: entries.filter((entry) => pending.plan.upserts.some((item) => item.id === entry.id) || pending.plan.retire.includes(entry.id)),
+      })
+      this.state.markConsolidated(entries.map((entry) => ({ scope: entry.scope, id: entry.id })))
+      const staged: string[] = []
+      for (const draft of pending.plan.skills) {
+        try {
+          await writeDraft(this.store.memoriesDir, draft)
+          staged.push(draft.name)
+        } catch (error) {
+          this.log.warn('dsh-memories: could not stage skill draft %s: %o', draft.name, error)
+        }
+      }
+      await clearPendingPlan(this.store.memoriesDir)
+      this.log.info('dsh-memories: applied a consolidation proposal: %d written, %d retired', result.written, result.retired)
+      return [
+        `Applied the proposal: ${result.written} written, ${result.retired} retired.`,
+        staged.length > 0 ? `Staged skill drafts: ${staged.join(', ')} (promote with /memories promote <name>).` : '',
+        result.notes,
+      ].filter((line) => line.length > 0).join(' ')
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.log.warn('dsh-memories: applying the proposal failed: %s', message)
+      return `Applying the proposal failed and the store was rolled back: ${message}`
+    }
   }
 
   /**
@@ -504,11 +581,18 @@ export class MemoriesRuntime {
    * @returns the note, or `undefined` when nothing is waiting.
    */
   private async draftNote(): Promise<string | undefined> {
+    const lines: string[] = []
+    const pending = await readPendingPlan(this.store.memoriesDir).catch(() => undefined)
+    if (pending !== undefined) {
+      lines.push(`Pending consolidation proposal for ${pending.label}: ${pending.plan.upserts.length} to write, ${pending.plan.retire.length} to retire — review with /memories plan, then /memories apply or /memories reject.`)
+    }
     const drafts = await listDrafts(this.store.memoriesDir).catch(() => [])
-    if (drafts.length === 0) return undefined
-    const names = drafts.slice(0, 3).map((draft) => draft.name).join(', ')
-    const more = drafts.length > 3 ? `, +${drafts.length - 3} more` : ''
-    return `Pending skill drafts (${drafts.length}): ${names}${more} — promote with /memories promote <name> or discard with /memories discard <name>.`
+    if (drafts.length > 0) {
+      const names = drafts.slice(0, 3).map((draft) => draft.name).join(', ')
+      const more = drafts.length > 3 ? `, +${drafts.length - 3} more` : ''
+      lines.push(`Pending skill drafts (${drafts.length}): ${names}${more} — promote with /memories promote <name> or discard with /memories discard <name>.`)
+    }
+    return lines.length === 0 ? undefined : lines.join(' ')
   }
 
   /**
@@ -649,6 +733,50 @@ export class MemoriesRuntime {
     this.injected.delete(session)
     this.recallCounts.delete(session)
     this.surfacedIds.delete(session)
+    this.helpedIds.delete(session)
+  }
+
+  /**
+   * Credit the injected memories this turn is actually about.
+   *
+   * The ranking's only demand signal used to be "was this memory searched for",
+   * which measures lookup-style knowledge — the entries a session goes looking
+   * for — and misses the ones that were handed over and silently used. Measured
+   * on a real store, the top-read memories were all of the first kind, and the
+   * six rules a person had written were never read at all.
+   *
+   * The gate is the same credit rule the recall path uses, deliberately: a mere
+   * shared word must not count, or every injected memory would earn a use in
+   * every conversation and the signal would be worthless. Each entry is credited
+   * at most once per conversation.
+   *
+   * @param agent - the agent whose next step is being prepared.
+   */
+  async creditInjectedUse(agent: Agent): Promise<void> {
+    const session = agent.session
+    const injected = this.surfacedIds.get(session)
+    if (injected === undefined || injected.size === 0) return
+    if (this.sessionOff(session)) return
+    const credited = this.helpedIds.get(session) ?? new Set<string>()
+    this.helpedIds.set(session, credited)
+    const pending = [...injected].filter((id) => !credited.has(id))
+    if (pending.length === 0) return
+    const query = this.latestUserText(session)
+    if (query === undefined || !isSubstantiveTurn(query)) return
+    const root = await this.projectRoot(session)
+    const states = await this.allScopes(session)
+    for (const state of states) {
+      for (const entry of state.entries) {
+        if (!pending.includes(entry.id)) continue
+        const why = explainEntry(entry, query)
+        const distinctive = why.relevance >= this.settings.recallMinScore * QUALIFIED_SCORE_FACTOR
+        const strong = why.evidence.phrase || why.evidence.strongTerms >= this.settings.recallMinTerms
+        if (!distinctive || !strong) continue
+        credited.add(entry.id)
+        this.log.decision('dsh-memories: injected memory %s was used by the conversation (relevance %d)', entry.id, why.relevance)
+        await this.touchEntry(entry, state.scope === 'project' ? root : undefined)
+      }
+    }
   }
 
   /**
@@ -1385,9 +1513,10 @@ export class MemoriesRuntime {
    * broken pass never damages the store and never retries in a hot loop.
    *
    * @param parent - an agent whose subagent seam and lineage the pass uses.
+   * @param options - `apply` writes the result; the default only proposes it.
    * @returns a human-readable summary, or `undefined` when nothing ran.
    */
-  async consolidateNow(parent: Agent): Promise<string | undefined> {
+  async consolidateNow(parent: Agent, options: { apply?: boolean } = {}): Promise<string | undefined> {
     if (!this.settings.consolidate) return undefined
     const seam = this.subagents
     if (seam === undefined) return undefined
@@ -1437,6 +1566,20 @@ export class MemoriesRuntime {
       if (plan === undefined) {
         this.state.deleteJob(CONSOLIDATE_JOB)
         return undefined
+      }
+      // A pass the user typed applies; a pass nothing asked for only proposes.
+      // The difference is the whole point: a silent rewrite has no model of what
+      // it is destroying, and one such pass on a real store erased 32 trigger
+      // phrases and demoted 8 hand-written rules before anyone noticed.
+      if (options.apply !== true) {
+        const label = root === undefined ? NO_PROJECT_LABEL : this.store.target('project', root).label
+        await writePendingPlan(this.store.memoriesDir, { plan, projectRoot: root ?? '', at: Date.now(), label })
+        this.state.markConsolidated(entries.map((entry) => ({ scope: entry.scope, id: entry.id })))
+        this.state.deleteJob(CONSOLIDATE_JOB)
+        this.state.clearLimit()
+        this.log.info('dsh-memories: staged a consolidation proposal (%d upserts, %d retires) for %s',
+          plan.upserts.length, plan.retire.length, parent.session.id)
+        return `Staged a consolidation proposal for ${entries.length} memories: ${plan.upserts.length} to write, ${plan.retire.length} to retire. Nothing changed yet — review with /memories plan, then /memories apply or /memories reject.`
       }
       const result = await applyPlan(plan, this.consolidationTarget(), root, { entries })
       // Record the review, so the next pass starts from whatever has waited
@@ -1562,9 +1705,14 @@ export class MemoriesRuntime {
    */
   private async retain(scope: MemoryScope, root: string | undefined, now: number): Promise<number> {
     const days = this.settings.maxUnusedDays
-    if (days <= 0) return 0
+    const snapshotDays = this.settings.snapshotMaxAgeDays
+    if (days <= 0 && snapshotDays <= 0) return 0
     const entries = await this.store.list(scope, root, { fresh: true })
-    const expired = planRetention(entries, this.state.retentionRows(), { maxUnusedDays: days, now })
+    const expired = planRetention(entries, this.state.retentionRows(), {
+      maxUnusedDays: days,
+      snapshotMaxAgeDays: snapshotDays,
+      now,
+    })
     let archived = 0
     for (const decision of expired) {
       this.log.decision('dsh-memories: archiving %s/%s, unused for %d days', decision.scope, decision.id, Math.round(decision.ageDays))
@@ -1703,9 +1851,63 @@ export class MemoriesRuntime {
     return lines.join('\n')
   }
 
+  /**
+   * Warning text for the entries a summary is about to list.
+   *
+   * Only the entries that actually reach the model are checked, which is what
+   * makes a filesystem check affordable on every injection: a handful of paths
+   * instead of the whole store. Roots are the workspace the session is in plus
+   * the harness home, because a memory states paths relative to the repository it
+   * is about.
+   *
+   * @param session - session whose summary is being built.
+   * @param entries - the entries the summary will list.
+   * @returns entry id → warning clause, empty when nothing is stale.
+   */
+  private async citationFlags(session: Session, entries: readonly MemoryEntry[]): Promise<Map<string, string>> {
+    const flags = new Map<string, string>()
+    if (entries.length === 0) return flags
+    const roots = citationRoots(await this.projectRoot(session), [this.deployment.dshHome])
+    if (roots.length === 0) return flags
+    for (const entry of entries) {
+      const warning = citationWarning(missingCitations(entry.body, roots))
+      if (warning.length > 0) flags.set(entry.id, warning)
+    }
+    return flags
+  }
+
+  /**
+   * List every memory that cites a file which no longer resolves.
+   *
+   * The injected block only warns about what it is showing; this is the full
+   * sweep, so a stale reference can be found and fixed before it misleads a
+   * session that never happened to list it.
+   *
+   * @param session - session whose scopes to scan.
+   * @returns a human-readable report.
+   */
+  async stale(session: Session): Promise<string> {
+    const states = await this.allScopes(session)
+    const roots = citationRoots(await this.projectRoot(session), [this.deployment.dshHome])
+    const lines: string[] = []
+    let flagged = 0
+    for (const state of states) {
+      for (const entry of state.entries) {
+        const missing = missingCitations(entry.body, roots)
+        if (missing.length === 0) continue
+        flagged += 1
+        lines.push(`[${state.label}] ${entry.title}`)
+        lines.push(`  id: ${entry.id}`)
+        lines.push(`  找不到: ${missing.join('  ')}`)
+      }
+    }
+    if (flagged === 0) return `No stale citations: every cited path resolves under ${roots.length} known root(s).`
+    return [`${flagged} memories cite a path that no longer resolves:`, ...lines,
+      '', 'These paths were true when the memory was written. Verify before acting on them, and rewrite the memory (memory action=write, same title) once you know the current path.'].join('\n')
+  }
+
   /** Render one scope's entries for a human-facing command. */
-  async list(session: Session, scope: MemoryScope): Promise<string> {
-    const state = await this.scopeState(scope, session)
+  async list(session: Session, scope: MemoryScope): Promise<string> {    const state = await this.scopeState(scope, session)
     return renderScopeListing({ scope: state.scope, label: state.label, entries: state.entries })
   }
 
@@ -1776,8 +1978,12 @@ function helpText(): string {
     '  restore <id>            bring an archived memory back',
     '  mode [on|off]           switch memory off or on for this session',
     '  mine                    extract memories from this session now',
-    '  consolidate             merge and reconcile all memories now',
+    '  consolidate             propose a merge/reconcile pass (nothing changes until /memories apply)',
+    '  plan                    show the pending consolidation proposal',
+    '  apply                   apply the pending consolidation proposal',
+    '  reject                  discard the pending consolidation proposal',
     '  sweep                   archive unused memories now',
+    '  stale                   list memories that cite a file that no longer exists',
     '  skills                  list staged skill drafts',
     '  promote <name>          copy a staged draft into the harness skill root',
     '  discard <name>          delete a staged draft',
@@ -1970,6 +2176,11 @@ export function apply(ctx: Context, config: MemoriesConfig = {}): void {
     const addition: UserMessage[] = []
     const summary = await runtime.injectionFor(agent)
     if (summary !== undefined) addition.push(summary)
+    // Credit the memories the block already handed over and this turn is now
+    // actually about. Without it the only "demand" signal the ranking has is a
+    // search hit, which measures lookup-style knowledge and misses the memory
+    // that was injected and used.
+    await runtime.creditInjectedUse(agent)
     // The on-demand delta is a second, independent decision: a conversation can
     // already carry the summary and still meet a memory that only matters now.
     const delta = await runtime.recallFor(agent)
@@ -1994,6 +2205,8 @@ async function handleCommand(runtime: MemoriesRuntime, invocation: CommandInvoca
       return { kind: 'success', text: helpText() }
     case 'stats':
       return { kind: 'success', text: await runtime.stats(session) }
+    case 'stale':
+      return { kind: 'success', text: await runtime.stale(session) }
     case 'list': {
       const scope = rest.trim().toLowerCase()
       if (scope === 'global' || scope === 'project') return { kind: 'success', text: await runtime.list(session, scope) }
@@ -2077,8 +2290,20 @@ async function handleCommand(runtime: MemoriesRuntime, invocation: CommandInvoca
     case 'off':
       return { kind: 'success', text: runtime.setSessionMode(session, 'off') }
     case 'consolidate': {
-      const summary = await runtime.consolidateNow(invocation.agent)
+      const summary = await runtime.consolidateNow(invocation.agent, { apply: false })
       return { kind: 'success', text: summary ?? 'Nothing to consolidate (cooldown active, too few memories, or no subagent support).' }
+    }
+    case 'plan': {
+      const pending = await runtime.pendingPlan()
+      return { kind: 'success', text: pending ?? 'No consolidation proposal is waiting.' }
+    }
+    case 'apply': {
+      const summary = await runtime.applyPendingPlan(invocation.agent)
+      return { kind: 'success', text: summary ?? 'No consolidation proposal is waiting.' }
+    }
+    case 'reject': {
+      const dropped = await clearPendingPlan(runtime.store.memoriesDir)
+      return { kind: 'success', text: dropped ? 'Discarded the pending consolidation proposal. The store is unchanged.' : 'No consolidation proposal is waiting.' }
     }
     case 'mine': {
       const count = await runtime.mineNow(invocation.agent)

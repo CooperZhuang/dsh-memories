@@ -24,7 +24,7 @@ import { createHash } from 'node:crypto'
 import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, join, relative, resolve } from 'node:path'
 import type { MemoryDraft, MemoryEntry, MemoryScope, ScopeTarget, UpsertResult } from './types.js'
-import { toMemoryKind } from './types.js'
+import { toMemoryDurability, toMemoryKind } from './types.js'
 
 /** Frontmatter fence used by every entry file. */
 const FENCE = '---'
@@ -127,6 +127,9 @@ export function formatEntry(entry: MemoryEntry): string {
     tags,
     ...keys === undefined ? [] : [keys],
     ...entry.appliesTo !== undefined && entry.appliesTo.length > 0 ? [`appliesTo: ${entry.appliesTo}`] : [],
+    ...entry.durability === 'snapshot' ? ['durability: snapshot'] : [],
+    ...entry.durability === 'snapshot' && entry.asOf !== undefined ? [`asOf: ${new Date(entry.asOf).toISOString()}`] : [],
+    ...entry.pinned === true ? ['pinned: true'] : [],
     ...entry.supersedes !== undefined && entry.supersedes.length > 0 ? [`supersedes: ${entry.supersedes}`] : [],
     ...entry.sourceSession !== undefined && entry.sourceSession.length > 0 ? [`session: ${entry.sourceSession}`] : [],
     `created: ${new Date(entry.createdAt).toISOString()}`,
@@ -181,6 +184,9 @@ export function parseEntry(text: string, scope: MemoryScope, fallbackId: string)
   const updatedAt = parseTime(fields.get('updated'), Date.now())
   const rawUses = Number(fields.get('uses') ?? '0')
   const appliesTo = fields.get('appliesto')
+  const durability = toMemoryDurability(fields.get('durability'))
+  const asOf = parseTime(fields.get('asof'), 0)
+  const pinned = fields.get('pinned') === 'true'
   const supersedes = fields.get('supersedes')
   const sourceSession = fields.get('session')
   const keys = (fields.get('keys') ?? '').split(',').map(normalizeKey).filter((key) => key.length > 0)
@@ -195,6 +201,8 @@ export function parseEntry(text: string, scope: MemoryScope, fallbackId: string)
     tags: (fields.get('tags') ?? '').split(',').map(normalizeTag).filter((tag) => tag.length > 0),
     keys,
     ...appliesTo !== undefined && appliesTo.length > 0 ? { appliesTo } : {},
+    ...durability === 'snapshot' ? { durability, ...asOf > 0 ? { asOf } : {} } : {},
+    ...pinned ? { pinned: true } : {},
     ...supersedes !== undefined && supersedes.length > 0 ? { supersedes } : {},
     ...sourceSession !== undefined && sourceSession.length > 0 ? { sourceSession } : {},
     createdAt: parseTime(fields.get('created'), updatedAt),
@@ -851,6 +859,12 @@ export class MemoryStore {
     // "meant to remove". A caller that really wants it gone can pass an empty
     // string, which is explicit.
     const appliesTo = draft.appliesTo === undefined ? existing?.appliesTo?.trim() : draft.appliesTo.trim()
+    // Same rule as `appliesTo`: an omitted field means "unchanged". A snapshot
+    // that a rewrite turned durable (or the reverse) has to say so explicitly,
+    // and `durability: 'durable'` is how a caller clears it.
+    const durability = draft.durability ?? existing?.durability ?? 'durable'
+    const asOf = durability === 'snapshot' ? (draft.asOf ?? existing?.asOf) : undefined
+    const pinned = draft.pinned ?? existing?.pinned ?? false
     const sourceSession = draft.sourceSession?.trim() ?? existing?.sourceSession
     // An explicit `supersedes` always wins; otherwise a near-identical memory
     // already in the scope is treated as the thing this one rewrites, so a
@@ -870,6 +884,8 @@ export class MemoryStore {
       tags,
       keys,
       ...appliesTo !== undefined && appliesTo.length > 0 ? { appliesTo } : {},
+      ...durability === 'snapshot' ? { durability, ...asOf === undefined || asOf <= 0 ? { asOf: now } : { asOf } } : {},
+      ...pinned ? { pinned: true } : {},
       ...supersedes !== undefined && supersedes.length > 0 ? { supersedes } : {},
       // Provenance survives a rewrite: a consolidation that re-words an entry
       // must not erase which conversation it came from.

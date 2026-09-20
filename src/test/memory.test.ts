@@ -472,6 +472,32 @@ test('every entry is listed when a scope fits, and nothing is listed at zero', (
   assert.deepEqual(selectForSummary(entries, 0, { freshSlots: 2, now }), [])
 })
 
+test('a pinned memory is listed even when the ranking would leave it out', () => {
+  const now = 1_000_000_000_000
+  const incumbents = Array.from({ length: 20 }, (_, index) => entry({
+    id: `old-${index}`, scope: 'global', title: `Old ${index}`, body: 'well read history',
+    updatedAt: now, lastUsedAt: now, lastSurfacedAt: now, uses: 6,
+  }))
+  const rule = entry({
+    id: 'the-rule', scope: 'global', title: 'Never break the prompt cache', body: 'only append',
+    updatedAt: now - 400 * 86_400_000, pinned: true, uses: 0,
+  })
+  const ranked = rankForSummary([...incumbents, rule], now)
+  assert.ok(ranked.findIndex((value) => value.id === 'the-rule') >= 5, 'the ranking alone keeps it out')
+  const selected = selectForSummary([...incumbents, rule], 5, { freshSlots: 0, now })
+  assert.equal(selected[0]?.id, 'the-rule', 'a pin is chosen before the ranking and before the fresh slots')
+})
+
+test('pins compete only with each other, so they cannot take the whole list', () => {
+  const now = 1_000_000_000_000
+  const pinned = Array.from({ length: 9 }, (_, index) => entry({
+    id: `pin-${index}`, scope: 'global', title: `Pin ${index}`, body: 'pinned', updatedAt: now - index * 1_000, pinned: true,
+  }))
+  const selected = selectForSummary(pinned, 4, { freshSlots: 1, now })
+  assert.equal(selected.length, 4, 'the cap still bounds the section')
+  assert.ok(selected.every((value) => value.pinned === true))
+})
+
 test('a summary note is carried inside the byte budget', () => {
   const scopes = [{
     label: 'global',

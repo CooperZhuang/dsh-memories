@@ -44,10 +44,17 @@ function preview(body: string, maxChars: number): string {
 }
 
 /** Format one entry as a summary bullet. */
-function bullet(entry: MemoryEntry, maxChars: number): string {
+function bullet(entry: MemoryEntry, maxChars: number, flag?: string): string {
   const age = new Date(entry.updatedAt).toISOString().slice(0, 10)
   const tags = entry.tags.length > 0 ? ` [${entry.tags.slice(0, 4).join(', ')}]` : ''
-  return `- ${entry.title}${tags} (${age}) — ${preview(entry.body, maxChars)}`
+  // A snapshot says when it was taken, and a pin says the listing is not the
+  // ranking's decision: both change how the line should be read.
+  const stamp = entry.durability === 'snapshot'
+    ? ` (${new Date(entry.asOf ?? entry.updatedAt).toISOString().slice(0, 10)} 快照)`
+    : ` (${age})`
+  const pin = entry.pinned === true ? '📌 ' : ''
+  const warn = flag === undefined || flag.length === 0 ? '' : ` · ${flag}`
+  return `- ${pin}${entry.title}${tags}${stamp} — ${preview(entry.body, maxChars)}${warn}`
 }
 
 /**
@@ -148,6 +155,15 @@ export function selectForSummary(
   const reserve = Math.max(0, Math.min(options.freshSlots ?? 0, perScope - 1))
   const chosen: MemoryEntry[] = []
   const chosenIds = new Set<string>()
+  // Pins first: a person asked for these by name, so which of them appears is not
+  // the ranking's call. They compete only with each other, so a scope cannot be
+  // flooded by pinning everything.
+  for (const entry of ranked) {
+    if (chosen.length >= perScope) break
+    if (entry.pinned !== true) continue
+    chosen.push(entry)
+    chosenIds.add(entry.id)
+  }
   if (reserve > 0) {
     // Among never-surfaced entries, prefer a deliberately written one, then one
     // this conversation actually names, then the newest. Without the topical
@@ -168,10 +184,15 @@ export function selectForSummary(
         || (relevance.get(right.id) ?? 0) - (relevance.get(left.id) ?? 0)
         || recencyOf(right) - recencyOf(left)
         || left.title.localeCompare(right.title))
+    // The reservation is a count of its own, on top of whatever the pins took,
+    // and it may never push the section past its cap.
+    let fresh = 0
     for (const entry of unseen) {
-      if (chosen.length >= reserve) break
+      if (fresh >= reserve || chosen.length >= perScope) break
+      if (chosenIds.has(entry.id)) continue
       chosen.push(entry)
       chosenIds.add(entry.id)
+      fresh += 1
     }
   }
   for (const entry of ranked) {
@@ -232,6 +253,15 @@ export interface SummaryOptions {
    * other line, so it can never push the block past its budget.
    */
   readonly note?: string
+  /**
+   * Per-entry warning appended to a bullet, keyed by entry id.
+   *
+   * The caller checks what it is about to show (a handful of entries) rather than
+   * the whole store, so this is affordable on every injection. Today it carries
+   * "this memory cites a file that no longer exists" — the failure mode that
+   * wastes a session's turn by sending it to a path that is gone.
+   */
+  readonly flags?: ReadonlyMap<string, string>
 }
 
 /**
@@ -279,7 +309,7 @@ export function renderMemorySummary(scopes: readonly SummaryScope[], options: Su
       const heading = `### ${MEMORY_KIND_HEADINGS[kind]}`
       const kept: string[] = []
       for (const entry of group) {
-        const line = bullet(entry, maxChars)
+        const line = bullet(entry, maxChars, options.flags?.get(entry.id))
         const cost = bytes(line) + 1 + (kept.length === 0 ? bytes(heading) + 1 : 0)
         // Only the section's very first bullet bypasses the budget, so a scope
         // with something to say never renders as an empty heading. Every later

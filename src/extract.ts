@@ -38,6 +38,7 @@ export const EXTRACT_SYSTEM = [
   'Write every title and body in Simplified Chinese. Keep paths, commands, identifiers, product names and error strings exactly as they are.',
   'The injected summary shows only the title and roughly the first 100 characters of the body (the budget forces short previews), so lead with the trigger and the decision; put the detail after.',
   'Never record a number that moves on its own (test counts, file or row counts, "ahead by N commits", a version that will be bumped). Record the command that produces the number instead, or mark the value 截至 <date>.',
+  'When a number IS the point of the memory (a measured pass rate, a corpus size, the current state of a system), set "durability":"snapshot" and give "asOf" as the date it was measured; it is then shown with that date and retired once it is old. Everything else is "durable" and needs neither field.',
   'A problem that is already fixed is recorded as fixed ("已修 in <commit>"); never leave it reading as an open problem.',
   '',
   'Choose the scope of each memory:',
@@ -80,6 +81,8 @@ export const EXTRACT_JSON_SCHEMA = {
           tags: { type: 'array', items: { type: 'string' } },
           keys: { type: 'array', items: { type: 'string' } },
           appliesTo: { type: 'string' },
+          durability: { type: 'string', enum: ['durable', 'snapshot'] },
+          asOf: { type: 'string' },
         },
       },
     },
@@ -237,6 +240,10 @@ export function parseExtraction(text: string, maxMemories: number, sessionId: st
     const appliesTo = typeof record['appliesTo'] === 'string'
       ? redactSecrets(record['appliesTo'].replace(/\s+/gu, ' ').trim()).slice(0, 160)
       : ''
+    // A snapshot without a date cannot be judged later, so it gets one: the
+    // extractor's own claim if it parsed, otherwise the moment of extraction.
+    const snapshot = record['durability'] === 'snapshot'
+    const parsedAsOf = typeof record['asOf'] === 'string' ? Date.parse(record['asOf']) : Number.NaN
     usable.push({
       scope: scope as MemoryScope,
       kind: toMemoryKind(record['kind']),
@@ -245,6 +252,7 @@ export function parseExtraction(text: string, maxMemories: number, sessionId: st
       tags,
       keys,
       ...appliesTo.length > 0 ? { appliesTo } : {},
+      ...snapshot ? { durability: 'snapshot' as const, asOf: Number.isFinite(parsedAsOf) ? parsedAsOf : Date.now() } : {},
       sourceSession: sessionId,
     })
   }

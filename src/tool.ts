@@ -114,6 +114,19 @@ export function registerMemoryTool(ctx: Context, runtime: MemoriesRuntime): () =
         type: 'string',
         description: 'write: a short phrase saying when this memory matters, when the title does not make it obvious.',
       },
+      durability: {
+        type: 'string',
+        enum: ['durable', 'snapshot'],
+        description: 'write: how long this memory stays true. durable (default) is a fact that does not move — a convention, a command, a constraint. snapshot is a reading taken at one moment — a count, a pass rate, the state of a system — and is listed with the date it was taken and archived once it is old. Use snapshot instead of writing a number as if it were a rule.',
+      },
+      asOf: {
+        type: 'string',
+        description: 'write: for durability=snapshot, when the reading was taken (ISO date or epoch ms). Defaults to now.',
+      },
+      pinned: {
+        type: 'boolean',
+        description: 'write: keep this memory in the injected summary whenever it fits, ahead of what the ranking would choose. For the few rules that must be visible in every session; pinned memories are also never archived for being unused.',
+      },
       query: {
         type: 'string',
         description: 'search: what to look for. Empty lists the most recent memories.',
@@ -149,6 +162,10 @@ export function registerMemoryTool(ctx: Context, runtime: MemoriesRuntime): () =
           const body = args.body?.trim()
           if (title === undefined || title.length === 0) throw new Error('dsh-memories: write requires a non-empty title')
           if (body === undefined || body.length === 0) throw new Error('dsh-memories: write requires a non-empty body')
+          const asOf = args.asOf === undefined ? undefined : Date.parse(args.asOf)
+          if (args.asOf !== undefined && !Number.isFinite(asOf)) {
+            throw new Error('dsh-memories: asOf must be an ISO date or epoch milliseconds')
+          }
           const result = await runtime.write(session, {
             scope: args.scope,
             title: title.slice(0, 120),
@@ -157,6 +174,9 @@ export function registerMemoryTool(ctx: Context, runtime: MemoriesRuntime): () =
             ...args.kind === undefined ? {} : { kind: args.kind },
             ...args.keys === undefined ? {} : { keys: args.keys },
             ...args.appliesTo === undefined ? {} : { appliesTo: args.appliesTo },
+            ...args.durability === undefined ? {} : { durability: args.durability },
+            ...asOf === undefined ? {} : { asOf },
+            ...args.pinned === undefined ? {} : { pinned: args.pinned },
           }, 'tool')
           // The runtime may have stored a project draft globally: a session with
           // no workspace of its own has no project scope, and reporting the scope
