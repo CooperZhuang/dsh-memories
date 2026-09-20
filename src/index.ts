@@ -571,8 +571,13 @@ export class MemoriesRuntime {
     if (summary === undefined) return undefined
     this.injected.add(session)
     await this.markSurfaced(session, summary.surfaced)
-    this.log.info('dsh-memories: injected the summary into session %s (%d bytes, %d entries)',
-      session.id, Buffer.byteLength(summary.text, 'utf8'), summary.surfaced.length)
+    // Report what the block actually SHOWS, not how many entries were offered:
+    // the two differ by design (the byte budget drops the tail), and a log that
+    // counts the selection makes a working budget look like a broken one.
+    const listed = summary.text.split('\n')
+      .filter((line) => line.startsWith('- ') && !line.startsWith('- …')).length
+    this.log.info('dsh-memories: injected the summary into session %s (%d bytes, %d entries listed of %d selected)',
+      session.id, Buffer.byteLength(summary.text, 'utf8'), listed, summary.surfaced.length)
     return createUserMessage({
       content: [{ type: 'text', text: summary.text }],
       source: { kind: 'plugin', plugin: name, form: 'recall' },
