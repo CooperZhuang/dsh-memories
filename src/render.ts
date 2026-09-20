@@ -301,10 +301,24 @@ export function renderMemorySummary(scopes: readonly SummaryScope[], options: Su
     const lines = [`## ${scope.heading} (${scope.total})`]
     let used = bytes(lines[0] ?? '')
     let shown = 0
+    // Pinned entries come first, before the kind grouping. The selection puts
+    // them first, but grouping by kind would re-order them back to the end of
+    // their kind — and the byte budget drops from the end, so a pinned overview
+    // (kind `fact`) was exactly the bullet that got cut. A pin is a promise that
+    // the entry is listed whenever it fits, so it cannot be the first casualty.
+    const pinned = listed.filter((entry) => entry.pinned === true)
+    for (const entry of pinned) {
+      const line = bullet(entry, maxChars, options.flags?.get(entry.id))
+      const cost = bytes(line) + 1
+      if (shown > 0 && used + cost > budget) break
+      lines.push(line)
+      used += cost
+      shown += 1
+    }
     // Within a scope, group by kind so the actionable memories (a preference
     // to follow, a failure to avoid) are not buried among background facts.
     for (const kind of MEMORY_KINDS) {
-      const group = listed.filter((entry) => entry.kind === kind)
+      const group = listed.filter((entry) => entry.kind === kind && entry.pinned !== true)
       if (group.length === 0) continue
       const heading = `### ${MEMORY_KIND_HEADINGS[kind]}`
       const kept: string[] = []

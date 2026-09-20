@@ -498,6 +498,28 @@ test('pins compete only with each other, so they cannot take the whole list', ()
   assert.ok(selected.every((value) => value.pinned === true))
 })
 
+test('a pinned entry survives the kind grouping, which would otherwise drop it', () => {
+  const now = 1_000_000_000_000
+  const overview = entry({
+    id: 'overview', scope: 'project', kind: 'fact', title: '项目概览：本仓库',
+    body: '这是一个很长的概览正文，用来把预算吃掉一部分。'.repeat(6), pinned: true, updatedAt: now,
+  })
+  const others = Array.from({ length: 12 }, (_, index) => entry({
+    id: `pref-${index}`, scope: 'project', kind: 'preference', title: `约定 ${index}`,
+    body: '一条偏好。'.repeat(20), updatedAt: now - index,
+  }))
+  const text = renderMemorySummary([{
+    label: 'project',
+    heading: 'Project memories',
+    entries: selectForSummary([...others, overview], 12, { freshSlots: 0, now }),
+    total: others.length + 1,
+  }], { maxBytes: 1_400, maxEntriesPerScope: 12 })
+  assert.ok(text !== undefined)
+  // Facts render last and the budget drops from the end: before the fix the
+  // pinned overview was exactly the bullet that disappeared.
+  assert.match(text, /📌 项目概览：本仓库/u, 'a pinned bullet is rendered first and cannot be cut')
+})
+
 test('a summary note is carried inside the byte budget', () => {
   const scopes = [{
     label: 'global',
