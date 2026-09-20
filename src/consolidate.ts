@@ -32,9 +32,14 @@ export const CONSOLIDATE_SYSTEM = [
   'Rules:',
   '- Preserve every id you keep. A returned memory with an existing id REPLACES that memory; a new id ADDS one.',
   '- Prefer fewer, sharper memories. Never invent facts that are not in the input.',
-  '- Keep scope honest: a fact that is only true in one workspace stays "project"; a durable user preference or general tooling fact is "global".',
+  '- Keep scope honest: a fact that is only true in one workspace stays "project"; a durable user preference or general tooling fact is "global". A fact that names a specific employer, product, customer, repository path, drive letter or internal host is NEVER global.',
   '- Keep the kind honest: "preference" for how the user wants work done, "failure" for something that went wrong, "procedure" for an ordered recipe, "knowledge" for a non-obvious technique, "fact" for background.',
   '- Do not record secrets, credentials, transient task state, or restatements of code.',
+  '- Write every title, body and appliesTo in Simplified Chinese, keeping paths, commands, identifiers and product names exactly as they are. A memory the model wrote in Chinese must not come back in English.',
+  '- The injected summary shows only the title and roughly the first 200 characters of the body, so lead with the trigger and the decision; put the detail after. This matters most when merging: the merged body must open with the one thing a future session needs.',
+  '- Always provide "appliesTo": a short phrase in the user\'s words saying when the memory matters ("准备推送代码之前"). When you rewrite a memory that already has one, carry it over unless the rewrite makes it wrong.',
+  '- Never record a number that moves on its own (test counts, file or row counts, "ahead by N commits", a version that will be bumped). Record the command that produces the number instead, or mark the value 截至 <date>.',
+  '- A problem that is already fixed is recorded as fixed ("已修 in <commit>"); never leave it reading as an open problem.',
   '- Write each body as 1-4 self-contained sentences. Titles are short and imperative.',
   '',
   'When two or more memories together describe a repeatable procedure that would be worth running again, also return it as a skill: a short kebab-case name, a one-line description, and the ordered steps. Skills are drafts a human promotes; return at most 2.',
@@ -55,7 +60,7 @@ export const CONSOLIDATE_JSON_SCHEMA = {
       items: {
         type: 'object',
         additionalProperties: false,
-        required: ['scope', 'title', 'body'],
+        required: ['scope', 'title', 'body', 'appliesTo'],
         properties: {
           // A nullable field must be spelled with `oneOf`: the harness schema
           // subset rejects `type: ["string", "null"]`, and a rejected schema
@@ -427,8 +432,27 @@ export async function applyPlan(
   const archived: { scope: MemoryScope; id: string }[] = []
   try {
     for (const item of plan.upserts) {
-      const draft: MemoryDraft = { scope: item.scope, title: item.title, body: item.body, tags: item.tags, keys: item.keys ?? [] }
-      const result = await target.upsert(draft, item.scope === 'project' ? projectRoot : undefined, 'auto', item.id ?? undefined)
+      // A rewrite keeps the provenance of what it rewrites. Stamping every
+      // consolidation result `auto` demotes memories a person wrote: `auto` is
+      // the extractor's guess, `tool`/`user` is somebody's statement, and the
+      // distinction carries a ranking bonus and an exemption from retention.
+      // Measured on a real store, one consolidation run demoted the user's own
+      // "never break the prompt cache" rule to `auto`, which is what a guess is.
+      const previous = item.id === null ? undefined : before.get(`${item.scope}\u0000${item.id}`)
+      const draft: MemoryDraft = {
+        scope: item.scope,
+        title: item.title,
+        body: item.body,
+        tags: item.tags,
+        keys: item.keys ?? [],
+        ...item.appliesTo === undefined ? {} : { appliesTo: item.appliesTo },
+      }
+      const result = await target.upsert(
+        draft,
+        item.scope === 'project' ? projectRoot : undefined,
+        previous?.source ?? 'auto',
+        item.id ?? undefined,
+      )
       touched.push({ scope: result.entry.scope, id: result.entry.id })
     }
     for (const id of plan.retire) {

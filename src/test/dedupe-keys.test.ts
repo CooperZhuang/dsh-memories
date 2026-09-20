@@ -144,6 +144,39 @@ test('the near-duplicate rule is off until it is configured', async (t) => {
   assert.equal(listed.length, 2)
 })
 
+test('a rewrite that omits appliesTo keeps the existing one', async (t) => {
+  const { store, dir } = await tempStore()
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const first = await store.upsert({
+    scope: 'global',
+    title: 'Alpha fact',
+    body: 'The first body.',
+    tags: [],
+    appliesTo: '准备推送代码之前',
+  }, undefined, 'auto', 1_000)
+  assert.equal(first.entry.appliesTo, '准备推送代码之前')
+
+  // A consolidation rewrite often returns only title/body. Dropping the trigger
+  // phrase silently removes the field on-demand recall gates on, and nothing
+  // downstream can tell that from a deliberate removal.
+  const rewritten = await store.upsert({
+    scope: 'global',
+    title: 'Alpha fact',
+    body: 'A sharper body.',
+    tags: [],
+  }, undefined, 'auto', 2_000, 'alpha-fact')
+  assert.equal(rewritten.entry.appliesTo, '准备推送代码之前', 'an omitted appliesTo is carried over')
+
+  const cleared = await store.upsert({
+    scope: 'global',
+    title: 'Alpha fact',
+    body: 'A sharper body still.',
+    tags: [],
+    appliesTo: '',
+  }, undefined, 'auto', 3_000, 'alpha-fact')
+  assert.equal(cleared.entry.appliesTo, undefined, 'an explicit empty string removes it')
+})
+
 test('an explicit supersedes still wins over the similarity search', async (t) => {
   const { store, dir } = await tempStore()
   t.after(() => rm(dir, { recursive: true, force: true }))

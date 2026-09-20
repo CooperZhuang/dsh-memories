@@ -843,7 +843,14 @@ export class MemoryStore {
       : await this.entryFile(draft.scope, projectRoot, keepId)
     const tags = [...new Set(draft.tags.map(normalizeTag).filter((tag) => tag.length > 0))].slice(0, 12)
     const keys = [...new Set((draft.keys ?? existing?.keys ?? []).map(normalizeKey).filter((key) => key.length > 0))].slice(0, 12)
-    const appliesTo = draft.appliesTo?.trim()
+    // A rewrite that omits `appliesTo` KEEPS the existing one, exactly like
+    // `kind` and `keys`. Dropping it silently is a leak nothing downstream can
+    // undo: measured on a real store, one background consolidation erased the
+    // trigger phrase from 32 of 163 memories — the field that on-demand recall
+    // gates on (recallMinTerms) — and the store cannot tell "left out" from
+    // "meant to remove". A caller that really wants it gone can pass an empty
+    // string, which is explicit.
+    const appliesTo = draft.appliesTo === undefined ? existing?.appliesTo?.trim() : draft.appliesTo.trim()
     const sourceSession = draft.sourceSession?.trim() ?? existing?.sourceSession
     // An explicit `supersedes` always wins; otherwise a near-identical memory
     // already in the scope is treated as the thing this one rewrites, so a

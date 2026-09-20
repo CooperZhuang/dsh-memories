@@ -478,8 +478,12 @@ export function decayOf(entry: MemoryEntry, now = Date.now()): number {
  * hand-written global rules — including "never break the prompt cache" and
  * "reconnaissance is read-only GET" — failed to reach any session's summary,
  * while the twelve that did were all extracted notes.
+ *
+ * Two, because the bonus has to clear {@link AUTO_IMPORTANCE_CEILING} rather
+ * than merely approach it: at 1.6 a written rule still tied with a note that had
+ * been read five times, and the measured global half kept preferring the note.
  */
-export const EXPLICIT_SOURCE_BONUS = 1.6
+export const EXPLICIT_SOURCE_BONUS = 2
 
 /**
  * How much one recorded read is worth, and the cap on how far it can climb.
@@ -493,6 +497,17 @@ export const USE_BONUS = 0.15
 
 /** @see USE_BONUS */
 export const USE_CAP = 5
+
+/**
+ * Ceiling a purely read-accumulated entry can reach (see {@link importanceOf}).
+ *
+ * Exported because {@link EXPLICIT_SOURCE_BONUS} has to clear it for a hand
+ * written rule to outrank the busiest extracted note: with the bonus below
+ * `1 + USE_CAP * USE_BONUS` the injected global half stays a list of whatever
+ * the harness's own tooling happened to read most, which is exactly the state
+ * the slot audit measured.
+ */
+export const AUTO_IMPORTANCE_CEILING = 1 + USE_CAP * USE_BONUS
 
 /**
  * How much an entry has earned its place: a small bonus per recorded use, and a

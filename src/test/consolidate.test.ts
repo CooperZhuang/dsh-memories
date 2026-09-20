@@ -204,6 +204,22 @@ test('applyPlan merges and retires through the target', async () => {
   assert.equal(store.get('global', 'b'), undefined)
 })
 
+test('applyPlan keeps the provenance of the memory it rewrites', async () => {
+  const written = entry({ id: 'rule', title: 'Never break the prompt cache', body: 'only append', source: 'user' })
+  const store = target([written])
+  await applyPlan({
+    upserts: [{ id: 'rule', scope: 'global', kind: 'preference', title: 'Never break the prompt cache', body: 'only append, never touch the prefix', tags: [] }],
+    retire: [],
+    skills: [],
+    notes: 'sharpened',
+  }, store.api, undefined, { entries: [written] })
+
+  // `auto` means "an extractor's guess": stamping it on a rewrite of somebody's
+  // own rule loses both the ranking bonus and the retention exemption, and one
+  // real consolidation run demoted the user's prompt-cache rule that way.
+  assert.equal(store.get('global', 'rule')?.source, 'user', 'a rewrite does not demote an explicit memory')
+})
+
 test('applyPlan restores what it changed when a write fails', async () => {
   const first = entry({ id: 'a', title: 'A', body: 'original a' })
   const store = target([first], 'b')

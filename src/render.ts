@@ -60,12 +60,18 @@ function bullet(entry: MemoryEntry, maxChars: number): string {
  * listing cannot renew its own claim to the next listing. Ranking decides the
  * order; {@link selectForSummary} decides who gets in.
  *
- * When a `query` is supplied (the conversation's opening turn), entries whose
- * own words appear in it are lifted above equally-weighted entries that share
- * nothing with this conversation. Without it the summary is topic-blind and a
- * broad scope spends every session on whatever it read most in the past.
- * The lift is capped so a passing word cannot outrank a memory that keeps
- * earning its place.
+ * When a `query` is supplied (the conversation's opening turn), a memory the
+ * conversation actually names is lifted above the entries that merely have
+ * history. Without it the summary is topic-blind and a broad scope spends every
+ * session on whatever it read most in the past — measured, the injected global
+ * half was the same six unrelated plugin notes in every workspace.
+ *
+ * The lift is gated rather than gradual, and large rather than gentle. Gentle
+ * does not work: at +60% a memory matching the opening turn still lost to an
+ * entry whose only advantage was five recorded reads (2.0 × 1.6 = 3.2 against
+ * 2.0 × 1.75 = 3.5), which is how a "prompt cache" query failed to surface the
+ * prompt-cache rule. Below {@link TOPIC_LIFT_MIN_SCORE} nothing is lifted, so an
+ * incidental shared word cannot displace a memory that keeps earning its place.
  *
  * @param entries - entries to order.
  * @param now - clock.
@@ -78,7 +84,7 @@ export function rankForSummary(entries: readonly MemoryEntry[], now = Date.now()
   const lift = (entry: MemoryEntry): number => {
     if (needle.length === 0) return 1
     const relevance = relevanceOf(entry, needle)
-    if (relevance <= 0) return 1
+    if (relevance < TOPIC_LIFT_MIN_SCORE) return 1
     return 1 + TOPIC_LIFT * Math.min(1, relevance / TOPIC_LIFT_FULL_SCORE)
   }
   const weight = (entry: MemoryEntry): number => importanceOf(entry) * decayOf(entry, now) * lift(entry)
@@ -88,10 +94,13 @@ export function rankForSummary(entries: readonly MemoryEntry[], now = Date.now()
 }
 
 /** Most a topical hit may multiply an entry's summary weight. */
-export const TOPIC_LIFT = 0.6
+export const TOPIC_LIFT = 1.5
 
 /** Relevance at which the topical lift is fully earned; see {@link TOPIC_LIFT}. */
 export const TOPIC_LIFT_FULL_SCORE = 20
+
+/** Relevance below which a match earns no lift at all; see {@link TOPIC_LIFT}. */
+export const TOPIC_LIFT_MIN_SCORE = 10
 
 /**
  * Choose which entries one scope may list in the injected summary.
@@ -233,40 +242,72 @@ export function renderMemorySummary(scopes: readonly SummaryScope[], options: Su
     'Use the `memory` tool for details: action=search finds memories, action=read shows one in full, action=evidence shows the conversation a memory came from, action=write records something worth keeping.'
   ].join(' ')
   const note = options.note === undefined || options.note.trim().length === 0 ? [] : [options.note.trim()]
+  /**
+   * Build one scope's section at a given preview length.
+   *
+   * @param scope - the scope to render.
+   * @param maxChars - preview length per bullet.
+   * @param cap - most entries to list.
+   * @returns the section text plus how many bullets it lists.
+   */
+  const buildSection = (scope: SummaryScope, maxChars: number, cap: number): { text: string; shown: number } => {
+    const listed = scope.entries.slice(0, cap)
+    const budget = scope.maxBytes ?? Number.POSITIVE_INFINITY
+    const lines = [`## ${scope.heading} (${scope.total})`]
+    let used = bytes(lines[0] ?? '')
+    let shown = 0
+    // Within a scope, group by kind so the actionable memories (a preference
+    // to follow, a failure to avoid) are not buried among background facts.
+    for (const kind of MEMORY_KINDS) {
+      const group = listed.filter((entry) => entry.kind === kind)
+      if (group.length === 0) continue
+      const heading = `### ${MEMORY_KIND_HEADINGS[kind]}`
+      const kept: string[] = []
+      for (const entry of group) {
+        const line = bullet(entry, maxChars)
+        const cost = bytes(line) + 1 + (kept.length === 0 ? bytes(heading) + 1 : 0)
+        // Only the section's very first bullet bypasses the budget, so a scope
+        // with something to say never renders as an empty heading. Every later
+        // bullet — including the first of each kind group — is subject to it,
+        // or a scope with four kinds would always cost four bullets.
+        if (shown + kept.length > 0 && used + cost > budget) break
+        kept.push(line)
+        used += cost
+      }
+      if (kept.length > 0) {
+        lines.push(heading, ...kept)
+        shown += kept.length
+      }
+    }
+    const omitted = scope.total - shown
+    if (omitted > 0) lines.push(`- … ${omitted} more not shown`)
+    return { text: lines.join('\n'), shown }
+  }
+  /**
+   * Preview lengths a capped scope may trade down through.
+   *
+   * A byte budget alone is not enough. A Chinese bullet runs to ~600 bytes at a
+   * 240-character preview, so a 1200-byte global section rendered TWO entries —
+   * measured on a real store, none of the six memories the scope's own audit
+   * said belong there made the cut, because two long previews had eaten the
+   * budget. Entries are the scarce good, not preview characters: when a scope's
+   * budget binds, shorten its previews until the entries fit.
+   */
+  const PREVIEW_LADDER = [140, 110, 80, 55, 35]
   const render = (maxChars: number, perScope: number): string => {
     const sections = populated.map((scope) => {
       const cap = scope.maxEntries === undefined ? perScope : Math.min(perScope, scope.maxEntries)
-      const listed = scope.entries.slice(0, cap)
-      const budget = scope.maxBytes ?? Number.POSITIVE_INFINITY
-      const lines = [`## ${scope.heading} (${scope.total})`]
-      let used = bytes(lines[0] ?? '')
-      let shown = 0
-      // Within a scope, group by kind so the actionable memories (a preference
-      // to follow, a failure to avoid) are not buried among background facts.
-      for (const kind of MEMORY_KINDS) {
-        const group = listed.filter((entry) => entry.kind === kind)
-        if (group.length === 0) continue
-        const heading = `### ${MEMORY_KIND_HEADINGS[kind]}`
-        const kept: string[] = []
-        for (const entry of group) {
-          const line = bullet(entry, maxChars)
-          const cost = bytes(line) + 1 + (kept.length === 0 ? bytes(heading) + 1 : 0)
-          // Only the section's very first bullet bypasses the budget, so a scope
-          // with something to say never renders as an empty heading. Every later
-          // bullet — including the first of each kind group — is subject to it,
-          // or a scope with four kinds would always cost four bullets.
-          if (shown + kept.length > 0 && used + cost > budget) break
-          kept.push(line)
-          used += cost
-        }
-        if (kept.length > 0) {
-          lines.push(heading, ...kept)
-          shown += kept.length
+      let best = buildSection(scope, maxChars, cap)
+      if (scope.maxBytes !== undefined) {
+        for (const size of PREVIEW_LADDER.filter((value) => value < maxChars)) {
+          const attempt = buildSection(scope, size, cap)
+          // More entries wins; a tie keeps the longer preview, which is why the
+          // ladder is walked downwards and only a strict improvement replaces.
+          if (attempt.shown > best.shown) best = attempt
+          if (best.shown >= cap) break
         }
       }
-      const omitted = scope.total - shown
-      if (omitted > 0) lines.push(`- … ${omitted} more not shown`)
-      return lines.join('\n')
+      return best.text
     })
     return [MEMORY_OPEN, intro, guidance, ...note, '', ...sections, MEMORY_CLOSE].join('\n')
   }
