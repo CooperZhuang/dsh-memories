@@ -389,6 +389,11 @@ export class MemoriesRuntime {
     for (const slug of await this.store.listProjects()) {
       const descriptor = await this.store.readProjectDescriptor(slug)
       if (descriptor === undefined) continue
+      // A catch-all directory is not a project, so it must never be a target
+      // either: the harness home in particular is cited by machine-level facts
+      // that belong in global, and rerouting them there hides them from every
+      // other workspace.
+      if (isCatchAllDirectory(descriptor.root, this.deployment.dshHome)) continue
       if (descriptor.root.toLowerCase().length >= 4 && haystack.includes(descriptor.root.toLowerCase())) {
         return descriptor.root
       }

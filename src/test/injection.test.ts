@@ -267,6 +267,26 @@ test('the user home directory itself is not a workspace', () => {
   assert.equal(isCatchAllDirectory(join(homedir(), 'AppData', 'LocalLow', 'SomeGame'), 'C:\\harness-home'), false)
 })
 
+test('a global draft is never rerouted into a catch-all directory', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'dsh-memories-home-'))
+  const dir = join(home, 'memories')
+  const runtime = new MemoriesRuntime(stubContext, { dshHome: home, memoriesDir: dir, autoExtract: false })
+  t.after(() => runtime.dispose())
+  t.after(() => rm(home, { recursive: true, force: true }))
+
+  // A descriptor for the harness home can outlive the guard that stopped new
+  // ones being created. A machine-level fact quoting a path there belongs in
+  // global: filing it under the home scope hides it from every other workspace.
+  const entry = await runtime.write(stubAgent(stubSession(home)).session, {
+    scope: 'global',
+    title: 'Helper lives in the harness home',
+    body: `The helper is ${home}\\restart.mjs, and its log sits beside it.`,
+    tags: [],
+  }, 'tool')
+  assert.equal(entry.entry.scope, 'global', 'a catch-all directory is never a reroute target')
+  assert.deepEqual(await runtime.store.listProjects(), [], 'and no scope is created for it')
+})
+
 test('a session with no recorded cwd has no project scope either', async (t) => {  const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-nocwd-'))
   const runtime = new MemoriesRuntime(stubContext, { memoriesDir: dir, autoExtract: false })
   t.after(() => runtime.dispose())
