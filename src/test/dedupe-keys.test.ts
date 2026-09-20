@@ -59,6 +59,9 @@ test('a re-worded memory supersedes its predecessor instead of joining it', asyn
   const listed = await store.list('global', undefined, { fresh: true })
   assert.deepEqual(listed.map((entry) => entry.id), [second.entry.id])
   assert.equal(await store.read('global', undefined, first.entry.id), undefined)
+  // The predecessor is archived for the same reason a merged loser is: an
+  // explicit rewrite is not a better reason to destroy a memory than a guess is.
+  assert.deepEqual((await store.listArchived('global', undefined)).map((entry) => entry.id), [first.entry.id])
 })
 
 test('Chinese memories are comparable, so a paraphrase is recognised', () => {

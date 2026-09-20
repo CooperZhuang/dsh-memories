@@ -227,6 +227,11 @@ const FIELDS = [
     hint: { zh: '合并用的模型；留空则先回退到抽取路由，再回退到会话路由。', en: 'Model for consolidation. Empty falls back to the extraction route, then the session route.' },
   },
   {
+    field: 'consolidateProposalMaxAgeHours', kind: 'number', min: 0, step: 6,
+    label: { zh: '合并提案保鲜期（小时）', en: 'Proposal lifetime (hours)' },
+    hint: { zh: '待确认的合并提案等多久还没被 /memories apply 或 reject，后续的自动整理才可以换一份新的。窗口内后台不重复生成（生成一次是模型调用，覆盖一个没人回答的问题没有意义）；/memories consolidate 无视这个窗口。0 表示一直等你的答复。', en: 'Hours a staged consolidation proposal waits for /memories apply or reject before a background pass may replace it with a fresh one. Inside the window a pass leaves the pending question alone; /memories consolidate always proposes now. 0 keeps it until answered.' },
+  },
+  {
     field: 'enableTool', kind: 'boolean',
     label: { zh: '记忆工具', en: 'Memory tool' },
     hint: { zh: '是否注册面向模型的 memory 工具。立即生效。', en: 'Register the model-facing memory tool. Takes effect immediately.' },

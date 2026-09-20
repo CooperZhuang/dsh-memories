@@ -197,6 +197,19 @@ export const DEFAULT_MAX_SESSIONS_PER_PASS = 2
 /** Default hours between consolidation passes. */
 export const DEFAULT_CONSOLIDATE_COOLDOWN_HOURS = 6
 
+/**
+ * Default hours a consolidation proposal waits for a decision before a new pass
+ * may replace it.
+ *
+ * A proposal is a question, and questions go stale: entries keep being written
+ * while it waits, so an old proposal describes a store that no longer exists.
+ * Inside this window a running pass leaves the pending one alone — proposing
+ * again would spend a model call to overwrite a question nobody has answered —
+ * and past it the fresh proposal wins. `/memories consolidate` ignores the
+ * window, because a user who types the command is asking now.
+ */
+export const DEFAULT_CONSOLIDATE_PROPOSAL_MAX_AGE_HOURS = 72
+
 /** Default cap on entries one consolidation pass considers. */
 export const DEFAULT_CONSOLIDATE_MAX_ENTRIES = 64
 
@@ -287,6 +300,7 @@ export const MemoriesSettingsSchema = z.object({
   maxSessionsPerPass: z.number().default(DEFAULT_MAX_SESSIONS_PER_PASS).description('How many sessions one extraction pass may mine, newest first.'),
   consolidate: z.boolean().default(true).description('After new memories land, merge and reconcile them through a restricted sub-agent.'),
   consolidateCooldownHours: z.number().default(DEFAULT_CONSOLIDATE_COOLDOWN_HOURS).description('Minimum hours between consolidation passes; bounds background quota use.'),
+  consolidateProposalMaxAgeHours: z.number().default(DEFAULT_CONSOLIDATE_PROPOSAL_MAX_AGE_HOURS).description('Hours a staged consolidation proposal waits for /memories apply or reject before a later pass may replace it with a fresh one. Inside the window a background pass leaves the pending question alone (proposing again would spend a model call to overwrite it); /memories consolidate always proposes now. 0 keeps a proposal until it is answered.'),
   consolidateMaxEntries: z.number().default(DEFAULT_CONSOLIDATE_MAX_ENTRIES).description('How many memories one consolidation pass may consider.'),
   consolidateTimeoutMs: z.number().default(DEFAULT_CONSOLIDATE_TIMEOUT_MS).description('Timeout for one consolidation sub-agent run.'),
   /** Stop background passes while the provider is refusing for quota or rate. */
@@ -349,6 +363,7 @@ export const MEMORIES_SETTINGS_DEFAULTS: MemoriesSettings = {
   maxSessionsPerPass: DEFAULT_MAX_SESSIONS_PER_PASS,
   consolidate: true,
   consolidateCooldownHours: DEFAULT_CONSOLIDATE_COOLDOWN_HOURS,
+  consolidateProposalMaxAgeHours: DEFAULT_CONSOLIDATE_PROPOSAL_MAX_AGE_HOURS,
   consolidateMaxEntries: DEFAULT_CONSOLIDATE_MAX_ENTRIES,
   consolidateTimeoutMs: DEFAULT_CONSOLIDATE_TIMEOUT_MS,
   pauseOnQuotaError: true,
@@ -414,6 +429,7 @@ export interface MemoriesConfig {
   maxSessionsPerPass?: number
   consolidate?: boolean
   consolidateCooldownHours?: number
+  consolidateProposalMaxAgeHours?: number
   consolidateMaxEntries?: number
   consolidateTimeoutMs?: number
   extractProvider?: string
@@ -515,6 +531,7 @@ export function normalizeSettings(input: Partial<MemoriesSettings> | undefined):
     maxSessionsPerPass: positive(value.maxSessionsPerPass, DEFAULT_MAX_SESSIONS_PER_PASS),
     consolidate: value.consolidate ?? true,
     consolidateCooldownHours: decimal(value.consolidateCooldownHours, DEFAULT_CONSOLIDATE_COOLDOWN_HOURS),
+    consolidateProposalMaxAgeHours: decimal(value.consolidateProposalMaxAgeHours, DEFAULT_CONSOLIDATE_PROPOSAL_MAX_AGE_HOURS, 0),
     consolidateMaxEntries: positive(value.consolidateMaxEntries, DEFAULT_CONSOLIDATE_MAX_ENTRIES),
     consolidateTimeoutMs: positive(value.consolidateTimeoutMs, DEFAULT_CONSOLIDATE_TIMEOUT_MS),
     pauseOnQuotaError: value.pauseOnQuotaError ?? true,

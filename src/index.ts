@@ -45,7 +45,7 @@ import { planRetention, retentionKey } from './retention.js'
 import { MemoryLog, createFileSink, createLogExporter, pluginLogger } from './log.js'
 import { collectWindow, runExtraction } from './extract.js'
 import { backgroundDelayMs, extractionDelayMs, formatDelay, parsePeakHours, peakDelayMs } from './schedule.js'
-import { applyPlan, clearPendingPlan, denyToolsFor, readPendingPlan, runConsolidation, selectForConsolidation, writePendingPlan } from './consolidate.js'
+import { applyPlan, clearPendingPlan, denyToolsFor, proposalIsFresh, readPendingPlan, runConsolidation, selectForConsolidation, writePendingPlan } from './consolidate.js'
 import { discardDraft, listDrafts, promote, writeDraft } from './skills.js'
 import type { ConsolidationTarget, SubagentSeam } from './consolidate.js'
 import { MEMORY_KINDS } from './types.js'
@@ -1516,10 +1516,24 @@ export class MemoriesRuntime {
    * @param options - `apply` writes the result; the default only proposes it.
    * @returns a human-readable summary, or `undefined` when nothing ran.
    */
-  async consolidateNow(parent: Agent, options: { apply?: boolean } = {}): Promise<string | undefined> {
+  async consolidateNow(parent: Agent, options: { apply?: boolean; force?: boolean } = {}): Promise<string | undefined> {
     if (!this.settings.consolidate) return undefined
     const seam = this.subagents
     if (seam === undefined) return undefined
+    // A proposal is a question, and a background pass must not spend a model call
+    // to overwrite one nobody has answered yet. Inside the window it leaves the
+    // pending question alone; past it the store has moved on and a fresh proposal
+    // is the honest one. A user who types the command forces it.
+    const pending = await readPendingPlan(this.store.memoriesDir).catch(() => undefined)
+    if (pending !== undefined && options.force !== true && proposalIsFresh(pending, this.settings.consolidateProposalMaxAgeHours, Date.now())) {
+      const ageHours = Math.round((Date.now() - pending.at) / 3_600_000)
+      this.log.decision('dsh-memories: leaving the consolidation proposal staged %sh ago alone; review it with /memories plan', ageHours)
+      return undefined
+    }
+    if (pending !== undefined && options.force !== true) {
+      this.log.info('dsh-memories: replacing a consolidation proposal staged %sh ago with a fresh one',
+        Math.round((Date.now() - pending.at) / 3_600_000))
+    }
     // A manual pass creates the job when none exists: the cooldown gates the
     // BACKGROUND pass, and a user who types the command is asking for it now.
     // Without this, `/memories consolidate` silently did nothing on a store
@@ -1687,12 +1701,57 @@ export class MemoriesRuntime {
     for (const slug of removed) {
       this.log.decision('dsh-memories: removed empty project directory %s', slug)
     }
+    // Citation drift belongs on the schedule, not only behind a command: a path
+    // that stopped existing is the kind of wrongness nothing else notices, and a
+    // reader who never types /memories stale should still learn it is there.
+    const stale = await this.countStale().catch(() => 0)
+    if (stale > 0) {
+      this.log.info('dsh-memories: %d memories cite a path that no longer resolves; /memories stale lists them', stale)
+    }
     // One line per sweep, always: it is the only evidence that retention runs at
     // all, and a sweep that never archives anything is exactly what somebody
     // wondering "why is my store still this big" needs to see.
-    this.log.info('dsh-memories: sweep: archived %d memories across %d project scopes, pruned %d empty project director%s',
-      archived, scopes, removed.length, removed.length === 1 ? 'y' : 'ies')
+    this.log.info('dsh-memories: sweep: archived %d memories across %d project scopes, pruned %d empty project director%s, %d stale citation%s',
+      archived, scopes, removed.length, removed.length === 1 ? 'y' : 'ies', stale, stale === 1 ? '' : 's')
     return archived
+  }
+
+  /**
+   * Every memory that cites a path no longer present in any known checkout.
+   *
+   * The full scan, without a session: the periodic sweep has no workspace of its
+   * own, so it checks each project's memories against that project's root (plus
+   * the harness home) and global memories against the harness home.
+   *
+   * @returns one row per flagged memory, most specific scope first.
+   */
+  private async staleRows(): Promise<{ scope: string; id: string; title: string; missing: string[] }[]> {
+    const rows: { scope: string; id: string; title: string; missing: string[] }[] = []
+    const collect = (label: string, entries: readonly MemoryEntry[], root: string | undefined): void => {
+      const roots = citationRoots(root, [this.deployment.dshHome])
+      if (roots.length === 0) return
+      for (const entry of entries) {
+        const missing = missingCitations(entry.body, roots)
+        if (missing.length > 0) rows.push({ scope: label, id: entry.id, title: entry.title, missing })
+      }
+    }
+    collect('global', await this.store.list('global', undefined, { fresh: true }), undefined)
+    for (const slug of await this.store.listProjects()) {
+      const descriptor = await this.store.readProjectDescriptor(slug)
+      if (descriptor === undefined) continue
+      const entries = await this.store.list('project', descriptor.root, { fresh: true })
+      if (entries.length > 0) collect(slug, entries, descriptor.root)
+    }
+    return rows
+  }
+
+  /**
+   * How many memories cite a path that no longer resolves, for the sweep line.
+   *
+   * @returns the count.
+   */
+  private async countStale(): Promise<number> {
+    return (await this.staleRows()).length
   }
 
   /**
@@ -1841,6 +1900,7 @@ export class MemoriesRuntime {
       `recall: ${this.settings.recallMode} (relevance ≥${this.settings.recallMinScore} plus ${this.settings.recallMinTerms} terms or a shared run, ≤${this.settings.recallMaxPerConversation} memories and ≤${this.settings.recallMaxBytes}B per conversation)`,
       `summary: ≤${this.settings.maxSummaryEntries} per scope with ${this.settings.summaryFreshSlots} reserved for never-listed memories`,
       `skills: ${drafts.length === 0 ? 'no staged drafts' : `${drafts.length} staged draft${drafts.length === 1 ? '' : 's'} waiting (promote with /memories promote <name>)`}`,
+      `consolidation: ${await this.consolidationLine()}`,
       `retention: ${this.settings.maxUnusedDays > 0 ? `archive after ${this.settings.maxUnusedDays}d unused` : 'off'}${this.sweepLine()}`,
       `session mode: ${this.sessionMode(session)}`,
       `logging: ${this.settings.logLevel}${this.settings.traceMaintenance ? ' + maintenance trace' : ''} → ${this.logDestination()}`,
@@ -1887,23 +1947,35 @@ export class MemoriesRuntime {
    * @returns a human-readable report.
    */
   async stale(session: Session): Promise<string> {
-    const states = await this.allScopes(session)
     const roots = citationRoots(await this.projectRoot(session), [this.deployment.dshHome])
-    const lines: string[] = []
-    let flagged = 0
-    for (const state of states) {
-      for (const entry of state.entries) {
-        const missing = missingCitations(entry.body, roots)
-        if (missing.length === 0) continue
-        flagged += 1
-        lines.push(`[${state.label}] ${entry.title}`)
-        lines.push(`  id: ${entry.id}`)
-        lines.push(`  找不到: ${missing.join('  ')}`)
-      }
+    const rows = await this.staleRows()
+    if (rows.length === 0) return `No stale citations: every cited path resolves under ${roots.length} known root(s).`
+    const lines: string[] = [`${rows.length} memories cite a path that no longer resolves:`]
+    for (const row of rows) {
+      lines.push(`[${row.scope}] ${row.title}`)
+      lines.push(`  id: ${row.id}`)
+      lines.push(`  找不到: ${row.missing.join('  ')}`)
     }
-    if (flagged === 0) return `No stale citations: every cited path resolves under ${roots.length} known root(s).`
-    return [`${flagged} memories cite a path that no longer resolves:`, ...lines,
-      '', 'These paths were true when the memory was written. Verify before acting on them, and rewrite the memory (memory action=write, same title) once you know the current path.'].join('\n')
+    lines.push('', 'These paths were true when the memory was written. Verify before acting on them, and rewrite the memory (memory action=write, same title) once you know the current path.')
+    return lines.join('\n')
+  }
+
+  /**
+   * One line describing where consolidation stands, for `/memories stats`.
+   *
+   * A staged proposal is the one piece of maintenance state that needs a person,
+   * and it is otherwise invisible: the background pass produces it and then waits.
+   *
+   * @returns the line.
+   */
+  private async consolidationLine(): Promise<string> {
+    if (!this.settings.consolidate) return 'off'
+    const pending = await readPendingPlan(this.store.memoriesDir).catch(() => undefined)
+    if (pending === undefined) {
+      return `no proposal staged; a background pass proposes (never writes) after ${this.settings.consolidateCooldownHours}h of cooldown`
+    }
+    const ageHours = Math.round((Date.now() - pending.at) / 3_600_000)
+    return `proposal staged ${ageHours}h ago for ${pending.label}: ${pending.plan.upserts.length} to write, ${pending.plan.retire.length} to retire (review with /memories plan, then apply or reject)`
   }
 
   /** Render one scope's entries for a human-facing command. */
@@ -2290,7 +2362,7 @@ async function handleCommand(runtime: MemoriesRuntime, invocation: CommandInvoca
     case 'off':
       return { kind: 'success', text: runtime.setSessionMode(session, 'off') }
     case 'consolidate': {
-      const summary = await runtime.consolidateNow(invocation.agent, { apply: false })
+      const summary = await runtime.consolidateNow(invocation.agent, { apply: false, force: true })
       return { kind: 'success', text: summary ?? 'Nothing to consolidate (cooldown active, too few memories, or no subagent support).' }
     }
     case 'plan': {

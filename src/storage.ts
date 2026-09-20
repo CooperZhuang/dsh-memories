@@ -903,8 +903,13 @@ export class MemoryStore {
     if (draft.scope === 'project' && projectRoot !== undefined) await this.writeProjectDescriptor(projectRoot, now)
     // Honour `supersedes`: the entry this one replaces is retired, in the same
     // scope, unless it IS this entry (an id can never supersede itself).
+    // ARCHIVED, not removed. The near-duplicate pass already treats its loser as
+    // recoverable, and an explicit rewrite has no better claim to destroy a
+    // memory outright — `/memories forget` is the only deletion a caller can ask
+    // for. Measured: the two paths disagreed, so a re-worded memory surviving its
+    // predecessor depended on which of the two happened to fire.
     if (entry.supersedes !== undefined && entry.supersedes !== id) {
-      await rm(await this.entryFile(draft.scope, projectRoot, entry.supersedes), { force: true })
+      await this.archive(draft.scope, projectRoot, entry.supersedes, now).catch(() => false)
     }
     this.invalidate(draft.scope, projectRoot)
     const limit = this.entryLimit()

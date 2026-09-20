@@ -194,8 +194,9 @@ memories:
 | `maxEntriesPerScope` | `200` | 每个作用域最多保留多少条，超出**归档**最久未使用的 |
 | `maxUnusedDays` | `90` | 多久没被读到/被注入摘要/也不是新写的就归档；`0` 关闭；人手写的与置顶的永不归档 |
 | `snapshotMaxAgeDays` | `60` | 标记为 `durability: snapshot` 的记忆（某个时刻的读数）从**测量那天**算起多少天后归档，与"多久没被读到"无关——过期数字再被读一次也不会变对。`0` 关闭快照过期 |
-| `dedupeSimilarity` | `0.7` | 标题与正文词重叠达到该比例时，新记忆视为改写并 `supersedes` 旧记忆；`0` 只保留完全相同规则 |
-| `sweepIntervalHours` | `12` | 定期整理间隔（对所有已知工作区）；`0` 关闭，仍可手动 `/memories sweep` |
+| `dedupeSimilarity` | `0.7` | 标题与正文词重叠达到该比例时，新记忆视为改写并 `supersedes` 旧记忆；`0` 只保留完全相同规则。**被替代的旧条目是归档，不是删除**（可 `restore`） |
+| `sweepIntervalHours` | `12` | 定期整理间隔（对所有已知工作区）：保留策略 + 快照过期 + 作用域改名自愈 + 空目录清理 + **失效引用计数**；`0` 关闭，仍可手动 `/memories sweep` |
+| `consolidateProposalMaxAgeHours` | `72` | 待确认的合并提案等多久还没被 apply/reject，后续的自动整理才可以换一份新的。窗口内后台不重复生成（生成一次是模型调用，覆盖一个没人回答的问题没有意义）；`/memories consolidate` 无视窗口。`0` 表示一直等你的答复 |
 | `autoExtract` | `true` | 是否启用空闲后台抽取 |
 | `autoExtractIdleMs` | `300000` | 空闲多久后开始抽取（最小 1000）；实际等待见 `minIdleHours` |
 | `extractWindowMessages` | `60` | 一次抽取最多看多少条对话消息（按一个周期间隔的增量来定） |
@@ -325,6 +326,30 @@ frontmatter 的目录包），下次技能目录刷新后进入目录。草稿�
   既被记住又不骗人，用这个而不是把它写成事实。
 - **引用校验**：正文里写的 `dir/file.ext` 会在注入前被核对；只有当"父目录存在、文件不存在"
   时才提示「⚠ 引用的 X 已不存在，以实测为准」，并可用 `/memories stale` 全库扫描。
+
+## 后台定期做什么（以及为什么有些事必须问你）
+
+插件在宿主里跑三个定时任务，分工的标准只有一条：**判据是确定的、结果可逆的，就自动做；
+需要模型判断并且会改写正文的，只出提案。**
+
+| 任务 | 周期 | 做什么 | 要不要人 |
+| --- | --- | --- | --- |
+| 抽取（`extractIntervalMinutes`） | 30 分钟扫一遍有活动的会话（另加 `minIdleHours` 空闲门槛） | 把新内容里**可复用的事实**写进记忆；把当前作用域已有条目的标题一起给模型，让它改写已有条目而不是新增 | 不需要。写入即生效，但每条都带 provenance、可 `archive`/`forget` |
+| 整理 sweep（`sweepIntervalHours`） | 12 小时 | 保留策略（`maxUnusedDays`）、快照过期（`snapshotMaxAgeDays`）、作用域改名自愈、空目录清理，并**统计失效引用条数写进一行日志** | 不需要。全部是确定性规则，且归档可 `restore` |
+| 合并 consolidate（`consolidateCooldownHours`） | 6 小时冷却 | 让受限子代理把一批记忆去重、改写、退役 | **需要**：它只产出 `memories/pending/consolidation.json`，要 `/memories plan` 看、`/memories apply` 落盘、`/memories reject` 丢弃 |
+
+为什么合并必须是提案：它是唯一会**改写正文**的通道，而它判错过——实测一次后台整理抹掉了
+32 条 `appliesTo`、把 8 条人写的规则降级成"抽取器的猜测"、把中文标题改回英文，全部是事后
+审计才发现的。提案有同样的能力、没有这份风险。
+
+提案不会烂在那里：`consolidateProposalMaxAgeHours`（默认 72 小时）之内后台**不重复生成**
+（避免花模型调用去覆盖一个没人回答的问题），超时后由新提案替换（届时库已经变了，旧提案本来
+也不再准确）；`/memories consolidate` 无视这个窗口。注入块里会一直提示有一份待确认的提案，
+`/memories stats` 的 `consolidation:` 一行会显示它的年龄与规模。
+
+**归档 vs 删除**：归档是唯一的自动处置方式（`/memories archive` 列表、`/memories restore <id>` 取回），
+永不因"长期未用"被动到 `source: user` 或 `pinned` 的记忆。真正删除只有两个入口：
+`/memories forget <id>`（你明确要求），以及归档区自身的上限（每作用域保留最新 500 个归档文件）。
 
 ## 日志与排障
 

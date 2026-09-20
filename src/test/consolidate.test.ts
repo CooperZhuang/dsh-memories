@@ -20,6 +20,7 @@ import {
   denyToolsFor,
   applyPlan,
   parsePlan,
+  proposalIsFresh,
   readPendingPlan,
   renderConsolidationInput,
   runConsolidation,
@@ -191,6 +192,16 @@ test('runConsolidation reads the structured result when the provider returns one
     signal: new AbortController().signal,
   })
   assert.equal(plan?.upserts[0]?.title, 'From schema')
+})
+
+test('a proposal is left alone while fresh, and replaced once it is stale', () => {
+  const hour = 3_600_000
+  const pending = { plan: { upserts: [], retire: [], skills: [], notes: '' }, projectRoot: '', at: 0, label: 'global' }
+  // Inside the window a background pass must not spend a model call to overwrite
+  // a question nobody has answered yet.
+  assert.equal(proposalIsFresh(pending, 72, 24 * hour), true)
+  assert.equal(proposalIsFresh(pending, 72, 100 * hour), false, 'the store moved on, so a fresh proposal is the honest one')
+  assert.equal(proposalIsFresh(pending, 0, 10_000 * hour), true, '0 means wait for an answer')
 })
 
 test('a proposal round-trips through disk and can be dropped', async (t) => {

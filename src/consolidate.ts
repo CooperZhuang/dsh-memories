@@ -471,6 +471,24 @@ export async function readPendingPlan(memoriesDir: string): Promise<PendingPlan 
 }
 
 /**
+ * Whether a staged proposal is still worth leaving alone.
+ *
+ * A proposal is a question, and questions go stale: entries keep arriving while
+ * it waits, so an old proposal describes a store that no longer exists. Inside
+ * the window a background pass does not spend a model call to overwrite a
+ * question nobody has answered; past it, the fresh proposal wins.
+ *
+ * @param pending - the staged proposal.
+ * @param maxAgeHours - the window; `0` means "wait for an answer".
+ * @param now - clock.
+ * @returns true when a running pass should leave it in place.
+ */
+export function proposalIsFresh(pending: PendingPlan, maxAgeHours: number, now: number): boolean {
+  if (maxAgeHours <= 0) return true
+  return now - pending.at < maxAgeHours * 3_600_000
+}
+
+/**
  * Drop the pending proposal.
  *
  * @param memoriesDir - the store root.
