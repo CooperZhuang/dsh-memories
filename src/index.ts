@@ -1812,6 +1812,11 @@ export function apply(ctx: Context, config: MemoriesConfig = {}): void {
     if (delta !== undefined) addition.push(delta)
     const fresh = addition.filter((message) => !decision.messages.some((existing) => existing.id === message.id))
     if (fresh.length === 0) return decision
+    // APPEND ONLY. DeepSeek's context cache is keyed on an unchanged prefix, so
+    // this seam may extend the tail and nothing else: no rewriting, reordering,
+    // or dropping an existing message, and never moving a memory block into the
+    // system prompt. The harness deep-freezes request messages for the same
+    // reason; see the "前缀缓存约束" section of README.md before changing this.
     return { ...decision, messages: [...decision.messages, ...fresh] }
   })
 }
