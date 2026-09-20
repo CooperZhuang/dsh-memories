@@ -438,6 +438,30 @@ test('reserved slots prefer an explicit write and never take the whole list', ()
   assert.ok(selected.filter((value) => value.uses === 0).length < 12, 'the reservation does not take the whole list')
 })
 
+test('a reserved slot prefers a never-surfaced entry this conversation names', () => {
+  const now = 1_000_000_000_000
+  const incumbents = Array.from({ length: 20 }, (_, index) => entry({
+    id: `old-${index}`, scope: 'global', title: `Old ${index}`, body: 'generic history',
+    updatedAt: now, lastUsedAt: now, lastSurfacedAt: now, uses: 6,
+  }))
+  // The newest unseen entry shares nothing with the turn; an older one is about it.
+  const newest = entry({
+    id: 'newest', scope: 'global', title: 'Unrelated fresh note', body: 'nothing to do with it',
+    updatedAt: now, source: 'auto',
+  })
+  const relevant = entry({
+    id: 'relevant', scope: 'global', title: '发票 OCR 手写字段补摘', body: '按版面语义抽字段，不要用首个正则命中',
+    updatedAt: now - 86_400_000, source: 'auto',
+  })
+  // Without the topical step the reserved slot went to the newest entry, which is
+  // how every measured scope spent one of four global slots on something the
+  // session could not use.
+  const blind = selectForSummary([...incumbents, newest, relevant], 5, { freshSlots: 1, now })
+  assert.ok(blind.some((value) => value.id === 'newest'), 'newest wins when there is no topic signal')
+  const topical = selectForSummary([...incumbents, newest, relevant], 5, { freshSlots: 1, now, query: '发票手写字段怎么补摘' })
+  assert.ok(topical.some((value) => value.id === 'relevant'), 'the named entry takes the reserved slot')
+})
+
 test('every entry is listed when a scope fits, and nothing is listed at zero', () => {
   const now = 1_000_000_000_000
   const entries = [
