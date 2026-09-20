@@ -22,6 +22,7 @@ test('extractCitations keeps real relative paths and drops prose', () => {
   assert.deepEqual(extractCitations('config.ts/index.ts/consolidate.ts'), [], 'a slash-joined list is not a path')
   assert.deepEqual(extractCitations('see https://example.com/a/b.js'), [])
   assert.deepEqual(extractCitations('a single index.js is not checkable'), [])
+  assert.deepEqual(extractCitations('fonts live in app/.tools and are installed'), [], 'a hidden directory is not a file')
 })
 
 test('a citation is reported only when its directory exists but the file does not', () => {

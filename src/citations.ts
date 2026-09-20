@@ -48,6 +48,10 @@ export function extractCitations(text: string): string[] {
     if (before.includes('//')) continue
     const cleaned = raw.replace(/^\.\//u, '').replace(/\/+/gu, '/')
     if (cleaned.startsWith('/') || cleaned.includes('://')) continue
+    // A trailing segment that is a hidden directory (`app/.tools`) is not a file
+    // path, and the check can only ask whether files exist.
+    const last = cleaned.split('/').at(-1) ?? ''
+    if (last.startsWith('.')) continue
     // Reject slash-joined lists of same-extension files (`config.ts/index.ts`).
     const parts = cleaned.split('/')
     if (parts.length > 1 && parts.every((part) => /\.(ts|js|mjs|py)$/u.test(part))) continue
