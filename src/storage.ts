@@ -744,6 +744,8 @@ export class MemoryStore {
         title: entry.title,
         tags: entry.tags,
         ...entry.appliesTo === undefined ? {} : { appliesTo: entry.appliesTo },
+        ...entry.durability === 'snapshot' ? { durability: entry.durability, ...entry.asOf === undefined ? {} : { asOf: entry.asOf } } : {},
+        ...entry.pinned === true ? { pinned: true } : {},
         ...entry.supersedes === undefined ? {} : { supersedes: entry.supersedes },
         createdAt: entry.createdAt,
         updatedAt: entry.updatedAt,
