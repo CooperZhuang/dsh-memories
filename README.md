@@ -192,7 +192,8 @@ memories:
 | `recallMaxBytes` | `1200` | 单个 `<memory-recall>` 块的字节预算；`0` 关闭按需补注 |
 | `recallMinQueryChars` | `2` | 短于该字数的用户消息不触发补注判定（「好」「继续」不必扫全库） |
 | `maxEntriesPerScope` | `200` | 每个作用域最多保留多少条，超出**归档**最久未使用的 |
-| `maxUnusedDays` | `90` | 多久没被读到/被注入摘要/也不是新写的就归档；`0` 关闭；人手写的永不归档 |
+| `maxUnusedDays` | `90` | 多久没被读到/被注入摘要/也不是新写的就归档；`0` 关闭；人手写的与置顶的永不归档 |
+| `snapshotMaxAgeDays` | `60` | 标记为 `durability: snapshot` 的记忆（某个时刻的读数）从**测量那天**算起多少天后归档，与"多久没被读到"无关——过期数字再被读一次也不会变对。`0` 关闭快照过期 |
 | `dedupeSimilarity` | `0.7` | 标题与正文词重叠达到该比例时，新记忆视为改写并 `supersedes` 旧记忆；`0` 只保留完全相同规则 |
 | `sweepIntervalHours` | `12` | 定期整理间隔（对所有已知工作区）；`0` 关闭，仍可手动 `/memories sweep` |
 | `autoExtract` | `true` | 是否启用空闲后台抽取 |
@@ -300,8 +301,12 @@ frontmatter 的目录包），下次技能目录刷新后进入目录。草稿�
 /memories restore <id>        把归档的记忆取回原作用域
 /memories mode [on|off]       本次会话关闭/开启记忆（不写库、不抽取、不注入）
 /memories mine                立刻从当前会话抽取一次（不等空闲）
-/memories consolidate         立刻合并重整全部记忆（不等冷却）
+/memories consolidate         产出一次合并提案（**不改库**，等 /memories apply）
+/memories plan                查看待确认的合并提案
+/memories apply               落盘待确认的合并提案（失败会回滚）
+/memories reject              丢弃待确认的合并提案
 /memories sweep               立刻跑一次保留整理（归档长期无用的记忆）
+/memories stale               列出引用了"已不存在的文件"的记忆
 /memories skills              列出技能草稿
 /memories promote <name>      晋升一份草稿到 $DSH_HOME/skills
 /memories discard <name>      丢弃一份草稿
@@ -310,6 +315,16 @@ frontmatter 的目录包），下次技能目录刷新后进入目录。草稿�
 
 `kind` 取值：`fact` / `preference` / `knowledge` / `failure` / `procedure`。写错的 kind 会被忽略
 而不是让过滤结果为空——手滑不该让检索静默失效。
+
+### 三条只在需要时才会用到的记忆属性
+
+- **`pinned`**：置顶。注入时先于预留名额与排序被选中（置顶之间仍按排序竞争，所以不会占满整段），
+  并且不再因"长期未使用"被归档——置顶是人做的决定，调度无权推翻。注入行首有 📌 标记。
+- **`durability: snapshot` + `asOf`**：这条记的是**某个时刻的读数**（数量、通过率、当前状态），
+  不是规则。注入时带测量日期，并按 `snapshotMaxAgeDays` 从测量日算起归档。想让一条数字
+  既被记住又不骗人，用这个而不是把它写成事实。
+- **引用校验**：正文里写的 `dir/file.ext` 会在注入前被核对；只有当"父目录存在、文件不存在"
+  时才提示「⚠ 引用的 X 已不存在，以实测为准」，并可用 `/memories stale` 全库扫描。
 
 ## 日志与排障
 
