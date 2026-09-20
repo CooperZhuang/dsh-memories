@@ -111,6 +111,37 @@ test('the host codecs validate instead of passing values through', () => {
   assert.throws(() => numberCodec?.schema.parse('10'), /must be a number/u)
 })
 
+test('the settings page can list and resolve the decisions waiting for a person', async (t) => {
+  const { store, dshHome } = await roots(t)
+  const seen: { id: string; decision: string }[] = []
+  // A store without a runtime has no decisions: the page must render, not fail.
+  const bare = createRemoteService({ store, dshHome })
+  assert.deepEqual(await bare.disputes(), { disputes: [] })
+  assert.match(await bare.resolveDispute('x', 'accept'), /No decisions are waiting/u)
+
+  const service = createRemoteService({
+    store,
+    dshHome,
+    disputes: async () => [{
+      id: 'a', scope: 'global', action: 'retire', title: 'A', reason: '它被读到过 3 次', before: 'body', after: '',
+    }],
+    resolveDispute: async (id, decision) => {
+      seen.push({ id, decision })
+      return `Kept “${id}”.`
+    },
+  })
+  const listed = await service.disputes()
+  assert.equal(listed.disputes[0]?.reason, '它被读到过 3 次')
+  assert.equal(listed.disputes[0]?.action, 'retire')
+  assert.equal(await service.resolveDispute('a', 'reject'), 'Kept “a”.')
+  assert.deepEqual(seen, [{ id: 'a', decision: 'reject' }])
+  // A missing id, or an unknown decision word, must not reach the runtime as a
+  // destructive default.
+  assert.match(await service.resolveDispute('', 'accept'), /No decision id/u)
+  await service.resolveDispute('a', 'delete-everything')
+  assert.equal(seen[1]?.decision, 'accept', 'anything that is not reject is treated as accept')
+})
+
 test('the service carries the typertRemote binding the gateway validates', async (t) => {
   const { store, dshHome } = await roots(t)
   const service = createRemoteService({ store, dshHome })

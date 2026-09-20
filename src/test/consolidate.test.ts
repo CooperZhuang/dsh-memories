@@ -17,6 +17,7 @@ import {
   CONSOLIDATE_DENY_TOOLS,
   CONSOLIDATE_JSON_SCHEMA,
   clearPendingPlan,
+  classifyPlan,
   denyToolsFor,
   applyPlan,
   parsePlan,
@@ -26,7 +27,7 @@ import {
   runConsolidation,
   writePendingPlan,
 } from '../consolidate.js'
-import type { ConsolidationTarget, SubagentSeam } from '../consolidate.js'
+import type { ConsolidationPlan, ConsolidationTarget, SubagentSeam } from '../consolidate.js'
 import type { MemoryDraft, MemoryEntry, MemoryScope } from '../types.js'
 
 /** Build one entry. */
@@ -196,11 +197,11 @@ test('runConsolidation reads the structured result when the provider returns one
 
 test('a proposal is left alone while fresh, and replaced once it is stale', () => {
   const hour = 3_600_000
-  const pending = { plan: { upserts: [], retire: [], skills: [], notes: '' }, projectRoot: '', at: 0, label: 'global' }
-  // Inside the window a background pass must not spend a model call to overwrite
-  // a question nobody has answered yet.
+  const pending = { plan: { upserts: [], retire: [], skills: [], notes: '' }, disputes: [], projectRoot: '', at: 0, label: 'global' }
+  // Inside the window a decision nobody made is left alone; past it the store has
+  // moved on, so the conservative outcome is to drop the question, not apply it.
   assert.equal(proposalIsFresh(pending, 72, 24 * hour), true)
-  assert.equal(proposalIsFresh(pending, 72, 100 * hour), false, 'the store moved on, so a fresh proposal is the honest one')
+  assert.equal(proposalIsFresh(pending, 72, 100 * hour), false, 'the store moved on, so the question is stale')
   assert.equal(proposalIsFresh(pending, 0, 10_000 * hour), true, '0 means wait for an answer')
 })
 
@@ -213,11 +214,11 @@ test('a proposal round-trips through disk and can be dropped', async (t) => {
     skills: [],
     notes: 'merged two',
   }
-  // The proposal is the only artifact a background pass produces: nothing in the
-  // store changes until a person says so.
-  await writePendingPlan(dir, { plan, projectRoot: '', at: 1_700_000_000_000, label: 'global' })
+  const disputes = [{ id: 'a', scope: 'global' as const, action: 'rewrite' as const, title: 'A', reason: 'r', before: 'a', after: 'a2' }]
+  await writePendingPlan(dir, { plan, disputes, projectRoot: '', at: 1_700_000_000_000, label: 'global' })
   const read = await readPendingPlan(dir)
   assert.equal(read?.plan.retire[0], 'b')
+  assert.equal(read?.disputes[0]?.id, 'a')
   assert.equal(read?.label, 'global')
   assert.equal(await clearPendingPlan(dir), true)
   assert.equal(await readPendingPlan(dir), undefined)
@@ -227,6 +228,53 @@ test('an absent or unreadable proposal reads as none', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-pending2-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   assert.equal(await readPendingPlan(dir), undefined)
+})
+
+test('classification applies what is reversible and asks about what is not', () => {
+  const quoted = 'See scripts/verify_all.py and app/api/routes.py for the two entry points.'
+  const base = entry({ id: 'a', title: 'A', body: quoted, uses: 0 })
+  const plan = (upserts: never[] | ConsolidationPlan['upserts'], retire: string[] = []) => ({ upserts, retire, skills: [], notes: '' })
+  const rewrite = (body: string, over: Partial<ConsolidationPlan['upserts'][number]> = {}) => ({
+    id: 'a', scope: 'global' as const, kind: 'fact' as const, title: 'A', body, tags: [], ...over,
+  })
+
+  // Sharpening wording while keeping the anchors is what a pass is FOR.
+  const sharpened = classifyPlan(plan([rewrite(`${quoted} Both are exercised by the smoke test.`) as never]), { entries: [base] })
+  assert.equal(sharpened.disputes.length, 0)
+  assert.equal(sharpened.safe.upserts.length, 1)
+
+  // Dropping a cited path is a silent loss: nothing downstream can notice it.
+  const dropped = classifyPlan(plan([rewrite('See the two entry points.') as never]), { entries: [base] })
+  assert.equal(dropped.disputes.length, 1)
+  assert.match(dropped.disputes[0]?.reason ?? '', /文件路径引用/u)
+
+  // Halving a body is a summary, and what it drops is what the pass judged noise.
+  const halved = classifyPlan(plan([rewrite(`${quoted}\n\nMore detail that makes this body long enough to matter.`) as never]), { entries: [entry({ id: 'a', title: 'A', body: `${quoted} ${'x'.repeat(400)}` })] })
+  assert.equal(halved.disputes.length, 1)
+  assert.match(halved.disputes[0]?.reason ?? '', /不到原来的一半/u)
+
+  // A person's own words, a pin, and a move between scopes are not the pass's call.
+  for (const [previous, expected] of [
+    [entry({ id: 'a', title: 'A', body: quoted, source: 'user' }), /人手写/u],
+    [entry({ id: 'a', title: 'A', body: quoted, pinned: true }), /置顶/u],
+  ] as const) {
+    const result = classifyPlan(plan([rewrite(`${quoted} sharpened`) as never]), { entries: [previous] })
+    assert.equal(result.disputes.length, 1)
+    assert.match(result.disputes[0]?.reason ?? '', expected)
+  }
+  const moved = classifyPlan(plan([rewrite(`${quoted} sharpened`, { scope: 'project' }) as never]), { entries: [base] })
+  assert.match(moved.disputes[0]?.reason ?? '', /作用域/u)
+
+  // Retirement: nothing ever read it is safe; something a session used is not.
+  assert.equal(classifyPlan(plan([], ['a']), { entries: [base] }).safe.retire.length, 1)
+  const used = classifyPlan(plan([], ['a']), { entries: [entry({ id: 'a', title: 'A', body: 'x', uses: 7 })] })
+  assert.equal(used.safe.retire.length, 0)
+  assert.match(used.disputes[0]?.reason ?? '', /被读到过 7 次/u)
+
+  // A brand-new memory destroys nothing.
+  const created = classifyPlan(plan([{ id: null, scope: 'global', kind: 'fact', title: 'New', body: 'x', tags: [] }]), { entries: [] })
+  assert.equal(created.disputes.length, 0)
+  assert.equal(created.safe.upserts.length, 1)
 })
 
 test('applyPlan merges and retires through the target', async () => {

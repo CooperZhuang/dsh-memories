@@ -56,6 +56,8 @@ export type WireShape =
   | 'skill'
   /** Whether a staged draft was discarded. */
   | 'discard'
+  /** The consolidation decisions waiting for a person. */
+  | 'disputes'
 
 /** One ordered business parameter, as pure data. */
 export interface WireParameter {
@@ -133,6 +135,19 @@ export const REMOTE_INVOCATION_DATA: readonly WireInvocation[] = [
     method: 'discardSkill',
     parameters: [{ name: 'name', wire: 'name', shape: 'text' }],
     result: 'discard',
+  },
+  {
+    method: 'disputes',
+    parameters: [],
+    result: 'disputes',
+  },
+  {
+    method: 'resolveDispute',
+    parameters: [
+      { name: 'id', wire: 'id', shape: 'text' },
+      { name: 'decision', wire: 'decision', shape: 'text' },
+    ],
+    result: 'text',
   },
 ]
 
@@ -298,6 +313,23 @@ function hostCodec(shape: WireShape): StrictCodec {
         const view = asRecord(value, 'discard')
         return { name: asText(view.name, 'discard.name'), removed: asFlag(view.removed, 'discard.removed') }
       }
+      case 'disputes': {
+        const view = asRecord(value, 'disputes')
+        return {
+          disputes: asList(view.disputes, 'disputes.disputes').map((row) => {
+            const entry = asRecord(row, 'dispute')
+            return {
+              id: asText(entry.id, 'dispute.id'),
+              scope: asText(entry.scope, 'dispute.scope'),
+              action: asText(entry.action, 'dispute.action'),
+              title: asText(entry.title, 'dispute.title'),
+              reason: asText(entry.reason, 'dispute.reason'),
+              before: asText(entry.before, 'dispute.before'),
+              after: asText(entry.after, 'dispute.after'),
+            }
+          }),
+        }
+      }
       /* v8 ignore next 2 -- the union is exhaustive; kept for the type checker. */
       default:
         throw new TypeError(`dsh-memories: unknown shape ${String(shape)}`)
@@ -394,6 +426,17 @@ export interface RemoteHost {
   readonly store: MemoryStore
   /** Harness home whose `skills/` promotion writes to. */
   readonly dshHome: string
+  /**
+   * The consolidation decisions waiting for a person, when the runtime is wired.
+   *
+   * The browser never decides what may be applied — it only asks — so these are
+   * hooks back into the runtime rather than logic living at this seam: the
+   * runtime is the only writer, and a page without a runtime (a bare store, a
+   * test) simply has no decisions to show.
+   */
+  readonly disputes?: () => Promise<readonly { id: string; scope: string; action: string; title: string; reason: string; before: string; after: string }[]>
+  /** Accept or reject one waiting decision, through the runtime that owns it. */
+  readonly resolveDispute?: (id: string, decision: 'accept' | 'reject') => Promise<string | undefined>
 }
 
 /**
@@ -412,6 +455,23 @@ export interface MemoriesRemote {
   forget(project?: string, scope?: string, id?: string): Promise<{ readonly removed: boolean }>
   promoteSkill(name?: string): Promise<{ readonly name: string; readonly path: string }>
   discardSkill(name?: string): Promise<{ readonly name: string; readonly removed: boolean }>
+  disputes(): Promise<{ readonly disputes: readonly DisputeView[] }>
+  resolveDispute(id?: string, decision?: string): Promise<string>
+}
+
+/** One consolidation decision, as the settings page renders it. */
+export interface DisputeView {
+  readonly id: string
+  readonly scope: string
+  /** `rewrite` or `retire`. */
+  readonly action: string
+  readonly title: string
+  /** Why this one is being asked about, in one sentence. */
+  readonly reason: string
+  /** What the memory says today. */
+  readonly before: string
+  /** What the pass wants it to say; empty for a retirement. */
+  readonly after: string
 }
 
 /** Narrow a wire scope string to a scope, or `undefined` for "both". */
@@ -541,6 +601,32 @@ export function createRemoteService(host: RemoteHost): MemoriesRemote & { readon
     async discardSkill(name?: string) {
       const wanted = (name ?? '').trim()
       return { name: wanted, removed: await discardDraft(store.memoriesDir, wanted) }
+    },
+
+    async disputes() {
+      if (host.disputes === undefined) return { disputes: [] }
+      const rows = await host.disputes()
+      return {
+        disputes: rows.map((row) => ({
+          id: row.id,
+          scope: row.scope,
+          action: row.action,
+          title: row.title,
+          reason: row.reason,
+          // The page shows both versions; a decision about a rewrite is only
+          // meaningful next to what it is rewriting.
+          before: row.before,
+          after: row.after,
+        })),
+      }
+    },
+
+    async resolveDispute(id?: string, decision?: string) {
+      const wanted = (id ?? '').trim()
+      if (wanted.length === 0) return 'No decision id was given.'
+      const action = decision === 'reject' ? 'reject' : 'accept'
+      if (host.resolveDispute === undefined) return 'No decisions are waiting.'
+      return await host.resolveDispute(wanted, action) ?? 'That decision is no longer waiting.'
     },
   }
   Object.defineProperty(service, 'typertRemote', {

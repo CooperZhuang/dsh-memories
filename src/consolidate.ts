@@ -400,6 +400,133 @@ export interface ConsolidationSnapshot {
   readonly entries: readonly MemoryEntry[]
 }
 
+/**
+ * One consolidation decision that a person should make rather than the pass.
+ *
+ * The pass runs unattended, so the question is not "is this a good edit" but
+ * "can this edit be undone or noticed if it is wrong". Archiving an entry nobody
+ * ever read, folding a duplicate, sharpening a body while keeping its anchors:
+ * all reversible or visible. Deleting the memory a session actually used,
+ * rewriting what a person typed, silently moving a fact between scopes, or
+ * dropping the paths a body cited — those need a human, because the loss is
+ * invisible and the pass has no model of what it did not understand.
+ */
+export interface ConsolidationDispute {
+  /** Entry id the decision is about. */
+  readonly id: string
+  /** Scope the entry lives in. */
+  readonly scope: MemoryScope
+  /** What would happen to it. */
+  readonly action: 'rewrite' | 'retire'
+  /** Title before the change, for the reader. */
+  readonly title: string
+  /** One short sentence saying why this one is being asked about. */
+  readonly reason: string
+  /** What the entry says today. */
+  readonly before: string
+  /** What the pass wants it to say; empty for a retirement. */
+  readonly after: string
+}
+
+/** Paths a body cites, as anchors that must survive a rewrite. */
+const CITATION = /\b[A-Za-z0-9_.-]+\/[A-Za-z0-9_./-]*\.[A-Za-z0-9]{1,6}\b/gu
+
+/** How many cited paths a body carries. */
+function citationCount(body: string): number {
+  return new Set([...body.matchAll(CITATION)].map((match) => match[0])).size
+}
+
+/**
+ * Split a plan into what may be applied unattended and what should be asked about.
+ *
+ * The rules are deliberately about *loss*, not taste: the pass is allowed to
+ * sharpen wording, merge duplicates and retire memories nothing ever read. It is
+ * not allowed to quietly destroy a fact a session used, rewrite something a
+ * person wrote, change where a memory lives, or drop the concrete anchors
+ * (file paths) that made a body checkable.
+ *
+ * @param plan - the plan the pass returned.
+ * @param snapshot - the entries as they were before it ran.
+ * @returns the safe remainder and the decisions to ask about.
+ */
+export function classifyPlan(
+  plan: ConsolidationPlan,
+  snapshot: ConsolidationSnapshot,
+): { safe: ConsolidationPlan; disputes: readonly ConsolidationDispute[] } {
+  // Indexed by id alone: a plan that MOVES an entry between scopes names the new
+  // scope, so a scope+id lookup would miss the entry it is describing and treat a
+  // move as a brand-new memory — the one case where the old copy is the thing
+  // being changed.
+  const byId = new Map<string, MemoryEntry[]>()
+  for (const entry of snapshot.entries) {
+    const list = byId.get(entry.id)
+    if (list === undefined) byId.set(entry.id, [entry])
+    else list.push(entry)
+  }
+  const previousOf = (id: string, scope: MemoryScope): MemoryEntry | undefined => {
+    const candidates = byId.get(id) ?? []
+    return candidates.find((entry) => entry.scope === scope) ?? candidates[0]
+  }
+  const disputes: ConsolidationDispute[] = []
+  const safeUpserts: ConsolidationPlan['upserts'][number][] = []
+  for (const item of plan.upserts) {
+    const previous = item.id === null ? undefined : previousOf(item.id, item.scope)
+    if (previous === undefined) {
+      // A brand-new memory destroys nothing: it can be un-written.
+      safeUpserts.push(item)
+      continue
+    }
+    const reasons: string[] = []
+    if (previous.source === 'user') reasons.push('这条是人手写的')
+    if (previous.pinned === true) reasons.push('这条是置顶的')
+    if (previous.scope !== item.scope) reasons.push(`作用域要从 ${previous.scope} 改成 ${item.scope}`)
+    const lostCitations = citationCount(previous.body) - citationCount(item.body)
+    if (lostCitations > 0) reasons.push(`新版少了 ${lostCitations} 处文件路径引用`)
+    // A body that shrinks by half is not a rewrite, it is a summary — and what
+    // was dropped is exactly what the pass judged to be noise.
+    if (item.body.length * 2 < previous.body.length) reasons.push('新版正文不到原来的一半')
+    if (reasons.length === 0) {
+      safeUpserts.push(item)
+      continue
+    }
+    disputes.push({
+      id: previous.id,
+      scope: previous.scope,
+      action: 'rewrite',
+      title: previous.title,
+      reason: reasons.join('；'),
+      before: previous.body,
+      after: item.body,
+    })
+  }
+  const safeRetire: string[] = []
+  for (const id of plan.retire) {
+    const previous = snapshot.entries.find((entry) => entry.id === id)
+    if (previous === undefined) continue
+    const reasons: string[] = []
+    if (previous.source === 'user') reasons.push('这条是人手写的')
+    if (previous.pinned === true) reasons.push('这条是置顶的')
+    if (previous.uses > 0) reasons.push(`它被读到过 ${previous.uses} 次`)
+    if (reasons.length === 0) {
+      safeRetire.push(id)
+      continue
+    }
+    disputes.push({
+      id: previous.id,
+      scope: previous.scope,
+      action: 'retire',
+      title: previous.title,
+      reason: reasons.join('；'),
+      before: previous.body,
+      after: '',
+    })
+  }
+  return {
+    safe: { upserts: safeUpserts, retire: safeRetire, skills: plan.skills, notes: plan.notes },
+    disputes,
+  }
+}
+
 /** Apply one plan against a store-like target. */
 export interface ConsolidationTarget {
   /** Write one entry, keeping `keepId` when given. */
@@ -419,8 +546,10 @@ export interface ConsolidationResult {
 
 /** A plan waiting for a human, as stored between passes. */
 export interface PendingPlan {
-  /** The plan itself. */
+  /** The disputed part of the plan, so accepting one is a matter of applying it. */
   readonly plan: ConsolidationPlan
+  /** One row per decision being asked about, for the reader. */
+  readonly disputes: readonly ConsolidationDispute[]
   /** Workspace root the plan was prepared for, or `''` for a global-only pass. */
   readonly projectRoot: string
   /** When the pass produced it. */
@@ -464,10 +593,46 @@ export async function readPendingPlan(memoriesDir: string): Promise<PendingPlan 
     const parsed = JSON.parse(text) as PendingPlan
     if (typeof parsed !== 'object' || parsed === null || typeof parsed.plan !== 'object' || parsed.plan === null) return undefined
     if (!Array.isArray(parsed.plan.upserts) || !Array.isArray(parsed.plan.retire)) return undefined
-    return parsed
+    // A file written before disputes existed carries no rows to show; it is
+    // treated as empty rather than as an unreadable file, so an upgrade cannot
+    // strand a question nobody can see.
+    return { ...parsed, disputes: Array.isArray(parsed.disputes) ? parsed.disputes : [] }
   } catch {
     return undefined
   }
+}
+
+/**
+ * Merge newly disputed decisions into the ones already waiting.
+ *
+ * A later pass must not silently replace a question: the reader may be part-way
+ * through deciding, and the same id can legitimately be disputed twice (the pass
+ * proposes something else about it). Newest wins for an id, older rows stay.
+ *
+ * @param memoriesDir - the store root.
+ * @param pending - the rows and the plan fragment that would apply them.
+ * @returns how many rows are waiting after the merge.
+ */
+export async function mergePendingPlan(memoriesDir: string, pending: PendingPlan): Promise<number> {
+  const existing = await readPendingPlan(memoriesDir)
+  if (existing === undefined) {
+    await writePendingPlan(memoriesDir, pending)
+    return pending.disputes.length
+  }
+  const byId = new Map(existing.disputes.map((row) => [`${row.action}\u0000${row.id}`, row]))
+  for (const row of pending.disputes) byId.set(`${row.action}\u0000${row.id}`, row)
+  const disputes = [...byId.values()]
+  // The plan fragment follows the rows: keep the upsert/retire for every id that
+  // is still waiting, so applying a row later needs no second model call.
+  const ids = new Set(disputes.map((row) => row.id))
+  const plan: ConsolidationPlan = {
+    upserts: [...existing.plan.upserts, ...pending.plan.upserts].filter((item) => item.id !== null && ids.has(item.id)),
+    retire: [...new Set([...existing.plan.retire, ...pending.plan.retire])].filter((id) => ids.has(id)),
+    skills: [],
+    notes: pending.plan.notes,
+  }
+  await writePendingPlan(memoriesDir, { plan, disputes, projectRoot: pending.projectRoot, at: pending.at, label: pending.label })
+  return disputes.length
 }
 
 /**

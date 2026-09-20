@@ -41,6 +41,16 @@ const SECTION_COPY = {
     tunables: '配置项',
     tabMemories: '记忆',
     tabConfig: '配置',
+    tabDisputes: '待裁决',
+    disputesTitle: '合并时需要你拍板的事',
+    disputesIntro: '后台合并会自动执行可逆的改动（合并重复、收紧措辞、退役从没被读过的条目）。只有下面这些会伤到内容，才留给你决定——接受就按它改，驳回就原样保留，不动它过 72 小时会自动作废。',
+    disputeRetire: '建议退役',
+    disputeRewrite: '建议改写',
+    disputeBefore: '现在是',
+    disputeAfter: '改成',
+    accept: '接受',
+    reject: '保留原样',
+    noDisputes: '没有待裁决的事项。',
     unavailable: '本部署没有把 memories 远程接口暴露给浏览器，只能编辑可调项。',
     uses: '使用',
     session: '来自会话',
@@ -79,6 +89,16 @@ const SECTION_COPY = {
     tunables: 'Tunables',
     tabMemories: 'Memories',
     tabConfig: 'Configuration',
+    tabDisputes: 'Needs review',
+    disputesTitle: 'Decisions consolidation will not make on its own',
+    disputesIntro: 'Background consolidation applies what is reversible by itself: folding duplicates, sharpening wording, retiring memories nothing ever read. The rows below would lose something — accept applies the change, reject keeps the memory as it is, and doing nothing expires the question after 72 hours.',
+    disputeRetire: 'retire',
+    disputeRewrite: 'rewrite',
+    disputeBefore: 'now',
+    disputeAfter: 'would become',
+    accept: 'Accept',
+    reject: 'Keep as is',
+    noDisputes: 'Nothing needs your decision.',
     unavailable: 'This deployment does not expose the memories Remote API to the browser; only the tunables can be edited.',
     uses: 'used',
     session: 'from',
@@ -187,6 +207,7 @@ function createMemoriesSection(React, Card) {
     const [project, setProject] = React.useState('')
     const [formOpen, setFormOpen] = React.useState(false)
     const [tab, setTab] = React.useState('memories')
+    const [disputes, setDisputes] = React.useState([])
     const [draft, setDraft] = React.useState({ scope: 'global', kind: 'fact', title: '', body: '', tags: '' })
 
     const loadOverview = React.useCallback(async () => {
@@ -225,8 +246,21 @@ function createMemoriesSection(React, Card) {
       return () => clearTimeout(timer)
     }, [query])
 
+    // A decision waits for a person, so the count has to be visible without
+    // opening the tab — otherwise it is a question nobody knows was asked.
+    const loadDisputes = React.useCallback(async () => {
+      if (api === undefined || typeof api.disputes !== 'function') return
+      try {
+        const result = await api.disputes()
+        setDisputes(result?.disputes ?? [])
+      } catch (failure) {
+        setError(errorText(failure))
+      }
+    }, [api])
+
     React.useEffect(() => { void loadOverview() }, [loadOverview])
     React.useEffect(() => { void loadEntries() }, [loadEntries])
+    React.useEffect(() => { void loadDisputes() }, [loadDisputes])
 
     // Preselect the newest project so the project filter has a subject.
     React.useEffect(() => {
@@ -236,7 +270,22 @@ function createMemoriesSection(React, Card) {
     }, [overview, project])
 
     const refresh = async () => {
-      await Promise.all([loadOverview(), loadEntries()])
+      await Promise.all([loadOverview(), loadEntries(), loadDisputes()])
+    }
+
+    /** Accept or reject one waiting decision, then reload what it changed. */
+    const onResolve = async (row, decision) => {
+      if (api === undefined || typeof api.resolveDispute !== 'function') return
+      setBusy(true)
+      try {
+        setNotice(await api.resolveDispute(row.id, decision))
+        await refresh()
+        setError(null)
+      } catch (failure) {
+        setError(errorText(failure))
+      } finally {
+        setBusy(false)
+      }
     }
 
     const onForget = async (entry) => {
@@ -447,6 +496,14 @@ function createMemoriesSection(React, Card) {
         className: `dshm-tab${tab === 'config' ? ' dshm-tab-active' : ''}`,
         onClick: () => setTab('config'),
       }, copy.tabConfig),
+      h('button', {
+        key: 'disputes',
+        type: 'button',
+        role: 'tab',
+        'aria-selected': tab === 'disputes',
+        className: `dshm-tab${tab === 'disputes' ? ' dshm-tab-active' : ''}${disputes.length > 0 ? ' dshm-tab-alert' : ''}`,
+        onClick: () => setTab('disputes'),
+      }, disputes.length > 0 ? `${copy.tabDisputes} (${disputes.length})` : copy.tabDisputes),
     ])
 
     // The two tabs keep the store's CONTENT and the plugin's SETTINGS apart: one
@@ -474,10 +531,48 @@ function createMemoriesSection(React, Card) {
       }),
     ])
 
+    // Only the decisions a pass refused to make alone. The panel says what the
+    // memory says today and what the pass wants instead, because a rewrite is not
+    // decidable from its title.
+    const disputeRows = disputes.map((row) => h('li', { key: `${row.action}:${row.id}`, className: 'dshm-entry' }, [
+      h('div', { key: 'head', className: 'dshm-entry-head' }, [
+        h('h4', { key: 'title', className: 'dshm-entry-title' }, row.title),
+        h('span', { key: 'action', className: 'dshm-badge dshm-badge-global' }, row.action === 'retire' ? copy.disputeRetire : copy.disputeRewrite),
+      ]),
+      h('p', { key: 'reason', className: 'dshm-note' }, row.reason),
+      h('p', { key: 'before', className: 'dshm-body' }, `${copy.disputeBefore}: ${row.before}`),
+      row.after ? h('p', { key: 'after', className: 'dshm-body' }, `${copy.disputeAfter}: ${row.after}`) : null,
+      h('div', { key: 'actions', className: 'dshm-actions' }, [
+        h('button', {
+          key: 'accept',
+          type: 'button',
+          className: 'dshm-btn dshm-btn-primary',
+          disabled: busy,
+          onClick: () => props.onResolve === undefined ? undefined : onResolve(row, 'accept'),
+        }, copy.accept),
+        h('button', {
+          key: 'reject',
+          type: 'button',
+          className: 'dshm-btn',
+          disabled: busy,
+          onClick: () => onResolve(row, 'reject'),
+        }, copy.reject),
+      ]),
+    ]))
+    const disputesPanel = h('div', { key: 'panel-disputes', role: 'tabpanel', className: 'dshm-panel' }, [
+      h('h3', { key: 'title', className: 'dshm-section-title' }, copy.disputesTitle),
+      h('p', { key: 'intro', className: 'dshm-note' }, copy.disputesIntro),
+      disputeRows.length > 0
+        ? h('ul', { key: 'list', className: 'dshm-list' }, disputeRows)
+        : h('p', { key: 'empty', className: 'dshm-note' }, copy.noDisputes),
+      notice !== null ? h('p', { key: 'notice', className: 'dshm-status dshm-ok' }, notice) : null,
+      error !== null ? h('p', { key: 'error', className: 'dshm-status dshm-error' }, error) : null,
+    ])
+
     const children = [head]
     if (overview !== null) children.push(h('p', { key: 'store', className: 'dshm-path' }, `${copy.store}: ${overview.storePath}`))
     children.push(tabList)
-    children.push(tab === 'config' ? configPanel : memoriesPanel)
+    children.push(tab === 'config' ? configPanel : tab === 'disputes' ? disputesPanel : memoriesPanel)
     return h('div', { className: 'dshm-page' }, children)
   }
 }

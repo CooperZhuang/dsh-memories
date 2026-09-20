@@ -45,7 +45,8 @@ import { planRetention, retentionKey } from './retention.js'
 import { MemoryLog, createFileSink, createLogExporter, pluginLogger } from './log.js'
 import { collectWindow, runExtraction } from './extract.js'
 import { backgroundDelayMs, extractionDelayMs, formatDelay, parsePeakHours, peakDelayMs } from './schedule.js'
-import { applyPlan, clearPendingPlan, denyToolsFor, proposalIsFresh, readPendingPlan, runConsolidation, selectForConsolidation, writePendingPlan } from './consolidate.js'
+import { applyPlan, classifyPlan, clearPendingPlan, denyToolsFor, mergePendingPlan, proposalIsFresh, readPendingPlan, runConsolidation, selectForConsolidation, writePendingPlan } from './consolidate.js'
+import type { ConsolidationDispute } from './consolidate.js'
 import { discardDraft, listDrafts, promote, writeDraft } from './skills.js'
 import type { ConsolidationTarget, SubagentSeam } from './consolidate.js'
 import { MEMORY_KINDS } from './types.js'
@@ -500,7 +501,91 @@ export class MemoriesRuntime {
   }
 
   /**
-   * Describe the consolidation proposal waiting for a decision.
+   * The consolidation decisions waiting for a person.
+   *
+   * @returns one row per decision, newest pass first.
+   */
+  async disputes(): Promise<readonly ConsolidationDispute[]> {
+    const pending = await readPendingPlan(this.store.memoriesDir)
+    return pending === undefined ? [] : pending.disputes
+  }
+
+  /**
+   * Accept or reject one waiting decision.
+   *
+   * Accepting applies only that item — the plan fragment stored beside the row —
+   * so a person can take the safe-looking half of a pass without taking all of
+   * it. Rejecting changes nothing: the entry stays exactly as it was.
+   *
+   * @param id - entry id the decision is about.
+   * @param decision - `accept` applies it, `reject` drops it.
+   * @returns a human-readable outcome, or `undefined` when nothing matched.
+   */
+  async resolveDispute(id: string, decision: 'accept' | 'reject'): Promise<string | undefined> {
+    const pending = await readPendingPlan(this.store.memoriesDir)
+    if (pending === undefined) return undefined
+    const row = pending.disputes.find((item) => item.id === id)
+    if (row === undefined) return undefined
+    const root = pending.projectRoot.length > 0 ? pending.projectRoot : undefined
+    if (decision === 'accept') {
+      const upsert = pending.plan.upserts.find((item) => item.id === id)
+      const retire = pending.plan.retire.includes(id)
+      const entries = await this.scopeEntries(root)
+      const snapshot = entries.filter((entry) => entry.id === id)
+      try {
+        await applyPlan(
+          { upserts: upsert === undefined ? [] : [upsert], retire: retire ? [id] : [], skills: [], notes: '' },
+          this.consolidationTarget(),
+          root,
+          { entries: snapshot },
+        )
+        this.log.info('dsh-memories: accepted the consolidation decision for %s (%s)', id, row.action)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        this.log.warn('dsh-memories: accepting the decision for %s failed and was rolled back: %s', id, message)
+        return `Applying that decision failed and was rolled back: ${message}`
+      }
+    } else {
+      this.log.info('dsh-memories: rejected the consolidation decision for %s (%s)', id, row.action)
+    }
+    await this.removeDispute(id)
+    return decision === 'accept'
+      ? `Applied: ${row.action === 'retire' ? 'retired' : 'rewrote'} “${row.title}”.`
+      : `Kept “${row.title}” unchanged.`
+  }
+
+  /** Load the entries of one scope pair, for a single-item apply. */
+  private async scopeEntries(root: string | undefined): Promise<readonly MemoryEntry[]> {
+    const global = await this.store.list('global', undefined, { fresh: true })
+    const project = root === undefined ? [] : await this.store.list('project', root, { fresh: true })
+    return [...global, ...project]
+  }
+
+  /** Drop one row from the waiting set, clearing the file when it empties. */
+  private async removeDispute(id: string): Promise<void> {
+    const pending = await readPendingPlan(this.store.memoriesDir)
+    if (pending === undefined) return
+    const disputes = pending.disputes.filter((row) => row.id !== id)
+    if (disputes.length === 0) {
+      await clearPendingPlan(this.store.memoriesDir)
+      return
+    }
+    await writePendingPlan(this.store.memoriesDir, {
+      plan: {
+        upserts: pending.plan.upserts.filter((item) => item.id !== id),
+        retire: pending.plan.retire.filter((item) => item !== id),
+        skills: [],
+        notes: pending.plan.notes,
+      },
+      disputes,
+      projectRoot: pending.projectRoot,
+      at: pending.at,
+      label: pending.label,
+    })
+  }
+
+  /**
+   * Describe the decisions waiting for a person.
    *
    * @returns a human-readable summary, or `undefined` when nothing is staged.
    */
@@ -508,63 +593,37 @@ export class MemoriesRuntime {
     const pending = await readPendingPlan(this.store.memoriesDir)
     if (pending === undefined) return undefined
     const lines = [
-      `Pending consolidation proposal for ${pending.label} (staged ${new Date(pending.at).toISOString()}):`,
-      `  ${pending.plan.upserts.length} memories would be rewritten, ${pending.plan.retire.length} retired.`,
+      `${pending.disputes.length} consolidation decision${pending.disputes.length === 1 ? '' : 's'} need you (${pending.label}, staged ${new Date(pending.at).toISOString()}):`,
     ]
-    for (const item of pending.plan.upserts.slice(0, 12)) {
-      lines.push(`  write  ${item.id ?? '(new)'} → ${item.title}`)
+    for (const row of pending.disputes.slice(0, 12)) {
+      lines.push(`  [${row.action === 'retire' ? '退役' : '改写'}] ${row.title}`)
+      lines.push(`      ${row.reason}`)
     }
-    for (const id of pending.plan.retire.slice(0, 12)) lines.push(`  retire ${id}`)
-    const extra = pending.plan.upserts.length + pending.plan.retire.length - Math.min(pending.plan.upserts.length, 12) - Math.min(pending.plan.retire.length, 12)
-    if (extra > 0) lines.push(`  … ${extra} more`)
-    lines.push('', pending.plan.notes.length > 0 ? `Agent notes: ${pending.plan.notes}` : 'No agent notes.')
-    lines.push('Apply with /memories apply, drop it with /memories reject.')
+    if (pending.disputes.length > 12) lines.push(`  … ${pending.disputes.length - 12} more`)
+    lines.push('', '在 设置 → 记忆 → 待裁决 里逐条处理，或 /memories apply 全部接受 / /memories reject 全部丢弃。')
     return lines.join('\n')
   }
 
   /**
-   * Apply the pending proposal against the store as it is now.
+   * Apply every waiting decision.
    *
-   * The snapshot used for rollback is re-read at apply time rather than taken
-   * from the pass: time passed, and an entry edited since must not be reverted to
-   * a version nobody has.
-   *
-   * @param _parent - the agent asking; the proposal records its own workspace,
-   *   so this is only part of the command surface.
+   * @param _parent - the agent asking; the stored rows carry their own scope.
    * @returns a human-readable summary, or `undefined` when nothing is staged.
    */
   async applyPendingPlan(_parent: Agent): Promise<string | undefined> {
     const pending = await readPendingPlan(this.store.memoriesDir)
     if (pending === undefined) return undefined
     const root = pending.projectRoot.length > 0 ? pending.projectRoot : undefined
-    const global = await this.store.list('global', undefined, { fresh: true })
-    const project = root === undefined ? [] : await this.store.list('project', root, { fresh: true })
-    const entries = [...global, ...project]
+    const entries = await this.scopeEntries(root)
     try {
-      const result = await applyPlan(pending.plan, this.consolidationTarget(), root, {
-        entries: entries.filter((entry) => pending.plan.upserts.some((item) => item.id === entry.id) || pending.plan.retire.includes(entry.id)),
-      })
-      this.state.markConsolidated(entries.map((entry) => ({ scope: entry.scope, id: entry.id })))
-      const staged: string[] = []
-      for (const draft of pending.plan.skills) {
-        try {
-          await writeDraft(this.store.memoriesDir, draft)
-          staged.push(draft.name)
-        } catch (error) {
-          this.log.warn('dsh-memories: could not stage skill draft %s: %o', draft.name, error)
-        }
-      }
+      const result = await applyPlan(pending.plan, this.consolidationTarget(), root, { entries })
       await clearPendingPlan(this.store.memoriesDir)
-      this.log.info('dsh-memories: applied a consolidation proposal: %d written, %d retired', result.written, result.retired)
-      return [
-        `Applied the proposal: ${result.written} written, ${result.retired} retired.`,
-        staged.length > 0 ? `Staged skill drafts: ${staged.join(', ')} (promote with /memories promote <name>).` : '',
-        result.notes,
-      ].filter((line) => line.length > 0).join(' ')
+      this.log.info('dsh-memories: applied %d waiting consolidation decision(s): %d written, %d retired', pending.disputes.length, result.written, result.retired)
+      return `Applied ${pending.disputes.length} decision${pending.disputes.length === 1 ? '' : 's'}: ${result.written} written, ${result.retired} retired.`
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-      this.log.warn('dsh-memories: applying the proposal failed: %s', message)
-      return `Applying the proposal failed and the store was rolled back: ${message}`
+      this.log.warn('dsh-memories: applying the waiting decisions failed: %s', message)
+      return `Applying them failed and the store was rolled back: ${message}`
     }
   }
 
@@ -1524,15 +1583,14 @@ export class MemoriesRuntime {
     // to overwrite one nobody has answered yet. Inside the window it leaves the
     // pending question alone; past it the store has moved on and a fresh proposal
     // is the honest one. A user who types the command forces it.
+    // An unanswered question goes stale: entries keep arriving while it waits, so
+    // a decision nobody made inside the window is DROPPED rather than applied —
+    // the store has moved on, and changing nothing is the conservative outcome.
     const pending = await readPendingPlan(this.store.memoriesDir).catch(() => undefined)
-    if (pending !== undefined && options.force !== true && proposalIsFresh(pending, this.settings.consolidateProposalMaxAgeHours, Date.now())) {
-      const ageHours = Math.round((Date.now() - pending.at) / 3_600_000)
-      this.log.decision('dsh-memories: leaving the consolidation proposal staged %sh ago alone; review it with /memories plan', ageHours)
-      return undefined
-    }
-    if (pending !== undefined && options.force !== true) {
-      this.log.info('dsh-memories: replacing a consolidation proposal staged %sh ago with a fresh one',
-        Math.round((Date.now() - pending.at) / 3_600_000))
+    if (pending !== undefined && options.force !== true && !proposalIsFresh(pending, this.settings.consolidateProposalMaxAgeHours, Date.now())) {
+      await clearPendingPlan(this.store.memoriesDir)
+      this.log.info('dsh-memories: dropped %d unanswered consolidation decision(s) staged %sh ago; the store has moved on',
+        pending.disputes.length, Math.round((Date.now() - pending.at) / 3_600_000))
     }
     // A manual pass creates the job when none exists: the cooldown gates the
     // BACKGROUND pass, and a user who types the command is asking for it now.
@@ -1581,21 +1639,14 @@ export class MemoriesRuntime {
         this.state.deleteJob(CONSOLIDATE_JOB)
         return undefined
       }
-      // A pass the user typed applies; a pass nothing asked for only proposes.
-      // The difference is the whole point: a silent rewrite has no model of what
-      // it is destroying, and one such pass on a real store erased 32 trigger
-      // phrases and demoted 8 hand-written rules before anyone noticed.
-      if (options.apply !== true) {
-        const label = root === undefined ? NO_PROJECT_LABEL : this.store.target('project', root).label
-        await writePendingPlan(this.store.memoriesDir, { plan, projectRoot: root ?? '', at: Date.now(), label })
-        this.state.markConsolidated(entries.map((entry) => ({ scope: entry.scope, id: entry.id })))
-        this.state.deleteJob(CONSOLIDATE_JOB)
-        this.state.clearLimit()
-        this.log.info('dsh-memories: staged a consolidation proposal (%d upserts, %d retires) for %s',
-          plan.upserts.length, plan.retire.length, parent.session.id)
-        return `Staged a consolidation proposal for ${entries.length} memories: ${plan.upserts.length} to write, ${plan.retire.length} to retire. Nothing changed yet — review with /memories plan, then /memories apply or /memories reject.`
-      }
-      const result = await applyPlan(plan, this.consolidationTarget(), root, { entries })
+      // The pass runs unattended; what it may do unattended is the question
+      // `classifyPlan` answers. Sharpening wording, folding duplicates and
+      // retiring memories nothing ever read are reversible and visible. Killing
+      // the memory a session used, rewriting what a person typed, moving a fact
+      // between scopes, or dropping the paths that made a body checkable are not
+      // — those wait for a person, and they are the only thing that waits.
+      const { safe, disputes } = classifyPlan(plan, { entries })
+      const result = await applyPlan(safe, this.consolidationTarget(), root, { entries })
       // Record the review, so the next pass starts from whatever has waited
       // longest instead of from the same newest page again.
       this.state.markConsolidated(entries.map((entry) => ({ scope: entry.scope, id: entry.id })))
@@ -1610,13 +1661,34 @@ export class MemoriesRuntime {
           this.log.warn('dsh-memories: could not stage skill draft %s: %o', draft.name, error)
         }
       }
+      // A decision worth asking about is stored, not applied, and it merges with
+      // whatever is already waiting so a later pass cannot silently replace a
+      // question somebody is part-way through answering.
+      let waiting = 0
+      if (disputes.length > 0) {
+        const disputedIds = new Set(disputes.map((row) => row.id))
+        const label = root === undefined ? NO_PROJECT_LABEL : this.store.target('project', root).label
+        waiting = await mergePendingPlan(this.store.memoriesDir, {
+          plan: {
+            upserts: plan.upserts.filter((item) => item.id !== null && disputedIds.has(item.id)),
+            retire: plan.retire.filter((id) => disputedIds.has(id)),
+            skills: [],
+            notes: plan.notes,
+          },
+          disputes,
+          projectRoot: root ?? '',
+          at: Date.now(),
+          label,
+        })
+      }
       this.state.deleteJob(CONSOLIDATE_JOB)
       this.state.clearLimit()
-      this.log.info('dsh-memories: consolidated %d written, %d retired, %d skill drafts for session %s',
-        result.written, result.retired, staged.length, parent.session.id)
+      this.log.info('dsh-memories: consolidated %d written, %d retired, %d skill drafts, %d decision(s) needing a person (%d waiting) for session %s',
+        result.written, result.retired, staged.length, disputes.length, waiting, parent.session.id)
       return [
         `Consolidated ${entries.length} memories: ${result.written} written, ${result.retired} retired.`,
         staged.length > 0 ? `Staged skill drafts: ${staged.join(', ')} (promote with /memories promote <name>).` : '',
+        disputes.length > 0 ? `${disputes.length} decision${disputes.length === 1 ? '' : 's'} need you (${waiting} waiting): review in 设置 → 记忆 → 待裁决, or with /memories plan.` : '',
         result.notes,
       ].filter((line) => line.length > 0).join(' ')
     } catch (error) {
@@ -1708,12 +1780,53 @@ export class MemoriesRuntime {
     if (stale > 0) {
       this.log.info('dsh-memories: %d memories cite a path that no longer resolves; /memories stale lists them', stale)
     }
+    // Consolidation is otherwise enqueued only when an extraction STORES something,
+    // so a store nobody is writing to is never reorganised — and a memory written
+    // by hand never queues a pass at all. The sweep is already a timer, so it
+    // queues one; the pass returns before any model call when there is nothing
+    // worth reviewing, so idling costs nothing.
+    const queued = await this.queueConsolidation(now).catch(() => false) ? 1 : 0
     // One line per sweep, always: it is the only evidence that retention runs at
     // all, and a sweep that never archives anything is exactly what somebody
     // wondering "why is my store still this big" needs to see.
-    this.log.info('dsh-memories: sweep: archived %d memories across %d project scopes, pruned %d empty project director%s, %d stale citation%s',
-      archived, scopes, removed.length, removed.length === 1 ? 'y' : 'ies', stale, stale === 1 ? '' : 's')
+    this.log.info('dsh-memories: sweep: archived %d memories across %d project scopes, pruned %d empty project director%s, %d stale citation%s%s',
+      archived, scopes, removed.length, removed.length === 1 ? 'y' : 'ies', stale, stale === 1 ? '' : 's',
+      queued === 1 ? ', queued a consolidation pass' : '')
     return archived
+  }
+
+  /**
+   * Queue a consolidation pass if one is not already waiting and there is work.
+   *
+   * @param now - clock.
+   * @returns whether a pass was queued.
+   */
+  private async queueConsolidation(now: number): Promise<boolean> {
+    if (!this.settings.consolidate || this.subagents === undefined) return false
+    if (this.state.getJob(CONSOLIDATE_JOB) !== undefined) return false
+    const reviewed = new Map(this.state.retentionRows().map((row) => [retentionKey(row.scope, row.id), row.consolidatedAt]))
+    const enough = async (entries: readonly MemoryEntry[]): Promise<boolean> => {
+      const picked = selectForConsolidation(entries, reviewed, this.settings.consolidateMaxEntries)
+      // A pass reviews whatever has waited longest, so "enough" means "there is a
+      // page to review", not "there is something never reviewed" — the latter
+      // would stop short on a store whose entries were all seen once.
+      return picked.length >= 2
+    }
+    if (await enough(await this.store.list('global', undefined, { fresh: true }))) {
+      this.enqueueConsolidation(now, true)
+      return true
+    }
+    for (const slug of await this.store.listProjects()) {
+      const descriptor = await this.store.readProjectDescriptor(slug)
+      if (descriptor === undefined) continue
+      // The harness home owns no memories any more (see `resolveProjectRoot`).
+      if (isWithin(this.deployment.dshHome, descriptor.root)) continue
+      if (await enough(await this.store.list('project', descriptor.root, { fresh: true }))) {
+        this.enqueueConsolidation(now, true, descriptor.root)
+        return true
+      }
+    }
+    return false
   }
 
   /**
@@ -2050,10 +2163,10 @@ function helpText(): string {
     '  restore <id>            bring an archived memory back',
     '  mode [on|off]           switch memory off or on for this session',
     '  mine                    extract memories from this session now',
-    '  consolidate             propose a merge/reconcile pass (nothing changes until /memories apply)',
-    '  plan                    show the pending consolidation proposal',
-    '  apply                   apply the pending consolidation proposal',
-    '  reject                  discard the pending consolidation proposal',
+    '  consolidate             run a merge/reconcile pass now (safe changes apply at once)',
+    '  plan                    list the consolidation decisions waiting for you',
+    '  apply                   accept every waiting decision',
+    '  reject                  discard every waiting decision',
     '  sweep                   archive unused memories now',
     '  stale                   list memories that cite a file that no longer exists',
     '  skills                  list staged skill drafts',
@@ -2153,7 +2266,12 @@ export function apply(ctx: Context, config: MemoriesConfig = {}): void {
     try {
       const withdraw = typert.register(REMOTE_CONTRIBUTION)
       ctx.effect(() => withdraw, 'dsh-memories.remoteContribution')
-      const service = createRemoteService({ store: runtime.store, dshHome: deployment.dshHome })
+      const service = createRemoteService({
+        store: runtime.store,
+        dshHome: deployment.dshHome,
+        disputes: () => runtime.disputes(),
+        resolveDispute: (id, decision) => runtime.resolveDispute(id, decision),
+      })
       ctx.effect(() => ctx.provide(REMOTE_SERVICE, service), 'dsh-memories.remoteService')
     } catch (error) {
       log.warn('dsh-memories: remote registration failed, the settings page stays unavailable: %o', error)

@@ -59,6 +59,9 @@ const CSS = [
   '.dshm-tab{height:28px;padding:0 12px;font:inherit;font-size:13px;border:none;border-radius:8px;background:transparent;color:var(--dsw-alias-label-tertiary);cursor:pointer}',
   '.dshm-tab:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}',
   '.dshm-tab-active{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);font-weight:500}',
+  // A tab that is waiting for a decision has to look like it: the point of the
+  // disputed subset is that somebody notices it among everything else.
+  '.dshm-tab-alert{color:var(--dsw-alias-label-primary);box-shadow:inset 0 -2px 0 0 var(--dsw-alias-brand-primary,#d97706)}',
   '.dshm-panel{display:flex;flex-direction:column;gap:12px}',
 ].join('\n')
 

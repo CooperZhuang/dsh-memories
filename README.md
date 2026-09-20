@@ -302,10 +302,10 @@ frontmatter 的目录包），下次技能目录刷新后进入目录。草稿�
 /memories restore <id>        把归档的记忆取回原作用域
 /memories mode [on|off]       本次会话关闭/开启记忆（不写库、不抽取、不注入）
 /memories mine                立刻从当前会话抽取一次（不等空闲）
-/memories consolidate         产出一次合并提案（**不改库**，等 /memories apply）
-/memories plan                查看待确认的合并提案
-/memories apply               落盘待确认的合并提案（失败会回滚）
-/memories reject              丢弃待确认的合并提案
+/memories consolidate         立刻跑一次合并（可逆的改动直接落盘，有争议的才排队等你）
+/memories plan                列出等你裁决的合并决定
+/memories apply               全部接受（失败会回滚）
+/memories reject              全部丢弃（原样保留）
 /memories sweep               立刻跑一次保留整理（归档长期无用的记忆）
 /memories stale               列出引用了"已不存在的文件"的记忆
 /memories skills              列出技能草稿
@@ -329,23 +329,29 @@ frontmatter 的目录包），下次技能目录刷新后进入目录。草稿�
 
 ## 后台定期做什么（以及为什么有些事必须问你）
 
-插件在宿主里跑三个定时任务，分工的标准只有一条：**判据是确定的、结果可逆的，就自动做；
-需要模型判断并且会改写正文的，只出提案。**
+插件在宿主里跑三个定时任务，分工的标准只有一条：**结果可逆的自动做；会丢东西、而且丢了看不见的，
+才问人。**
 
 | 任务 | 周期 | 做什么 | 要不要人 |
 | --- | --- | --- | --- |
 | 抽取（`extractIntervalMinutes`） | 30 分钟扫一遍有活动的会话（另加 `minIdleHours` 空闲门槛） | 把新内容里**可复用的事实**写进记忆；把当前作用域已有条目的标题一起给模型，让它改写已有条目而不是新增 | 不需要。写入即生效，但每条都带 provenance、可 `archive`/`forget` |
-| 整理 sweep（`sweepIntervalHours`） | 12 小时 | 保留策略（`maxUnusedDays`）、快照过期（`snapshotMaxAgeDays`）、作用域改名自愈、空目录清理，并**统计失效引用条数写进一行日志** | 不需要。全部是确定性规则，且归档可 `restore` |
-| 合并 consolidate（`consolidateCooldownHours`） | 6 小时冷却 | 让受限子代理把一批记忆去重、改写、退役 | **需要**：它只产出 `memories/pending/consolidation.json`，要 `/memories plan` 看、`/memories apply` 落盘、`/memories reject` 丢弃 |
+| 整理 sweep（`sweepIntervalHours`） | 12 小时 | 保留策略（`maxUnusedDays`）、快照过期（`snapshotMaxAgeDays`）、作用域改名自愈、空目录清理、**统计失效引用条数**，并在没有待处理任务时**补排一次合并** | 不需要。全部是确定性规则，且归档可 `restore` |
+| 合并 consolidate（`consolidateCooldownHours`） | 6 小时冷却，另有 sweep 兜底排队 | 让受限子代理把一批记忆去重、改写、退役。**可逆的改动直接落盘**，只有少数会造成损失的决定留给人 | 只有"有争议"的那些：在 **设置 → 记忆 → 待裁决** 里逐条接受/驳回，或 `/memories plan` 看、`/memories apply` 全接受、`/memories reject` 全丢弃 |
 
-为什么合并必须是提案：它是唯一会**改写正文**的通道，而它判错过——实测一次后台整理抹掉了
-32 条 `appliesTo`、把 8 条人写的规则降级成"抽取器的猜测"、把中文标题改回英文，全部是事后
-审计才发现的。提案有同样的能力、没有这份风险。
+**"有争议"是明确定义的**（`classifyPlan`），判据是"丢了能不能被发现或恢复"，不是口味：
 
-提案不会烂在那里：`consolidateProposalMaxAgeHours`（默认 72 小时）之内后台**不重复生成**
-（避免花模型调用去覆盖一个没人回答的问题），超时后由新提案替换（届时库已经变了，旧提案本来
-也不再准确）；`/memories consolidate` 无视这个窗口。注入块里会一直提示有一份待确认的提案，
-`/memories stats` 的 `consolidation:` 一行会显示它的年龄与规模。
+- **自动执行**：收紧措辞（路径引用与长度都没丢）、合并重复、退役 `uses=0` 且非人手写、非置顶的条目、新增条目。
+- **问人**：退役一条**被读到过**的记忆、改写**人手写**或**置顶**的记忆、把事实**换作用域**、
+  改写后**少了文件路径引用**、或**正文缩到一半以下**。
+  页面上每条同时给出「现在是 / 改成」，因为改写对不对无法只看标题判断。
+
+不处理的后果是保守的：超过 `consolidateProposalMaxAgeHours`（默认 72 小时）仍未处理的决定**自动作废**，
+不会被应用——库已经变了，什么都不改才是稳妥的结果。注入块只在**确实有争议项**时才会提示一句，
+`/memories stats` 的 `consolidation:` 一行显示它的规模与年龄。
+
+（背景：这个通道曾经判错过——一次后台整理抹掉 32 条 `appliesTo`、把 8 条人写的规则降级成
+"抽取器的猜测"、把中文标题改回英文，全部是事后审计才发现的。元数据那几类已经在存储层被强制保留，
+剩下的"会丢内容"的几类就是上面那五条。）
 
 **归档 vs 删除**：归档是唯一的自动处置方式（`/memories archive` 列表、`/memories restore <id>` 取回），
 永不因"长期未用"被动到 `source: user` 或 `pinned` 的记忆。真正删除只有两个入口：
