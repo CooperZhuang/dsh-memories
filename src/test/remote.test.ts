@@ -47,12 +47,14 @@ test('every invocation satisfies the registry validation rules', () => {
     assert.equal(ids.has(descriptor.id), false, `duplicate id ${descriptor.id}`)
     endpoints.add(endpoint)
     ids.add(descriptor.id)
-    // Strict codecs need a nonempty type symbol and a parse() function.
+    // Strict codecs need a nonempty type symbol and a create() factory whose
+    // schema parses; the registry rejects any other strict codec shape.
     const codecs: StrictCodec[] = [descriptor.result, ...descriptor.parameters.map((parameter) => parameter.codec)]
     for (const codec of codecs) {
       assert.equal(codec.mode, 'strict')
       assert.ok(codec.typeSymbol.length > 0)
-      assert.equal(typeof codec.schema.parse, 'function')
+      assert.equal(typeof codec.create, 'function')
+      assert.equal(typeof codec.create().parse, 'function')
     }
     const wires = new Set<string>()
     for (const parameter of descriptor.parameters) {
@@ -72,7 +74,7 @@ test('the wire table and the expanded descriptors agree', () => {
   const seen = new Set<WireShape>()
   const expanded = expandInvocations(REMOTE_INVOCATION_DATA, (shape) => {
     seen.add(shape)
-    return { mode: 'strict', typeSymbol: shape, schema: { parse: (value: unknown) => value } }
+    return { mode: 'strict', typeSymbol: shape, create: () => ({ parse: (value: unknown) => value }) }
   })
   assert.equal(expanded.length, REMOTE_INVOCATION_DATA.length)
   assert.deepEqual(expanded.map((descriptor) => descriptor.method), REMOTE_INVOCATION_DATA.map((invocation) => invocation.method))
@@ -98,17 +100,17 @@ test('the host codecs validate instead of passing values through', () => {
   const byMethod = new Map(REMOTE_CONTRIBUTION.invocations.map((descriptor) => [descriptor.method, descriptor]))
   const overview = byMethod.get('overview')
   assert.ok(overview !== undefined)
-  assert.throws(() => overview.result.schema.parse({}), /storePath must be a string/u)
-  assert.throws(() => overview.result.schema.parse({ storePath: 'x', globalCount: 1, projects: [], drafts: [], kinds: 'nope' }), /must be an array/u)
+  assert.throws(() => overview.result.create().parse({}), /storePath must be a string/u)
+  assert.throws(() => overview.result.create().parse({ storePath: 'x', globalCount: 1, projects: [], drafts: [], kinds: 'nope' }), /must be an array/u)
 
   const list = byMethod.get('list')
   assert.ok(list !== undefined)
   const textCodec = list.parameters.find((parameter) => parameter.wire === 'query')?.codec
   const numberCodec = list.parameters.find((parameter) => parameter.wire === 'limit')?.codec
-  assert.equal(textCodec?.schema.parse('hello'), 'hello')
-  assert.throws(() => textCodec?.schema.parse(7), /must be a string/u)
-  assert.equal(numberCodec?.schema.parse(10), 10)
-  assert.throws(() => numberCodec?.schema.parse('10'), /must be a number/u)
+  assert.equal(textCodec?.create().parse('hello'), 'hello')
+  assert.throws(() => textCodec?.create().parse(7), /must be a string/u)
+  assert.equal(numberCodec?.create().parse(10), 10)
+  assert.throws(() => numberCodec?.create().parse('10'), /must be a number/u)
 })
 
 test('the settings page can list and resolve the decisions waiting for a person', async (t) => {

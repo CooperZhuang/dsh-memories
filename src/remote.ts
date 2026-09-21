@@ -12,9 +12,12 @@
  * the same shape from TypeScript decorators, but this package ships plain JS
  * with no build-time Typert step, and the registry's own validation
  * (`dsh-typert-registry`) accepts any contribution whose codecs carry a
- * `typeSymbol` and a `schema.parse` — a live Zod schema is one such codec, a
- * hand-written validator is another. Dropping the generator therefore costs no
- * wire capability and no dependency.
+ * `typeSymbol` and a `create()` factory returning a schema with `parse()` — a
+ * live Zod schema is one such codec, a hand-written validator is another.
+ * (0.1.6-alpha.2 replaced the older `schema.parse` field with that factory: the
+ * registry now checks `typeof codec.create === 'function'` and the gateway
+ * materializes the schema with `codec.create().parse(value)`.) Dropping the
+ * generator therefore costs no wire capability and no dependency.
  *
  * `REMOTE_INVOCATION_DATA` is the single source of truth for the wire shape:
  * the host expands it with validating parsers, and `scripts/build-client.mjs`
@@ -151,11 +154,18 @@ export const REMOTE_INVOCATION_DATA: readonly WireInvocation[] = [
   },
 ]
 
-/** A codec the registry accepts: a type symbol plus a boundary parser. */
+/** A schema a codec materializes: the one method the gateway calls. */
+export interface CodecSchema {
+  /** Validate one value at the wire boundary. */
+  parse(value: unknown): unknown
+}
+
+/** A codec the registry accepts: a type symbol plus a lazy schema factory. */
 export interface StrictCodec {
   readonly mode: 'strict'
   readonly typeSymbol: string
-  readonly schema: { parse(value: unknown): unknown }
+  /** Materialize the shape's schema; the registry requires this factory. */
+  create(): CodecSchema
 }
 
 /** One registry invocation descriptor. */
@@ -275,7 +285,7 @@ function parseDraftView(value: unknown): Record<string, unknown> {
  * the store.
  *
  * @param shape - the shape to validate.
- * @returns a strict codec carrying that shape's parser.
+ * @returns a strict codec whose `create()` returns that shape's parser.
  */
 function hostCodec(shape: WireShape): StrictCodec {
   const parse = (value: unknown): unknown => {
@@ -335,7 +345,7 @@ function hostCodec(shape: WireShape): StrictCodec {
         throw new TypeError(`dsh-memories: unknown shape ${String(shape)}`)
     }
   }
-  return { mode: 'strict', typeSymbol: `${REMOTE_PACKAGE}#${shape}`, schema: { parse } }
+  return { mode: 'strict', typeSymbol: `${REMOTE_PACKAGE}#${shape}`, create: () => ({ parse }) }
 }
 
 /**

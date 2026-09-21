@@ -52,7 +52,7 @@ import type { ConsolidationTarget, SubagentSeam } from './consolidate.js'
 import { MEMORY_KINDS } from './types.js'
 import type { MemoryDraft, MemoryEntry, MemoryKind, MemoryScope, SessionMode } from './types.js'
 import { registerMemoryTool } from './tool.js'
-import { REMOTE_CONTRIBUTION, REMOTE_SERVICE, createRemoteService } from './remote.js'
+import { REMOTE_CONTRIBUTION, REMOTE_NAMESPACE, REMOTE_SERVICE, createRemoteService } from './remote.js'
 import type { TypertRegistryLike } from './remote.js'
 
 /** Plugin name; also the source tag of every injected message. */
@@ -2273,8 +2273,13 @@ export function apply(ctx: Context, config: MemoriesConfig = {}): void {
         resolveDispute: (id, decision) => runtime.resolveDispute(id, decision),
       })
       ctx.effect(() => ctx.provide(REMOTE_SERVICE, service), 'dsh-memories.remoteService')
+      log.info('dsh-memories: exposed the %s Remote namespace to the browser (%d methods)',
+        REMOTE_NAMESPACE, REMOTE_CONTRIBUTION.invocations.length)
     } catch (error) {
-      log.warn('dsh-memories: remote registration failed, the settings page stays unavailable: %o', error)
+      // The logger serializes `%o` to `{}` for an Error, which hides the one
+      // line a human needs here; log the message instead.
+      log.warn('dsh-memories: remote registration failed, the settings page stays unavailable: %s',
+        error instanceof Error ? error.message : String(error))
     }
   }
   // Import (and remove) a pre-SQLite watermark file once, so upgrading does not

@@ -11,6 +11,9 @@
  * here carries the contract (mode + type symbol) with a permissive parser:
  * validation is the host's job, at the boundary where the value actually
  * arrives, and keeping it there means no schema library ships to the browser.
+ * The registry validates a strict codec by requiring a `create()` factory (it
+ * replaced the older `schema.parse` field in 0.1.6-alpha.2), so the browser
+ * codec exposes the same pass-through parser through that factory.
  */
 
 /** npm package owning the Remote methods. */
@@ -25,7 +28,7 @@ function clientCodec(shape) {
   return {
     mode: 'strict',
     typeSymbol: `${REMOTE_PACKAGE}#${shape}`,
-    schema: { parse: (value) => value },
+    create: () => ({ parse: (value) => value }),
   }
 }
 

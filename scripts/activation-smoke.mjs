@@ -97,9 +97,16 @@ class Typert {
     if (contribution.face !== 'host') throw new Error('host contribution must declare face "host"')
     for (const invocation of contribution.invocations ?? []) {
       if (typeof invocation.method !== 'string' || invocation.method.length === 0) throw new Error('invocation without a method')
-      if (typeof invocation.result?.schema?.parse !== 'function') throw new Error(`${invocation.method}: result codec is not strict`)
+      // The registry validates strict codecs through their create() factory
+      // (0.1.6-alpha.2 dropped the older schema.parse field), so the stand-in
+      // checks the same contract the real one does.
+      if (typeof invocation.result?.create !== 'function' || typeof invocation.result.create().parse !== 'function') {
+        throw new Error(`${invocation.method}: result codec is not strict`)
+      }
       for (const parameter of invocation.parameters ?? []) {
-        if (typeof parameter.codec?.schema?.parse !== 'function') throw new Error(`${invocation.method}.${parameter.name}: parameter codec is not strict`)
+        if (typeof parameter.codec?.create !== 'function' || typeof parameter.codec.create().parse !== 'function') {
+          throw new Error(`${invocation.method}.${parameter.name}: parameter codec is not strict`)
+        }
       }
     }
     this.contributions.push(contribution)
