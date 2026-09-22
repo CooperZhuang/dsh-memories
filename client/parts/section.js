@@ -5,7 +5,7 @@
  * skills, and the tunables card — because a settings section's copy and data
  * both belong to the feature that registered it. Data arrives through the
  * Remote namespace the host registered (`ctx.remote.memories`), tunables through
- * the settings scope, so this page reads one store and one settings document and
+ * this entry's own config form, so this page reads one store and one config and
  * never a private route.
  */
 
@@ -275,10 +275,17 @@ function createMemoriesSection(React, Card) {
 
     /** Accept or reject one waiting decision, then reload what it changed. */
     const onResolve = async (row, decision) => {
-      if (api === undefined || typeof api.resolveDispute !== 'function') return
+      if (api === undefined || typeof api.resolveDispute !== 'function') {
+        setError(copy.unavailable)
+        return
+      }
       setBusy(true)
+      setNotice(null)
       try {
-        setNotice(await api.resolveDispute(row.id, decision))
+        // One object keyed by the descriptor's own parameter names: the Remote
+        // wrapper maps those fields onto the gateway's positional arguments, so
+        // a positional call arrives as no arguments at all.
+        setNotice(await api.resolveDispute({ id: row.id, decision }))
         await refresh()
         setError(null)
       } catch (failure) {
@@ -548,7 +555,7 @@ function createMemoriesSection(React, Card) {
           type: 'button',
           className: 'dshm-btn dshm-btn-primary',
           disabled: busy,
-          onClick: () => props.onResolve === undefined ? undefined : onResolve(row, 'accept'),
+          onClick: () => onResolve(row, 'accept'),
         }, copy.accept),
         h('button', {
           key: 'reject',
@@ -562,6 +569,7 @@ function createMemoriesSection(React, Card) {
     const disputesPanel = h('div', { key: 'panel-disputes', role: 'tabpanel', className: 'dshm-panel' }, [
       h('h3', { key: 'title', className: 'dshm-section-title' }, copy.disputesTitle),
       h('p', { key: 'intro', className: 'dshm-note' }, copy.disputesIntro),
+      api === undefined ? h('p', { key: 'unavailable', className: 'dshm-status dshm-error' }, copy.unavailable) : null,
       disputeRows.length > 0
         ? h('ul', { key: 'list', className: 'dshm-list' }, disputeRows)
         : h('p', { key: 'empty', className: 'dshm-note' }, copy.noDisputes),

@@ -103,6 +103,13 @@ async function mountMemoriesRemote(ctx) {
       // gateway omits from the wire fields and the host's `acceptsUndefined`
       // descriptor allows.
       const supplied = args ?? {}
+      // A positional call (`api.resolveDispute(id, decision)` spread over two
+      // arguments) would otherwise reach the host as an empty field set and come
+      // back as a gateway complaint — or, for a handler that swallows it, as a
+      // dead button. Fail here instead, where the mistake actually is.
+      if (invocation.parameters.length > 0 && (typeof supplied !== 'object' || Array.isArray(supplied))) {
+        throw new Error(`dsh-memories: ${invocation.method} takes one object keyed by its parameter names (${invocation.parameters.map((parameter) => parameter.name).join(', ')})`)
+      }
       const values = invocation.parameters.map((parameter) => supplied[parameter.name])
       const result = await namespace[invocation.method](...values)
       return unwrapRemote(invocation.method, result)
