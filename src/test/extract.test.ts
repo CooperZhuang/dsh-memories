@@ -60,7 +60,7 @@ function stubSession(cwd: string, events: { seq: number; role: 'user' | 'assista
           type: 'user/message',
           data: {
             content: [{ type: 'text', text: event.text }],
-            source: event.source === 'plugin' ? { kind: 'plugin', plugin: 'other' } : { kind: 'user' },
+            source: event.source === 'plugin' ? { kind: 'plugin:other' } : { kind: 'user' },
           },
         }
       }
@@ -244,7 +244,7 @@ test('runExtraction stores drafts, advances the watermark, and never mines twice
     t.after(() => runtime.dispose())
     const agent = { id: 'extract-session', session, status: 'idle' } as unknown as Agent
 
-    assert.equal(await runtime.runExtraction(agent), 1)
+    assert.equal((await runtime.runExtraction(agent)).stored, 1)
     const stored = await runtime.store.list('project', process.cwd(), { fresh: true })
     assert.equal(stored.length, 1)
     assert.equal(stored[0]?.source, 'auto')
@@ -255,8 +255,73 @@ test('runExtraction stores drafts, advances the watermark, and never mines twice
     assert.equal(state?.contributed, true)
 
     // Nothing new on the surface, so a second pass is a no-op.
-    assert.equal(await runtime.runExtraction(agent), 0)
+    assert.equal((await runtime.runExtraction(agent)).stored, 0)
     assert.equal((await runtime.store.list('project', process.cwd(), { fresh: true })).length, 1)
+  t.after(() => rm(dir, { recursive: true, force: true }))
+})
+
+test('an llm service that arrives after activation is still used', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-late-llm-'))
+  const session = stubSession(process.cwd(), [{ seq: 1, role: 'user', text: 'I always deploy with pnpm run ship.' }])
+  const reply = '{"memories":[{"scope":"project","title":"Deploy with pnpm run ship","body":"Ship with `pnpm run ship`.","tags":["deploy"]}]}'
+  let live: unknown
+  const ctx = {
+    get: (name: string) => (name === 'llm' ? live : undefined),
+    logger: { info: () => undefined, warn: () => undefined, debug: () => undefined },
+  } as never
+  const runtime = new MemoriesRuntime(ctx, { memoriesDir: dir, autoExtract: true, extractTimeoutMs: 5_000 })
+  t.after(() => runtime.dispose())
+  const agent = { id: 'extract-session', session, status: 'idle' } as unknown as Agent
+
+  // In 0.1.7 the service can be provided by a row that runs after this plugin's,
+  // so the activation snapshot is legitimately empty. Capturing it once — which
+  // is what the plugin used to do — turned every later pass into a silent no-op
+  // and left the watermark frozen for days.
+  const before = await runtime.runExtraction(agent)
+  assert.equal(before.stored, 0)
+  assert.equal(before.reason, 'no-llm', 'the refusal names the missing service')
+
+  live = fakeLlm(reply)
+  assert.equal((await runtime.runExtraction(agent)).stored, 1, 'the pass picks the service up when it appears')
+  assert.equal((await runtime.store.list('project', process.cwd(), { fresh: true })).length, 1)
+  t.after(() => rm(dir, { recursive: true, force: true }))
+})
+
+test('a session the registry knows but this process never settled is still mined', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-registry-'))
+  const lines: string[] = []
+  const session = stubSession(process.cwd(), [{ seq: 1, role: 'user', text: 'Always run the tests with npm test here.' }])
+  const reply = '{"memories":[{"scope":"project","title":"Run npm test","body":"Use `npm test`.","tags":["test"]}]}'
+  const agent = {
+    id: 'extract-session',
+    session,
+    status: 'idle',
+    runMaintenance: (job: (signal: AbortSignal) => Promise<unknown>) => job(new AbortController().signal),
+  } as unknown as Agent
+  const ctx = {
+    get: (name: string) => {
+      if (name === 'llm') return fakeLlm(reply)
+      if (name === 'agents') return { roots: () => [agent] }
+      return undefined
+    },
+    logger: {
+      info: (format: string, ...args: unknown[]) => lines.push(`${format} ${args.join(' ')}`),
+      warn: (format: string, ...args: unknown[]) => lines.push(`${format} ${args.join(' ')}`),
+      debug: (format: string, ...args: unknown[]) => lines.push(`${format} ${args.join(' ')}`),
+    },
+  } as never
+  const runtime = new MemoriesRuntime(ctx, { memoriesDir: dir, autoExtract: true, extractTimeoutMs: 5_000 })
+  t.after(() => runtime.dispose())
+
+  // `tracked` only holds agents that settled in THIS process, so a restored
+  // window is invisible to it. The live registry is the second source.
+  await runtime.runPeriodicPass()
+
+  assert.equal((await runtime.store.list('project', process.cwd(), { fresh: true })).length, 1,
+    'a registry session is mined without ever settling here')
+  const pass = lines.find((line) => line.startsWith('dsh-memories: extract pass:'))
+  assert.ok(pass !== undefined, 'the pass reports itself')
+  assert.match(pass, /%d live, %d considered/u, 'the line separates what was live from what was considered')
   t.after(() => rm(dir, { recursive: true, force: true }))
 })
 
@@ -284,7 +349,7 @@ test('extraction is skipped for subagent sessions and when disabled', async (t) 
     t.after(() => runtime.dispose())
     const agent = { id: 'extract-session', session, status: 'idle' } as unknown as Agent
     runtime.scheduleExtraction(agent)
-    assert.equal(await runtime.runExtraction(agent), 0)
+    assert.equal((await runtime.runExtraction(agent)).stored, 0)
   t.after(() => rm(dir, { recursive: true, force: true }))
 })
 
@@ -318,7 +383,7 @@ test('a provider refusal pauses background passes and the pause survives a reope
 
   // The next pass never reaches the provider, so the refusal costs one call per
   // cooldown instead of one per idle timer.
-  assert.equal(await runtime.runExtraction(agent), 0)
+  assert.equal((await runtime.runExtraction(agent)).stored, 0)
   assert.equal(calls, 1)
 
   // A second refusal doubles the wait; consecutive refusals keep doubling to a cap.
@@ -332,7 +397,7 @@ test('a provider refusal pauses background passes and the pause survives a reope
   const reopened = new MemoriesRuntime(stubContext(refusing), { memoriesDir: dir, autoExtract: true })
   t.after(() => reopened.dispose())
   assert.equal(reopened.state.isLimited(), true)
-  assert.equal(await reopened.runExtraction(agent), 0)
+  assert.equal((await reopened.runExtraction(agent)).stored, 0)
   assert.equal(calls, 2, 'a paused pass never calls the provider')
 
   // A successful pass forgets the pause.
@@ -359,7 +424,7 @@ test('a successful pass writes the evidence note behind the drafts', async (t) =
   t.after(() => runtime.dispose())
   const agent = { id: 'extract-session', session, status: 'idle' } as unknown as Agent
 
-  assert.equal(await runtime.runExtraction(agent), 1)
+  assert.equal((await runtime.runExtraction(agent)).stored, 1)
   const note = await runtime.store.readSessionNote('extract-session')
   assert.equal(note?.summary, 'The user explained how this project ships.')
   assert.deepEqual(note?.memories, ['deploy-with-pnpm-run-ship'])

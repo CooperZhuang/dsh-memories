@@ -10,7 +10,7 @@
  * being silently dropped.
  */
 
-/** Settings namespace this card edits; must match the host registration. */
+/** The profile entry whose form this card edits; must match the host's entry id. */
 const NS = 'memories'
 
 /** Per-locale chrome strings for the card frame. */
@@ -18,14 +18,14 @@ const CARD_COPY = {
   zh: {
     reset: '恢复默认',
     saved: '已保存。',
-    unavailable: '这个部署没有把 memories 设置命名空间暴露给浏览器。',
-    note: '改动立即生效，无需重启。存储位置是部署层配置。',
+    unavailable: '这个部署没有把 memories 条目暴露成可编辑的表单。',
+    note: '改动写进 profile 配置并立即生效，无需重启。存储位置是部署层配置。',
   },
   en: {
     reset: 'Reset',
     saved: 'Saved.',
-    unavailable: 'This deployment does not expose the memories settings namespace to the browser.',
-    note: 'Changes apply immediately; no restart is needed. The store location is a deployment setting.',
+    unavailable: 'This deployment does not expose the memories entry as an editable form.',
+    note: 'Changes are written to the profile config and apply immediately; no restart is needed. The store location is a deployment setting.',
   },
 }
 
@@ -338,11 +338,11 @@ function renderRow(React, field, snapshot, draft, onEdit, lang, copy) {
 /**
  * Build the card component.
  *
- * `props.scope` is the bound settings scope and `props.useSnapshot` its
- * reactive hook, both supplied by the registration's inject face; `props.lang`
- * and `props.copy` pick the labels and chrome for the active locale. The
- * component is embedded at the foot of the Memories settings page, so it edits
- * one namespace through one write path regardless of where it is rendered.
+ * `props.scope` is the entry's config form and `props.useSnapshot` its reactive
+ * hook, both supplied by the registration's inject face; `props.lang` and
+ * `props.copy` pick the labels and chrome for the active locale. The component is
+ * embedded at the foot of the Memories settings page, so it edits one entry
+ * through one write path regardless of where it is rendered.
  *
  * @param React - the shell's React instance.
  * @returns the card component.

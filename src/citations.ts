@@ -16,7 +16,7 @@
  *
  * @module dsh-memories/citations
  */
-import { existsSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, statSync } from 'node:fs'
 import { dirname, isAbsolute, join, relative } from 'node:path'
 
 /** Whether a path exists. Injected so the rule can be tested without a filesystem. */
@@ -90,17 +90,173 @@ function parentExists(roots: readonly string[], relativePath: string, probe: Pat
  * @param body - the entry body.
  * @param roots - checkout roots (project roots, the harness home, package dirs).
  * @param probe - filesystem probe, for tests.
+ * @param options - extra rules; `isIgnored` suppresses a path the repository
+ *   itself generates (see {@link isIgnoredPath}).
  * @returns the paths that look deleted or moved.
  */
-export function missingCitations(body: string, roots: readonly string[], probe: PathProbe = fileProbe): string[] {
+export function missingCitations(
+  body: string,
+  roots: readonly string[],
+  probe: PathProbe = fileProbe,
+  options: { readonly isIgnored?: (relativePath: string) => boolean } = {},
+): string[] {
   if (roots.length === 0) return []
   const missing: string[] = []
   for (const citation of extractCitations(body)) {
     if (presentUnder(roots, citation, probe)) continue
     if (!parentExists(roots, citation, probe)) continue
+    // A generated file is not a stale citation. Measured on a real store, three
+    // of twelve flagged memories named runtime artifacts (`state/run.json`, a
+    // cache database, a synced local-state file) that are absent between runs by
+    // design; a warning that cries wolf is a warning the reader learns to skip.
+    if (options.isIgnored?.(citation) === true) continue
     missing.push(citation)
   }
   return missing
+}
+
+/** One parsed `.gitignore` rule. */
+export interface IgnoreRule {
+  /** Pattern text, without the leading `!` or the trailing `/`. */
+  readonly pattern: string
+  /** Whether this rule re-includes a path an earlier rule excluded. */
+  readonly negated: boolean
+  /** Whether the pattern is anchored to the ignore file's own directory. */
+  readonly anchored: boolean
+  /** Whether the pattern names a directory rather than a file. */
+  readonly directory: boolean
+}
+
+/**
+ * Parse one `.gitignore` body.
+ *
+ * Only the subset that decides "is this path generated" is supported: comments,
+ * blank lines, negation, a leading or embedded slash for anchoring, a trailing
+ * slash for directories, and `*` / `**` / `?` globs. Character classes and
+ * escaped leading `#`/`!` are treated literally, which can only make the check
+ * miss an exclusion — never invent one.
+ *
+ * @param text - the file's contents.
+ * @returns the rules, in file order (git gives the last match the last word).
+ */
+export function parseGitignore(text: string): IgnoreRule[] {
+  const rules: IgnoreRule[] = []
+  for (const raw of text.split(/\r?\n/u)) {
+    const line = raw.trim()
+    if (line.length === 0 || line.startsWith('#')) continue
+    const negated = line.startsWith('!')
+    let body = negated ? line.slice(1).trim() : line
+    if (body.length === 0) continue
+    const directory = body.endsWith('/')
+    if (directory) body = body.slice(0, -1)
+    // A slash anywhere but the end anchors the pattern to the ignore file.
+    const anchored = body.startsWith('/') || body.includes('/')
+    if (body.startsWith('/')) body = body.slice(1)
+    if (body.length === 0) continue
+    rules.push({ pattern: body, negated, anchored, directory })
+  }
+  return rules
+}
+
+/**
+ * Read the ignore rules that govern paths relative to one root.
+ *
+ * Deliberately one file: the root's own `.gitignore`. Parent directories and
+ * global excludes are not consulted, so a path covered only by those is still
+ * reported — the conservative direction for a check whose job is to warn.
+ *
+ * @param root - repository root.
+ * @returns the rules, or an empty list when there is no readable `.gitignore`.
+ */
+export function readGitignore(root: string): IgnoreRule[] {
+  try {
+    return parseGitignore(readFileSync(join(root, '.gitignore'), 'utf8'))
+  } catch {
+    return []
+  }
+}
+
+/** Translate one gitignore pattern into a whole-string regular expression. */
+function ignorePatternToRegExp(pattern: string): RegExp {
+  let source = ''
+  for (let index = 0; index < pattern.length; index += 1) {
+    const char = pattern[index] ?? ''
+    if (char === '*') {
+      if (pattern[index + 1] === '*') {
+        index += 1
+        if (pattern[index + 1] === '/') {
+          source += '(?:.*/)?'
+          index += 1
+        } else if (source.endsWith('/')) {
+          source = `${source.slice(0, -1)}(?:/.*)?`
+        } else {
+          source += '.*'
+        }
+        continue
+      }
+      source += '[^/]*'
+      continue
+    }
+    if (char === '?') {
+      source += '[^/]'
+      continue
+    }
+    source += char.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')
+  }
+  return new RegExp(`^${source}$`, 'u')
+}
+
+/** Whether one rule matches a path, given its segments. */
+function ruleMatches(rule: IgnoreRule, path: string, segments: readonly string[]): boolean {
+  const regex = ignorePatternToRegExp(rule.pattern)
+  if (rule.anchored) {
+    if (!rule.directory) return regex.test(path)
+    // Every directory on the way down is a candidate, never the file itself.
+    for (let depth = 1; depth < segments.length; depth += 1) {
+      if (regex.test(segments.slice(0, depth).join('/'))) return true
+    }
+    return false
+  }
+  // Unanchored patterns name one component and match it at any depth.
+  const last = segments.length - 1
+  for (let index = 0; index < segments.length; index += 1) {
+    if (rule.directory && index === last) continue
+    if (regex.test(segments[index] ?? '')) return true
+  }
+  return false
+}
+
+/**
+ * Whether a repository's own ignore rules cover this relative path.
+ *
+ * The last matching rule decides, exactly as git does, so a `!` re-inclusion is
+ * honoured.
+ *
+ * @param relativePath - the cited path, relative to the root the rules came from.
+ * @param rules - rules from {@link parseGitignore} / {@link readGitignore}.
+ * @returns true when the path is one the repository generates.
+ */
+export function isIgnoredPath(relativePath: string, rules: readonly IgnoreRule[]): boolean {
+  if (rules.length === 0) return false
+  const path = relativePath.replace(/\\/gu, '/').replace(/^\.\//u, '').replace(/^\/+/u, '')
+  if (path.length === 0) return false
+  const segments = path.split('/')
+  let ignored = false
+  for (const rule of rules) {
+    if (ruleMatches(rule, path, segments)) ignored = !rule.negated
+  }
+  return ignored
+}
+
+/**
+ * A predicate that suppresses generated paths under one root.
+ *
+ * @param root - repository root whose `.gitignore` applies.
+ * @returns a predicate for {@link missingCitations}.
+ */
+export function ignoredUnder(root: string): (relativePath: string) => boolean {
+  const rules = readGitignore(root)
+  return (relativePath) => isIgnoredPath(relativePath, rules)
 }
 
 /**

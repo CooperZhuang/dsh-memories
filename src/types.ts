@@ -9,9 +9,26 @@
  *
  * @module dsh-memories/types
  */
+import type { ContextFormed } from '@deepseek-ai/dsh-llm'
 
 /** A memory scope: cross-project (`global`) or workspace-bound (`project`). */
 export type MemoryScope = 'global' | 'project'
+
+/**
+ * Who produced the content this plugin injects into a conversation.
+ *
+ * `MessageSource.kind` answers *who*, and durable session format v4 admits only
+ * a producer-owned kind: the retired `{ kind: 'plugin', plugin: … }` wrapper is
+ * refused outright on write (`format v4 message requires a producer-owned
+ * source kind`), which is what made every injection fail on 0.1.7. The platform's
+ * own v3→v4 migration derives exactly this spelling from that wrapper, so older
+ * logs and new writes carry the same kind — which is what lets a session resumed
+ * from an older log still recognise the block it already has.
+ *
+ * Spelled out rather than derived from the plugin name because the name lives in
+ * the plugin entry, which imports this module; a test holds the two together.
+ */
+export const MEMORY_SOURCE_KIND = 'plugin:memories'
 
 /** Every valid scope, in injection order (broadest first). */
 export const MEMORY_SCOPES: readonly MemoryScope[] = ['global', 'project']
@@ -257,4 +274,21 @@ export interface MemoryHit {
   readonly entry: MemoryEntry
   /** Relevance score; higher is better. */
   readonly score: number
+}
+
+/** The source this plugin stamps on every message it injects. */
+export type MemoryMessageSource = { kind: typeof MEMORY_SOURCE_KIND } & ContextFormed
+
+/**
+ * Add this plugin's producer kind to the shared source vocabulary.
+ *
+ * The augmentation names `@deepseek-ai/dsh-llm/message` — the module that
+ * declares the map — rather than the package root, which only re-exports it: a
+ * re-export carries the type but not the merge point.
+ */
+declare module '@deepseek-ai/dsh-llm/message' {
+  interface MessageSourceMap {
+    /** Injected memory context: the summary block or an on-demand recall delta. */
+    memories: MemoryMessageSource
+  }
 }

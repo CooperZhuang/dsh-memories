@@ -66,6 +66,11 @@
    「注入过没有」看的是**对话本身**，不是进程：注入的是一条持久的 user 消息，重启 dsh 后它跟着
    历史一起恢复，所以重启不会再多注一份；只有 `/compact`、清空会话（整段对话被替换）才会重新注入。
    代价是模型手里的摘要可能比记忆库旧一点，收益是一段 50 轮的会话只为记忆付一次约 2～4KB。
+   注入的那条消息带 `source: { kind: 'plugin:memories', form: 'recall' }`：会话格式 v4 在写入时
+   只接受**生产者自己的 kind**，`{ kind: 'plugin', plugin: … }` 这种旧写法会被直接拒（报
+   `format v4 message requires a producer-owned source kind`）；而 `plugin:memories` 正是平台自己的
+   v3→v4 迁移从旧写法推导出来的值——两边写成同一个字符串，升级前写下的旧会话才认得「已经注入过」
+   这件事，不会再多注一份。
    摘要之外还有**按需补注**（`recallMode: on-demand`，默认）：每一轮把当前用户消息拆成句子与分句，
    分别对记忆库做一次确定性打分（和 `memory_search` 同一套公式，**不额外调用模型**），把这一轮真正
    命中的记忆合成**一个** ≤`recallMaxBytes`（默认 1200B）的 `<memory-recall>` 小块，最多
@@ -157,7 +162,7 @@ dsh plugin --profile web add github:you/dsh-memories
 
 配置分两层。
 
-**部署层**（cordis 行配置，改完需要重启进程）—— 存储位置与工作区识别：
+**部署层**（cordis 行配置，改完需要重挂这一行）—— 存储位置与工作区识别：
 
 ```yaml
 - id: memories
@@ -167,16 +172,21 @@ dsh plugin --profile web add github:you/dsh-memories
     projectRootMarkers: ['.git']
 ```
 
-**可调项**（`memories` 设置命名空间，**热重载，改完立即生效**）—— 写进
-`$DSH_HOME/settings.yaml`，或从 DSH 设置界面改：
+**可调项**（同一个行配置里的 `volatile` 字段，**改完立即生效**）—— 从 DSH 设置界面的
+「记忆」页改，界面会把值写进当前 profile 的 cordis patch：
 
 ```yaml
-memories:
-  autoExtract: false
-  maxSummaryBytes: 8192
-  extractProvider: deepseek-official
-  extractModel: deepseek-v4-flash
+- id: memories
+  config:
+    autoExtract: false
+    maxSummaryBytes: 8192
+    extractProvider: deepseek-official
+    extractModel: deepseek-v4-flash
 ```
+
+两者是同一行的不同字段：可调项在插件自己的 `Config` 里标了 `.volatile()`，所以才是
+「活的」——Loader 把它当引用交给插件、设置域把它投影成表单，界面上的写入就地更新那个
+引用（并广播 `loader/volatile-update`），不需要重启或重挂。
 
 | 键 | 默认 | 说明 |
 | --- | --- | --- |
@@ -223,10 +233,11 @@ memories:
 | `logLevel` | `info` | 插件日志文件详细程度：`off`/`error`/`warn`/`info`/`debug`；`info` = 错误+警告+每轮摘要，`debug` 再加逐条决策 |
 | `traceMaintenance` | `false` | 把归档、按需补注、复审选择等决策提升到 `info`（默认等级即可见）；关闭时它们只在 `debug` 出现 |
 
-设置走 DSH 的 settings 接缝注册（`ctx.settings.register('memories', schema, …)`），
-所以它自带 schema 校验、revision 冲突检测和文档热重载。若部署里没有挂
-`dsh-settings-file`（没有设置文档），上面这些回退到部署层行配置里的同名扁平键；
-两者都没有则用 schema 默认值。
+可调项就是这个插件**自己那一行的 `Config` 字段**（标了 `.volatile()`），所以它自带 schema
+校验、revision 冲突检测，写入落在当前 profile 的 Cordis patch 里，Loader 直接把新值提交进
+正在运行的那份引用——不重挂、不重启。设置域（`@deepseek-ai/dsh-settings` + 浏览器侧的
+`ctx.configForms`）是**可选**的：部署里没有它，插件照常提供工具、命令、注入与抽取，只是没有
+「记忆」页。
 
 ### 设置界面
 
@@ -243,12 +254,16 @@ memories:
 
 入口读写的是两份各自官方接缝的东西：
 
-- 可调项走 `ctx.settingsScope.bind({ namespace: 'memories' })`，和内置设置页完全相同的 describe
-  镜像 + revision 围栏写入路径，没有自建 HTTP 路由；
+- 可调项走 `ctx.configForms.get('memories')`——就是这个行的配置表单，与设置域其它页面完全相同的
+  describe 镜像 + revision 围栏写入路径，没有自建 HTTP 路由；
 - 记忆数据走 **Typert 网关**：宿主 `src/remote.ts` 声明清单（`overview` / `list` / `add` /
-  `forget` / `promoteSkill` / `discardSkill`）并 `provide` 出 `memories` 服务，浏览器侧挂载同一份
-  清单后按 `ctx.remote.memories.*` 调用。部署里没挂网关（headless / tui）时只是没有这一页，
-  模型面与命令面照旧。
+  `forget` / `promoteSkill` / `discardSkill` / `disputes` / `resolveDispute`）并 `provide` 出
+  `memories` 服务，浏览器侧挂载同一份清单后按 `ctx.remote.memories.*` 调用。部署里没挂网关
+  （headless / tui）时只是没有这一页，模型面与命令面照旧。
+  注册走 `ctx.inject(['typert'], …)` 而不是 `ctx.get('typert')`：服务只有在提供它的 fiber 变为
+  active 之后才读得到，而 0.1.7 里网关的注册晚于消费它的那些行——用 `ctx.get` 会静默拿到
+  `undefined`，于是清单根本没注册、网关上 `/api/memories/*` 全 404。同一课在 settings 域上已经
+  吃过一次，见上面「可选服务」那一段。
 
 清单只维护一份：`REMOTE_INVOCATION_DATA` 在宿主侧展开成带校验的 codec，构建时再序列化进浏览器包，
 浏览器侧只做透传解析——校验留在真正收到值的宿主边界，浏览器包里因此不需要任何 schema 库。
@@ -326,6 +341,10 @@ frontmatter 的目录包），下次技能目录刷新后进入目录。草稿�
   既被记住又不骗人，用这个而不是把它写成事实。
 - **引用校验**：正文里写的 `dir/file.ext` 会在注入前被核对；只有当"父目录存在、文件不存在"
   时才提示「⚠ 引用的 X 已不存在，以实测为准」，并可用 `/memories stale` 全库扫描。
+  仓库自己声明为生成物的路径不算失效：每个作用域会读自己根目录的 `.gitignore`，命中的路径
+  （`state/`、`*.log`、`cache/**/*.db`…，含 `!` 反选）直接跳过——运行期才存在的状态文件、
+  缓存库、锁文件本来就不该在两次运行之间躺在磁盘上。父目录的 `.gitignore` 与全局 excludes
+  不读，所以只被它们覆盖的路径仍会被报出来（宁可多报，不可漏报）。
 
 ## 后台定期做什么（以及为什么有些事必须问你）
 
@@ -335,7 +354,7 @@ frontmatter 的目录包），下次技能目录刷新后进入目录。草稿�
 | 任务 | 周期 | 做什么 | 要不要人 |
 | --- | --- | --- | --- |
 | 抽取（`extractIntervalMinutes`） | 30 分钟扫一遍有活动的会话（另加 `minIdleHours` 空闲门槛） | 把新内容里**可复用的事实**写进记忆；把当前作用域已有条目的标题一起给模型，让它改写已有条目而不是新增 | 不需要。写入即生效，但每条都带 provenance、可 `archive`/`forget` |
-| 整理 sweep（`sweepIntervalHours`） | 12 小时 | 保留策略（`maxUnusedDays`）、快照过期（`snapshotMaxAgeDays`）、作用域改名自愈、空目录清理、**统计失效引用条数**，并在没有待处理任务时**补排一次合并** | 不需要。全部是确定性规则，且归档可 `restore` |
+| 整理 sweep（`sweepIntervalHours`） | 12 小时 | 保留策略（`maxUnusedDays`）、快照过期（`snapshotMaxAgeDays`）、作用域改名自愈、空目录清理、**统计失效引用条数**、**统计从未被注入也从未被读过的条数**，并在没有待处理任务时**补排一次合并** | 不需要。全部是确定性规则，且归档可 `restore` |
 | 合并 consolidate（`consolidateCooldownHours`） | 6 小时冷却，另有 sweep 兜底排队 | 让受限子代理把一批记忆去重、改写、退役。**可逆的改动直接落盘**，只有少数会造成损失的决定留给人 | 只有"有争议"的那些：在 **设置 → 记忆 → 待裁决** 里逐条接受/驳回，或 `/memories plan` 看、`/memories apply` 全接受、`/memories reject` 全丢弃 |
 
 **"有争议"是明确定义的**（`classifyPlan`），判据是"丢了能不能被发现或恢复"，不是口味：
@@ -375,6 +394,19 @@ grep '\[warn\]' ~/.dsh/logs/dsh-memories.log   # 只看警告
 
 等级含义是「该级别及以上」，所以 `off` < `error` < `warn` < `info` < `debug`。默认 `info` =
 错误 + 警告 + 每轮抽取/合并摘要；`warn` 会丢掉那些摘要行，`debug` 再加上逐条决策。
+
+**无事可做的那一轮也会留痕**：抽取轮次的行是
+`extract pass: N live, M considered, K mined (S stored), I nothing new, J skipped, F failed — <原因> <条数>`。
+它在「有产出 / 有失败 / 距上次 info 报告满 1 小时」时写 `info`，其余写 `debug`；跳过原因
+（`nothing-new` / `already-extracting` / `ineligible` / `peak` / `not-idle` / `quiet` / `claim` /
+`no-llm` / `no-route` / `empty`）都在这行的尾部，所以「抽取器还活着吗、为什么什么都没做」不需要
+开 `traceMaintenance` 就能从文件里读出来。这一条是 2026-09-23 的复盘的直接产物：当时水位线 32 小时
+没动，而每一道闸门的拒绝理由都只在 `debug`，日志里查不到任何线索。
+
+**服务在激活之后才出现也没关系**：`llm` 与 `subagents` 都是可选服务，0.1.7 允许它们由排在后面的
+行提供。插件在激活时取一次快照（为了关停途中仍能跑完最后一遍），快照为空时改为**每次调用现取**；
+两者都取不到才写一行警告并跳过（`no-llm` / `no-subagents`）。早期版本只取快照，于是「服务晚到」
+会让后台抽取与合并**永久静默**——同样的坑这个插件已经为 `settings` 与 `typert` 记录过两次。
 
 **一个必须知道的宿主行为**：cordis 对每条消息**按 exporter × logger 名**过滤，阈值取
 `exporter.levels?.[name] ?? exporter.levels?.default ?? logger.level ?? 1`，而 DSH 组合里唯一的
@@ -596,13 +628,13 @@ DeepSeek 的上下文缓存按**前缀**命中的 token 计费：只有请求开
 
 ## 端到端验证状况
 
-自动化测试覆盖了每个单元（211 项，含检索 eval 语料、中文 bigram 检索与证据闸门、保留判定、归档往返、状态列迁移、真机 cordis 日志路由与按需补注闸门），但提示词与真实模型行为只能靠真机跑。截至最近一次
+自动化测试覆盖了每个单元（250 项，含检索 eval 语料、中文 bigram 检索与证据闸门、保留判定、归档往返、状态列迁移、真机 cordis 日志路由与按需补注闸门），但提示词与真实模型行为只能靠真机跑。截至最近一次
 真机验证：
 
 | 路径 | 状态 |
 | --- | --- |
 | 工具写入、注入、模型真的用了记忆 | ✅ 真机 |
-| 设置 → 记忆 页面（列表/搜索/范围与类别过滤/新增/删除/可调项） | ✅ 真机浏览器：真写入了 `settings.yaml`，新增的记忆当场出现在列表里并被后续注入读到；「插件 → 插件配置」里不再有重复卡片 |
+| 设置 → 记忆 页面（列表/搜索/范围与类别过滤/新增/删除/可调项） | ✅ 真机浏览器：新增的记忆当场出现在列表里并被后续注入读到；可调项写进 profile 的 cordis patch 且当场生效；「插件 → 插件配置」里没有重复卡片 |
 | 空闲抽取（真模型） | ⚠️ 真机（但用了 `minIdleHours: 0` 覆盖层）：模型自己写了 `kind` 与 `appliesTo`。**注意**：默认配置下这条路径过去从不执行——见下一行 |
 | 证据层（真模型） | ✅ 真机：SDK 驱动的真实会话被抽取后，`memories/sessions/<id>.md` 里写下了模型给的会话摘要，条目带上 `session:` 溯源；`memory action=evidence` 能读回该笔记 |
 | 额度闸门 | ✅ 单元测试（含跨重启保留）；未经真实限流触发 |
@@ -615,6 +647,9 @@ DeepSeek 的上下文缓存按**前缀**命中的 token 计费：只有请求开
 | 抽取定时器 / 退出兜底 / 日志名过滤 / sessions 计数（缺陷修复） | ✅ 现场证据：真实库 `sessions_total=59` 而 `last_seq>0` **为 0**（阶段 1/2 从未执行），根因是 5 分钟定时器配 6 小时静默闸门且不重排；修复后定时器等到 `max(autoExtractIdleMs, minIdleHours)`、退出兜底与 `/memories mine` 绕过该闸门（均由新单测钉住）。真实 cordis 探针确认日志文件**只含本插件的行**（web-server / auto-thinking-effort 的噪音被排除）、stats 输出 `auto-extract: on (wait 6h idle …)` 与 `sessions: N mined / M tracked` |
 | 错峰调度 `peakHours`（本轮新增） | ✅ 单元测试覆盖星期几/跨午夜/非法条目/延迟计算与「自动 pass 让路、手动命令不让路」（19 项 schedule 测试）。价格口径来自官方 2026-09-10 起的峰谷规则（工作日 09:00-12:00 + 14:00-18:00 峰时，峰价 = 谷价 ×2，周末全谷时）。真机行为待下一轮复核 |
 | 周期性抽取 `extractIntervalMinutes`（本轮新增） | ✅ 单元测试覆盖：有新内容才抽、「无新内容不产生模型调用」、遵守峰时、定时器真的会按间隔跑、以及退出兜底在周期抽过之后仍会补抽新内容（+4 项）。现场依据：长会话只抽一次尾巴会把中间内容永久跳过（`collectWindow` 取尾部、水位线推到最新） |
+| 抽取「静默停摆」的根因与可观测性（2026-09-23 复盘） | ✅ 现场证据：真实库 `max(sessions.at)=2026-09-21T21:46Z`（`runExtraction` 只要走到 provider 就会写水位），此后 32 小时零水位、日志零产出，而同期有 6+ 个活跃会话与 26 条手写记忆 → 抽取确实停摆。修复三条：①`llm`/`subagents` 由「激活时取一次」改为「快照为空则每次现取」（0.1.7 允许服务由后面的行提供），取不到时写一次 `warn` 而不是静默 `return 0`；②周期轮次改为「有产出/有失败/距上次 info 满 1 小时」都写 `info`，并在行尾给出跳过原因计数；③候选会话除 `tracked` 外再并入 `agents` 注册表（`roots()`），使「进程启动前就闲置、从未在本进程 settle 过的会话」也能被抽到。三条均由新单测钉住 |
+| 抽取花费可见（2026-09-23） | ✅ 单测：抽取结果带回 `usage`，`stored …` 行尾附 `[N in / M out tokens]`（后台调用不建会话，成本面板看不到它，插件日志是唯一出口） |
+| 陈旧引用误报（2026-09-23） | ✅ 真机复核：对真实库跑引用校验，13 条 → 10 条，被抑制的 3 条正是 example-probe 的运行时产物（`state/run.json`、`state/cache.json`，该仓库 `.gitignore` 已忽略 `state/`）。规则：每个作用域读自己根目录的 `.gitignore`（含 `**`、锚定、目录、`!` 反选），命中即跳过；父目录规则与全局 excludes 不读（宁可多报） |
 
 > 「多轮不重注入」这一条目前是**单元测试 + 单轮真机进程**两重证据：本轮想用浏览器复核时，web
 > profile 里另外几个插件把 GUI 挡住了（`dsh-message-edit` 缺 `@deepseek-ai/dsh-client-runtime/client`、

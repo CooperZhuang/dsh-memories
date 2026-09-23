@@ -8,10 +8,13 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
+import { createVolatile, updateVolatile } from '@deepseek-ai/cosmokit'
 import { MemoryStore, formatEntry, parseEntry, projectSlug, slugify } from '../storage.js'
 import { browseMemories, scoreEntry, searchMemories } from '../search.js'
 import { rankForSummary, renderMemorySummary, selectForSummary } from '../render.js'
-import { DEFAULT_MAX_SUMMARY_BYTES, consolidationRouteOf, normalizeSettings, resolveConfig } from '../config.js'
+import { DEFAULT_MAX_SUMMARY_BYTES, consolidationRouteOf, normalizeSettings, readTunables, resolveConfig } from '../config.js'
+import { name } from '../index.js'
+import { MEMORY_SOURCE_KIND } from '../types.js'
 import { findProjectRoot, isWithin } from '../workspace.js'
 import type { MemoryEntry } from '../types.js'
 
@@ -581,16 +584,26 @@ test('summary renders both scopes and stays inside its byte budget', () => {
   assert.equal(renderMemorySummary([], { maxBytes: 100, maxEntriesPerScope: 5 }), undefined)
 })
 
-test('deployment config resolves paths and clamps legacy tunable spellings', () => {
+test('entry config resolves paths, clamps tunables, and reads live references', () => {
   const resolved = resolveConfig({ dshHome: 'C:\\home', maxSummaryBytes: -5, autoExtractIdleMs: 10, extractProvider: 'p', extractModel: 'm' })
   assert.equal(resolved.memoriesDir, 'C:\\home/memories')
-  assert.equal(resolved.defaults.maxSummaryBytes, 0)
-  assert.equal(resolved.defaults.autoExtractIdleMs, 1000)
-  assert.equal(resolved.defaults.extractProvider, 'p')
+  assert.equal(resolved.tunables.maxSummaryBytes, 0)
+  assert.equal(resolved.tunables.autoExtractIdleMs, 1000)
+  assert.equal(resolved.tunables.extractProvider, 'p')
   // A lone provider is not a route: both halves are required.
-  assert.equal(resolveConfig({ extractProvider: 'p' }).defaults.extractModel, '')
-  // `defaults` wins over the legacy flat spelling.
-  assert.equal(resolveConfig({ maxSummaryBytes: 10, defaults: { maxSummaryBytes: 99 } }).defaults.maxSummaryBytes, 99)
+  assert.equal(resolveConfig({ extractProvider: 'p' }).tunables.extractModel, '')
+  // A mounted row hands the tunables over as live references, not values; the
+  // same resolution has to see straight through them.
+  const mounted = resolveConfig({ maxSummaryBytes: createVolatile(8192), autoExtract: createVolatile(false) })
+  assert.equal(mounted.tunables.maxSummaryBytes, 8192)
+  assert.equal(mounted.tunables.autoExtract, false)
+  // And re-reading follows the reference, which is what makes a settings write
+  // take effect without a restart.
+  const reference = createVolatile(8192)
+  const live = { maxSummaryBytes: reference }
+  assert.equal(readTunables(live).maxSummaryBytes, 8192)
+  updateVolatile(reference, createVolatile(1024))
+  assert.equal(readTunables(live).maxSummaryBytes, 1024)
 })
 
 test('normalizeSettings fills every field and clamps nonsense', () => {
@@ -617,4 +630,15 @@ test('findProjectRoot walks up to the marker and falls back to cwd', async () =>
   } finally {
     await rm(root, { recursive: true, force: true })
   }
+})
+
+test('injected context carries a producer-owned source kind', () => {
+  // Durable session format v4 refuses the retired `{ kind: 'plugin', plugin }`
+  // wrapper on write, so every message this plugin injects has to name its
+  // producer. The platform's own v3→v4 migration derives `plugin:<name>` from
+  // that wrapper, which is why the two spellings must agree: a session resumed
+  // from an older log has to recognise the block it already carries, or the
+  // summary is injected a second time.
+  assert.equal(MEMORY_SOURCE_KIND, `plugin:${name}`)
+  assert.notEqual(MEMORY_SOURCE_KIND, 'plugin')
 })

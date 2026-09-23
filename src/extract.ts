@@ -14,7 +14,7 @@ import type { ContentBlock, GenerateOptions, LlmRuntime } from '@deepseek-ai/dsh
 import { deriveEventMessage } from '@deepseek-ai/dsh-session/surface'
 import type { Session } from '@deepseek-ai/dsh-session'
 import { SessionSeq } from '@deepseek-ai/dsh-session'
-import { toMemoryKind } from './types.js'
+import { MEMORY_SOURCE_KIND, toMemoryKind } from './types.js'
 import type { MemoryDraft, MemoryScope } from './types.js'
 
 /** Model-facing transcript line budget for one extraction window. */
@@ -292,6 +292,14 @@ export interface ExtractionRequest {
   readonly signal: AbortSignal
 }
 
+/** Token cost of one extraction call, as the provider reported it. */
+export interface ExtractionUsage {
+  /** Prompt tokens the call was billed for. */
+  readonly inputTokens: number
+  /** Completion tokens the call produced. */
+  readonly outputTokens: number
+}
+
 /** Outcome of one extraction call. */
 export type ExtractionOutcome =
   | {
@@ -302,8 +310,16 @@ export type ExtractionOutcome =
     /** Usable drafts the reply offered beyond `maxMemories`, reported to the caller. */
     readonly dropped: number
     readonly route: { provider: string; model: string }
+    /**
+     * What the call cost, when the adapter reported it.
+     *
+     * Carried out of here because background extraction runs outside any
+     * session, so this is the only place the spend can be observed at all: the
+     * cost dashboards read session logs, and this call writes none.
+     */
+    readonly usage?: ExtractionUsage
   }
-  | { readonly kind: 'none'; readonly reason: 'empty-window' | 'no-route' | 'empty-reply' }
+  | { readonly kind: 'none'; readonly reason: 'empty-window' | 'no-route' | 'empty-reply'; readonly usage?: ExtractionUsage }
 
 /**
  * Run one extraction call and return the drafts it produced.
@@ -334,7 +350,7 @@ export async function runExtraction(llm: LlmRuntime, request: ExtractionRequest)
   ].join('\n')
   const messages = [createUserMessage({
     content: [{ type: 'text', text: framed }],
-    source: { kind: 'plugin', plugin: 'dsh-memories' },
+    source: { kind: MEMORY_SOURCE_KIND },
   })]
   const timeout = AbortSignal.any([request.signal, AbortSignal.timeout(request.timeoutMs)])
   const options: GenerateOptions = {
@@ -356,7 +372,13 @@ export async function runExtraction(llm: LlmRuntime, request: ExtractionRequest)
     .filter((block): block is Extract<ContentBlock, { type: 'text' }> => block.type === 'text')
     .map((block) => block.text)
     .join('\n')
+  // The adapter emits usage before the terminal finish chunk; when a provider
+  // reports none, the call still happened and simply cannot be priced here.
+  const reported = assembler.usage
+  const usage: ExtractionUsage | undefined = reported === undefined
+    ? undefined
+    : { inputTokens: reported.inputTokens, outputTokens: reported.outputTokens }
   const parsed = parseExtraction(text, request.maxMemories, request.session.id)
-  if (parsed.drafts.length === 0) return { kind: 'none', reason: 'empty-reply' }
-  return { kind: 'memories', drafts: parsed.drafts, summary: parsed.summary, dropped: parsed.dropped, route }
+  if (parsed.drafts.length === 0) return { kind: 'none', reason: 'empty-reply', ...usage === undefined ? {} : { usage } }
+  return { kind: 'memories', drafts: parsed.drafts, summary: parsed.summary, dropped: parsed.dropped, route, ...usage === undefined ? {} : { usage } }
 }

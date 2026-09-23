@@ -146,6 +146,9 @@ test('the sweep and the background pass each report themselves in one line', asy
     runtime.dispose()
     return rm(dir, { recursive: true, force: true })
   })
+  // One memory nothing has ever surfaced: at twelve days old nothing is old
+  // enough for retention, so only this line can say the store has dead weight.
+  await runtime.store.upsert({ scope: 'global', title: 'Never surfaced', body: 'x', tags: [] }, undefined, 'auto', NOW)
 
   await runtime.sweepNow(NOW)
   // The host formats `%d`/`%s` downstream, so the stub sees the template plus its
@@ -154,12 +157,19 @@ test('the sweep and the background pass each report themselves in one line', asy
   assert.ok(sweep !== undefined, 'a sweep says what it did even when that is nothing')
   assert.match(sweep, /archived %d memories across %d project scopes, pruned %d empty project/u)
 
+  // An unseen tail is invisible to an age-based retention rule, so the sweep is
+  // where "nobody has ever seen these" has to be said.
+  const unseen = lines.find((line) => line.includes('never been injected or read'))
+  assert.ok(unseen !== undefined, 'a memory nothing has surfaced is reported')
+  assert.match(unseen, /%d of %d memories/u)
+
   lines.length = 0
   // No tracked session: the pass has nothing to do, and the point is that the
   // file still answers "did the extractor run, and why did it do nothing".
   await runtime.runPeriodicPass()
-  assert.ok(lines.some((line) => line.startsWith('dsh-memories: extract pass:')),
-    'a pass with no work still leaves a line')
+  const pass = lines.find((line) => line.startsWith('dsh-memories: extract pass:'))
+  assert.ok(pass !== undefined, 'a pass with no work still leaves a line')
+  assert.match(pass, /%d live, %d considered, %d mined/u, 'the line separates what was live from what was considered')
 })
 
 test('stats reports the recall and retention configuration', async (t) => {

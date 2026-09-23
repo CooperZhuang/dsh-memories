@@ -29,9 +29,12 @@ import type { Agent, SessionStartSource } from '@deepseek-ai/dsh-agent'
 import type { Session } from '@deepseek-ai/dsh-session'
 import type { CommandInvocation } from '@deepseek-ai/dsh-commands'
 import type { Context } from '@deepseek-ai/cordis'
-import { Config as ConfigSchema, MemoriesSettingsSchema, SETTINGS_NS, consolidationRouteOf, normalizeSettings, resolveConfig } from './config.js'
+// Type-only: the Loader owns the `loader/volatile-update` event this plugin
+// listens for, and the loader is the host rather than a runtime dependency, so
+// only its declarations belong in this program.
+import type {} from '@deepseek-ai/cordis-plugin-loader'
+import { Config as ConfigSchema, consolidationRouteOf, readTunables, resolveConfig } from './config.js'
 import type { MemoriesConfig, MemoriesSettings, ResolvedConfig } from './config.js'
-import type { SettingsProvider } from '@deepseek-ai/dsh-settings'
 import { MemoryStore, slugify } from './storage.js'
 import { StateStore, importLegacyState, statePath } from './state.js'
 import { browseMemories, explainEntry, searchMemories } from './search.js'
@@ -40,7 +43,7 @@ import { isSubstantiveTurn } from './query.js'
 import { MEMORY_OPEN, rankForSummary, renderEntry, renderHit, renderMemorySummary, renderRecall, renderScopeListing, selectForSummary } from './render.js'
 import type { SummaryScope } from './render.js'
 import { findProjectRoot, isWithin } from './workspace.js'
-import { citationRoots, citationWarning, missingCitations } from './citations.js'
+import { citationRoots, citationWarning, ignoredUnder, missingCitations } from './citations.js'
 import { planRetention, retentionKey } from './retention.js'
 import { MemoryLog, createFileSink, createLogExporter, pluginLogger } from './log.js'
 import { collectWindow, runExtraction } from './extract.js'
@@ -49,7 +52,7 @@ import { applyPlan, classifyPlan, clearPendingPlan, denyToolsFor, mergePendingPl
 import type { ConsolidationDispute } from './consolidate.js'
 import { discardDraft, listDrafts, promote, writeDraft } from './skills.js'
 import type { ConsolidationTarget, SubagentSeam } from './consolidate.js'
-import { MEMORY_KINDS } from './types.js'
+import { MEMORY_KINDS, MEMORY_SOURCE_KIND } from './types.js'
 import type { MemoryDraft, MemoryEntry, MemoryKind, MemoryScope, SessionMode } from './types.js'
 import { registerMemoryTool } from './tool.js'
 import { REMOTE_CONTRIBUTION, REMOTE_NAMESPACE, REMOTE_SERVICE, createRemoteService } from './remote.js'
@@ -60,6 +63,15 @@ export const name = 'memories'
 
 /** Budget for the extraction a shutdown is allowed to wait for. */
 const EXIT_FLUSH_TIMEOUT_MS = 8_000
+
+/**
+ * How often a periodic pass that changed nothing still reports at info level.
+ *
+ * An hour: often enough that a stall is visible within one working session, rare
+ * enough that a store nobody is using does not write a line every thirty minutes
+ * for the rest of the process's life.
+ */
+const PASS_REPORT_INTERVAL_MS = 3_600_000
 
 /** State key holding the last periodic sweep, so it survives a restart. */
 const SWEEP_META_KEY = 'sweep-at'
@@ -129,17 +141,48 @@ export function isCatchAllDirectory(root: string, dshHome: string): boolean {
 
 /**
  * Services this plugin requires at activation: the tool registry (for the
- * `memory` tool), the command registry (for `/memories`), and the settings
- * provider (which owns the `memories` namespace).
+ * `memory` tool) and the command registry (for `/memories`).
  *
- * The LLM and the subagent seam are read opportunistically with `ctx.get`, so a
- * deployment with no model adapter or no delegation still loads — it just never
- * runs background extraction or consolidation.
+ * The settings domain, the LLM, and the subagent seam are all optional and
+ * reached through `ctx.inject` or `ctx.get`: a deployment with no model adapter
+ * or no delegation still loads (it just never runs background extraction or
+ * consolidation), and one without the settings domain still serves every
+ * model-facing surface (it just has no Memories page).
  */
-export const inject: string[] = ['tools', 'commands', 'settings']
+export const inject: string[] = ['tools', 'commands']
+
+/**
+ * The one settings-domain method this plugin uses.
+ *
+ * Spelled structurally rather than imported: the plugin ships its own page and
+ * only needs to be left out of the schema-derived one, and the domain is an
+ * optional service rather than a dependency of a plugin whose config is the
+ * schema.
+ */
+interface SettingsDomainLike {
+  /** Register this plugin instance's page policy; the returned disposer withdraws it. */
+  configure(presentation: { auto?: boolean }, owner?: unknown): () => void
+}
 
 /** Job key of the single global consolidation job. */
 const CONSOLIDATE_JOB = 'global'
+
+/**
+ * The live-agent registry, spelled structurally.
+ *
+ * `@deepseek-ai/dsh-agent` publishes it as the `agents` service, but the plugin
+ * treats it the way it treats every other optional seam: a deployment that
+ * composes no registry still loads and simply has no second source of sessions.
+ */
+interface AgentRegistryLike {
+  /** Live agents in registration order. */
+  list?(): Agent[]
+  /** Live top-level agents in registration order. */
+  roots?(): Agent[]
+}
+
+/** Why one session was not mined, for the pass line. */
+type MineSkip = 'off' | 'peak' | 'not-idle' | 'quiet' | 'claim' | 'no-llm' | 'no-route' | 'empty'
 
 /** One scope's loaded state. */
 interface ScopeState {
@@ -169,15 +212,19 @@ export class MemoriesRuntime {
    */
   private readonly settingsThunk: () => MemoriesSettings
   /**
-   * The LLM runtime captured at activation.
+   * The LLM runtime as it was at activation, when it was already provided.
    *
-   * Captured eagerly rather than resolved per call: by the time a settle pass
-   * runs the tree may already be disposing, and a late `ctx.get('llm')` then
-   * resolves to nothing — which is exactly the pass a one-shot run depends on.
+   * Kept as a snapshot because by the time a settle pass runs the tree may
+   * already be disposing, and a late `ctx.get('llm')` then resolves to nothing —
+   * which is exactly the pass a one-shot run depends on.
    */
-  private readonly llm: LlmRuntime | undefined
-  /** The subagent seam, read once; absent in a deployment without delegation. */
-  private readonly subagents: SubagentSeam | undefined
+  private readonly llmAtActivation: LlmRuntime | undefined
+  /** The subagent seam as it was at activation; absent in a deployment without delegation. */
+  private readonly subagentsAtActivation: SubagentSeam | undefined
+  /** Whether the "no llm service" warning has already been written. */
+  private warnedNoLlm = false
+  /** Whether the "no subagent seam" warning has already been written. */
+  private warnedNoSubagents = false
   private readonly rootCache = new WeakMap<Session, Promise<string | undefined>>()
   /** Sessions whose conversation already carries the memory block. */
   private readonly injected = new WeakSet<Session>()
@@ -206,14 +253,49 @@ export class MemoriesRuntime {
     settings?: () => MemoriesSettings,
   ) {
     this.deployment = resolveConfig(config)
-    this.settingsThunk = settings ?? (() => this.deployment.defaults)
+    this.settingsThunk = settings ?? (() => this.deployment.tunables)
     this.store = new MemoryStore(this.deployment.memoriesDir)
     this.store.entryLimit = () => this.settings.maxEntriesPerScope
     this.store.similarityLimit = () => this.settings.dedupeSimilarity
     this.state = new StateStore(statePath(this.deployment.memoriesDir))
-    this.llm = ctx.get('llm') as LlmRuntime | undefined
-    this.subagents = ctx.get('subagents') as SubagentSeam | undefined
+    this.llmAtActivation = ctx.get('llm') as LlmRuntime | undefined
+    this.subagentsAtActivation = ctx.get('subagents') as SubagentSeam | undefined
     this.log = new MemoryLog(pluginLogger(ctx.logger), () => this.settings.traceMaintenance)
+  }
+
+  /**
+   * The LLM runtime to use right now.
+   *
+   * The activation snapshot first, then a live lookup. In 0.1.7 a service may be
+   * provided by a row that runs after this plugin's — the same ordering trap the
+   * `settings` and `typert` seams below document — so the snapshot is
+   * legitimately `undefined` at activation and stays that way for the whole
+   * process. Resolving per call is what keeps a late provider from turning every
+   * background pass into a silent no-op.
+   */
+  private get llm(): LlmRuntime | undefined {
+    if (this.llmAtActivation !== undefined) return this.llmAtActivation
+    try {
+      return this.ctx.get('llm') as LlmRuntime | undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * The subagent seam to use right now.
+   *
+   * Resolved the same way and for the same reason as {@link llm}: consolidation
+   * is a subagent pass, so a seam captured at activation when it was not yet
+   * provided would disable every later consolidation silently.
+   */
+  private get subagents(): SubagentSeam | undefined {
+    if (this.subagentsAtActivation !== undefined) return this.subagentsAtActivation
+    try {
+      return this.ctx.get('subagents') as SubagentSeam | undefined
+    } catch {
+      return undefined
+    }
   }
 
   /** The tunables in force right now. */
@@ -728,7 +810,7 @@ export class MemoriesRuntime {
       session.id, Buffer.byteLength(summary.text, 'utf8'), listed, summary.surfaced.length)
     return createUserMessage({
       content: [{ type: 'text', text: summary.text }],
-      source: { kind: 'plugin', plugin: name, form: 'recall' },
+      source: { kind: MEMORY_SOURCE_KIND, form: 'recall' },
     })
   }
 
@@ -743,7 +825,7 @@ export class MemoriesRuntime {
     try {
       return session.deriveMessages().some((message) => {
         const source = message.source
-        if (source.kind !== 'plugin' || source.plugin !== name || source.form !== 'recall') return false
+        if (source.kind !== MEMORY_SOURCE_KIND || source.form !== 'recall') return false
         // Both blocks carry this form, so the SUMMARY is the one whose frame
         // says so: an on-demand delta must not count as the once-per-
         // conversation block, or the summary would never be injected.
@@ -936,7 +1018,7 @@ export class MemoriesRuntime {
       content: [{ type: 'text', text }],
       // The same form as the summary block; `carriesRecall` tells them apart by
       // the frame, so a delta never suppresses the once-per-conversation block.
-      source: { kind: 'plugin', plugin: name, form: 'recall' },
+      source: { kind: MEMORY_SOURCE_KIND, form: 'recall' },
     })
   }
 
@@ -1104,8 +1186,8 @@ export class MemoriesRuntime {
         return
       }
       void this.mine(agent).then(
-        async (stored) => {
-          await this.afterPass(agent, stored)
+        async (outcome) => {
+          await this.afterPass(agent, outcome.stored)
         },
         (error: unknown) => {
           if (!this.lifecycle.signal.aborted) this.log.warn('dsh-memories: extraction failed for session %s: %o', agent.session.id, error)
@@ -1173,11 +1255,11 @@ export class MemoriesRuntime {
    *
    * A session with nothing new costs no model call.
    *
-   * The pass reports itself in one line. Without it the log could only be read
-   * for what happened, never for why nothing did: every gate that skips work
-   * (quota pause, no new material, an ineligible or already-running session)
-   * left no trace at the level the file is configured for, and "is the
-   * background extractor alive at all?" had no answer.
+   * The pass reports itself in one line, and at info at least once an hour even
+   * when it did nothing. Without that, every gate that skips work (quota pause,
+   * no new material, an ineligible or already-running session, a missing service)
+   * left a trace only at the level the file is configured to drop, and "is the
+   * background extractor alive at all?" had no answer a reader could act on.
    */
   async runPeriodicPass(): Promise<void> {
     if (!this.settings.autoExtract) return
@@ -1186,57 +1268,108 @@ export class MemoriesRuntime {
       this.log.decision('dsh-memories: periodic extraction skipped, background passes are %s', this.backgroundLine())
       return
     }
-    const counts = { tracked: 0, mined: 0, stored: 0, idle: 0, skipped: 0, failed: 0 }
+    const counts = { live: 0, tracked: 0, mined: 0, stored: 0, idle: 0, skipped: 0, failed: 0 }
+    const reasons = new Map<string, number>()
+    const note = (reason: string): void => { reasons.set(reason, (reasons.get(reason) ?? 0) + 1) }
+    // Two sources, because one of them is blind exactly when it matters. `tracked`
+    // only ever holds agents that settled during THIS process, so after a restart
+    // a session nobody has touched yet — the normal case for a restored window —
+    // is invisible to every later pass. The live registry knows about it.
+    const candidates = new Map<string, Agent>()
     for (const reference of [...this.tracked]) {
-      if (this.lifecycle.signal.aborted) return
       const agent = reference.deref()
       if (agent === undefined) {
         this.tracked.delete(reference)
         continue
       }
+      candidates.set(agent.session.id, agent)
+    }
+    const live = this.liveAgents()
+    counts.live = live.length
+    for (const agent of live) if (!candidates.has(agent.session.id)) candidates.set(agent.session.id, agent)
+    for (const agent of candidates.values()) {
+      if (this.lifecycle.signal.aborted) return
       counts.tracked += 1
       const session = agent.session
       if (!this.eligible(session)) {
         counts.skipped += 1
+        note('ineligible')
         continue
       }
       if (this.extracting.has(session.id)) {
         counts.skipped += 1
+        note('already-extracting')
         continue
       }
       if (this.hasNothingNew(session)) {
         counts.idle += 1
+        note('nothing-new')
         continue
       }
       try {
-        const stored = await this.mine(agent, { ignoreIdleWindow: true })
+        const outcome = await this.mine(agent, { ignoreIdleWindow: true })
         // A pass that ran but stored nothing was deferred, not mined: the reason
         // is in its own decision line, and only a real pass counts here.
-        if (stored > 0) {
+        if (outcome.stored > 0) {
           counts.mined += 1
-          counts.stored += stored
+          counts.stored += outcome.stored
         } else {
           counts.skipped += 1
+          if (outcome.reason !== undefined) note(outcome.reason)
         }
-        await this.afterPass(agent, stored)
+        await this.afterPass(agent, outcome.stored)
       } catch (error) {
         counts.failed += 1
         this.log.warn('dsh-memories: periodic extraction failed for session %s: %o', session.id, error)
       }
     }
-    this.reportPass(counts)
+    this.reportPass(counts, reasons)
     await this.sweepIfDue()
   }
 
+  /** Live agents from the harness registry, when the deployment composes one. */
+  private liveAgents(): Agent[] {
+    try {
+      const registry = this.ctx.get('agents') as AgentRegistryLike | undefined
+      if (registry === undefined) return []
+      const agents = registry.roots?.() ?? registry.list?.() ?? []
+      return Array.isArray(agents) ? agents : []
+    } catch {
+      return []
+    }
+  }
+
+  /** When the pass last reported itself at info level. */
+  private lastPassReportAt = 0
+
   /**
-   * Record one periodic pass: at info when it changed something or failed, and at
-   * decision level when there was simply nothing to do (which is most ticks).
+   * Record one periodic pass.
+   *
+   * At info when it changed something, failed, or an hour has passed since the
+   * last info report; at decision level otherwise. The hourly heartbeat is the
+   * point: a pass that does nothing is still evidence, and without it a stall
+   * (every session skipped for a reason nobody can see) is indistinguishable
+   * from a plugin that never ran.
    */
-  private reportPass(counts: { tracked: number; mined: number; stored: number; idle: number; skipped: number; failed: number }): void {
-    const line = 'dsh-memories: extract pass: %d tracked, %d mined (%d stored), %d nothing new, %d skipped, %d failed'
-    const args = [counts.tracked, counts.mined, counts.stored, counts.idle, counts.skipped, counts.failed] as const
-    if (counts.mined > 0 || counts.failed > 0) this.log.info(line, ...args)
-    else this.log.decision(line, ...args)
+  private reportPass(
+    counts: { live: number; tracked: number; mined: number; stored: number; idle: number; skipped: number; failed: number },
+    reasons: ReadonlyMap<string, number> = new Map(),
+  ): void {
+    const detail = [...reasons.entries()]
+      .filter(([, count]) => count > 0)
+      .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+      .map(([reason, count]) => `${reason} ${count}`)
+      .join(', ')
+    const line = 'dsh-memories: extract pass: %d live, %d considered, %d mined (%d stored), %d nothing new, %d skipped, %d failed%s'
+    const now = Date.now()
+    const args = [counts.live, counts.tracked, counts.mined, counts.stored, counts.idle, counts.skipped, counts.failed,
+      detail.length > 0 ? ` — ${detail}` : ''] as const
+    if (counts.mined > 0 || counts.failed > 0 || now - this.lastPassReportAt >= PASS_REPORT_INTERVAL_MS) {
+      this.lastPassReportAt = now
+      this.log.info(line, ...args)
+    } else {
+      this.log.decision(line, ...args)
+    }
   }
 
   /**
@@ -1247,7 +1380,17 @@ export class MemoriesRuntime {
    * job lease is exclusive.
    */
   private async consolidateIfDue(agent: Agent): Promise<void> {
-    if (!this.settings.consolidate || this.subagents === undefined) return
+    if (!this.settings.consolidate) return
+    if (this.subagents === undefined) {
+      // Same silence the extraction pass used to have: a service that never
+      // arrived at activation would disable consolidation for the whole process
+      // without a word. Say it once.
+      if (!this.warnedNoSubagents) {
+        this.warnedNoSubagents = true
+        this.log.warn('dsh-memories: the subagents service is unavailable, so consolidation cannot run')
+      }
+      return
+    }
     const job = this.state.getJob(CONSOLIDATE_JOB)
     if (job === undefined) return
     if (job.notBefore > Date.now()) return
@@ -1292,24 +1435,24 @@ export class MemoriesRuntime {
    * @param options - which gates to ignore. The exit flush passes
    *   `ignoreIdleWindow` (a session being torn down is finished by definition)
    *   but still respects peak hours, because it is an automatic spend.
-   * @returns how many drafts were stored.
+   * @returns how many drafts were stored, and which gate refused when none were.
    */
-  private async mine(agent: Agent, options: { ignoreIdleWindow?: boolean; ignorePeakHours?: boolean } = {}): Promise<number> {
-    if (this.sessionOff(agent.session)) return 0
+  private async mine(agent: Agent, options: { ignoreIdleWindow?: boolean; ignorePeakHours?: boolean } = {}): Promise<{ stored: number; reason?: MineSkip }> {
+    if (this.sessionOff(agent.session)) return { stored: 0, reason: 'off' }
     if (options.ignorePeakHours !== true) {
       const penalty = peakDelayMs(this.settings.peakHours, new Date())
       if (penalty > 0) {
         this.log.decision('dsh-memories: not mining session %s, %s of peak hours remain',
           agent.session.id, formatDelay(penalty))
-        return 0
+        return { stored: 0, reason: 'peak' }
       }
     }
     if (options.ignoreIdleWindow !== true) {
-      if (agent.status !== 'idle') return 0
+      if (agent.status !== 'idle') return { stored: 0, reason: 'not-idle' }
       if (!this.idleEnough(agent)) {
         this.log.decision('dsh-memories: session %s is not quiet enough yet, still inside the %sh window',
           agent.session.id, this.settings.minIdleHours)
-        return 0
+        return { stored: 0, reason: 'quiet' }
       }
     }
     try {
@@ -1318,7 +1461,7 @@ export class MemoriesRuntime {
       // Claiming the idle phase can be refused (a wake arrived first), and a
       // broken seam should not be silent: the pass is skipped either way.
       this.log.decision('dsh-memories: could not claim the idle phase for session %s: %o', agent.session.id, error)
-      return 0
+      return { stored: 0, reason: 'claim' }
     }
   }
 
@@ -1376,7 +1519,7 @@ export class MemoriesRuntime {
         // Forced past the quiet window: at this boundary the session is over, so
         // that gate would only guarantee a process which exits before
         // `minIdleHours` never mines anything. Peak hours still apply.
-        stored += await this.mine(agent, { ignoreIdleWindow: true })
+        stored += (await this.mine(agent, { ignoreIdleWindow: true })).stored
       } catch (error) {
         if (!budget.aborted) this.log.warn('dsh-memories: exit extraction failed for session %s: %o', agent.session.id, error)
       }
@@ -1435,21 +1578,31 @@ export class MemoriesRuntime {
    * @param budget - optional outer cancellation (a settle-window or shutdown deadline).
    * @param force - skip the "is the agent idle" gate; used by the exit flush and
    *   by `/memories mine`, where the caller has already decided to spend the call.
-   * @returns how many drafts were stored.
+   * @returns how many drafts were stored, and which gate refused when none were.
    */
-  async runExtraction(agent: Agent, budget?: AbortSignal, force = false): Promise<number> {
-    if (!this.settings.autoExtract) return 0
+  async runExtraction(agent: Agent, budget?: AbortSignal, force = false): Promise<{ stored: number; reason?: MineSkip }> {
+    if (!this.settings.autoExtract) return { stored: 0, reason: 'off' }
     if (this.backgroundPaused()) {
       const limit = this.state.getLimit()
       this.log.debug('dsh-memories: background pass paused until %s (%d refusals)', new Date(limit?.until ?? 0).toISOString(), limit?.failures ?? 0)
-      return 0
+      return { stored: 0, reason: 'quiet' }
     }
-    if (!force && agent.status !== 'idle') return 0
+    if (!force && agent.status !== 'idle') return { stored: 0, reason: 'not-idle' }
     const session = agent.session
     const key = session.id
-    if (this.extracting.has(key)) return 0
+    if (this.extracting.has(key)) return { stored: 0, reason: 'claim' }
     const llm = this.llm
-    if (llm === undefined) return 0
+    if (llm === undefined) {
+      // This used to return silently, which made a background extractor that
+      // could never run indistinguishable from one with nothing to do. The
+      // service is optional (`inject` cannot require it without breaking
+      // deployments that compose no model), so the missing case has to speak.
+      if (!this.warnedNoLlm) {
+        this.warnedNoLlm = true
+        this.log.warn('dsh-memories: the llm service is unavailable, so background extraction cannot run')
+      }
+      return { stored: 0, reason: 'no-llm' }
+    }
     this.extracting.add(key)
     // Keep the event loop alive for the duration: a one-shot run has nothing
     // else scheduled, and Node would exit mid-request. Released in `finally`.
@@ -1458,7 +1611,7 @@ export class MemoriesRuntime {
       const watermark = this.state.getSession(key)
       const afterSeq = watermark?.lastSeq ?? 0
       const window = collectWindow(session, afterSeq, this.settings.extractWindowMessages, this.settings.extractMaxInputChars)
-      if (window.lastSeq === undefined || window.text.trim().length === 0) return 0
+      if (window.lastSeq === undefined || window.text.trim().length === 0) return { stored: 0, reason: 'empty' }
       const root = await this.projectRoot(session)
       const projectLabel = root === undefined ? NO_PROJECT_LABEL : this.store.target('project', root).label
       const knownTitles = await this.knownTitles(root)
@@ -1489,8 +1642,13 @@ export class MemoriesRuntime {
       }
       // Reaching the provider proves quota is available again.
       this.state.clearLimit()
+      // The spend is reported on the same line as the result: this call belongs
+      // to no session, so the plugin log is the only place it is visible.
+      const spend = outcome.usage === undefined ? '' : ` [${outcome.usage.inputTokens} in / ${outcome.usage.outputTokens} out tokens]`
+      let refusal: MineSkip | undefined
       if (outcome.kind === 'none') {
-        this.log.decision('dsh-memories: session %s produced no memories (%s)', key, outcome.reason)
+        refusal = outcome.reason === 'no-route' ? 'no-route' : 'empty'
+        this.log.decision('dsh-memories: session %s produced no memories (%s)%s', key, outcome.reason, spend)
       } else {
         const stored: string[] = []
         for (const draft of outcome.drafts) {
@@ -1508,7 +1666,7 @@ export class MemoriesRuntime {
         }).catch((error: unknown) => {
           this.log.warn('dsh-memories: could not write the evidence note for session %s: %o', key, error)
         })
-        this.log.info('dsh-memories: stored %d memories from session %s (%s)', outcome.drafts.length, key, stored.join(', '))
+        this.log.info('dsh-memories: stored %d memories from session %s (%s)%s', outcome.drafts.length, key, stored.join(', '), spend)
         // A pass that always lands on the cap is a pass whose ceiling is the
         // binding constraint. Saying so is the only way anybody can tell that
         // `extractMaxMemories` is the knob to raise — measured on a real store,
@@ -1525,7 +1683,7 @@ export class MemoriesRuntime {
         activityAt: Date.now(),
         ...outcome.kind === 'memories' ? { contributed: true } : {},
       })
-      return outcome.kind === 'memories' ? outcome.drafts.length : 0
+      return { stored: outcome.kind === 'memories' ? outcome.drafts.length : 0, ...refusal === undefined ? {} : { reason: refusal } }
     } finally {
       clearTimeout(hold)
       this.extracting.delete(key)
@@ -1535,9 +1693,9 @@ export class MemoriesRuntime {
   /** Force an extraction now, ignoring the idle timer and the quiet window (used by `/memories mine`). */
   async mineNow(agent: Agent): Promise<number> {
     this.cancelExtraction(agent)
-    const stored = await this.runExtraction(agent, undefined, true)
-    if (stored > 0) this.enqueueConsolidation(Date.now(), false, await this.projectRoot(agent.session))
-    return stored
+    const outcome = await this.runExtraction(agent, undefined, true)
+    if (outcome.stored > 0) this.enqueueConsolidation(Date.now(), false, await this.projectRoot(agent.session))
+    return outcome.stored
   }
 
   /**
@@ -1780,6 +1938,14 @@ export class MemoriesRuntime {
     if (stale > 0) {
       this.log.info('dsh-memories: %d memories cite a path that no longer resolves; /memories stale lists them', stale)
     }
+    // An unseen tail is the other half of the same question ("is this store worth
+    // its size?"): retention cannot answer it, because nothing on a young store
+    // is old enough to archive yet.
+    const unseen = await this.neverSeen().catch(() => ({ count: 0, total: 0, oldestDays: 0 }))
+    if (unseen.count > 0) {
+      this.log.info('dsh-memories: %d of %d memories have never been injected or read (oldest %dd); only recall and consolidation surface them',
+        unseen.count, unseen.total, unseen.oldestDays)
+    }
     // Consolidation is otherwise enqueued only when an extraction STORES something,
     // so a store nobody is writing to is never reorganised — and a memory written
     // by hand never queues a pass at all. The sweep is already a timer, so it
@@ -1843,8 +2009,11 @@ export class MemoriesRuntime {
     const collect = (label: string, entries: readonly MemoryEntry[], root: string | undefined): void => {
       const roots = citationRoots(root, [this.deployment.dshHome])
       if (roots.length === 0) return
+      // Generated paths do not count as stale: each scope's own repository says
+      // which of its files are build output or runtime state.
+      const ignored = ignoredUnder(root ?? this.deployment.dshHome)
       for (const entry of entries) {
-        const missing = missingCitations(entry.body, roots)
+        const missing = missingCitations(entry.body, roots, undefined, { isIgnored: ignored })
         if (missing.length > 0) rows.push({ scope: label, id: entry.id, title: entry.title, missing })
       }
     }
@@ -1865,6 +2034,46 @@ export class MemoriesRuntime {
    */
   private async countStale(): Promise<number> {
     return (await this.staleRows()).length
+  }
+
+  /**
+   * How many memories have never been injected and never read.
+   *
+   * Retention is purely age-based, so on a young store nothing is old enough to
+   * archive and a large unseen tail can sit there with nothing to say so —
+   * measured on a real store twelve days in, 100 of 346 entries had never been
+   * injected into a session nor returned by the tool. The count, plus the age of
+   * the oldest, is what separates "recent entries nobody needed yet" from "the
+   * ranking never reaches these".
+   *
+   * @returns the never-seen count, the store size, and the oldest never-seen age in days.
+   */
+  private async neverSeen(): Promise<{ count: number; total: number; oldestDays: number }> {
+    const rows = new Map(this.state.retentionRows().map((row) => [retentionKey(row.scope, row.id), row]))
+    const now = Date.now()
+    let count = 0
+    let total = 0
+    let oldest = now
+    const consider = (entries: readonly MemoryEntry[]): void => {
+      for (const entry of entries) {
+        total += 1
+        const row = rows.get(retentionKey(entry.scope, entry.id))
+        // Both views are read: a hand-written entry carries its counters in the
+        // file, and a concurrent session's newer counter lives in the database.
+        const surfaced = (row?.surfacedAt ?? 0) > 0 || entry.lastSurfacedAt > 0
+        const used = (row?.lastUsedAt ?? 0) > 0 || entry.lastUsedAt > 0
+        if (surfaced || used) continue
+        count += 1
+        oldest = Math.min(oldest, entry.createdAt)
+      }
+    }
+    consider(await this.store.list('global', undefined, { fresh: true }))
+    for (const slug of await this.store.listProjects()) {
+      const descriptor = await this.store.readProjectDescriptor(slug)
+      if (descriptor === undefined) continue
+      consider(await this.store.list('project', descriptor.root, { fresh: true }))
+    }
+    return { count, total, oldestDays: count === 0 ? 0 : Math.floor((now - oldest) / 86_400_000) }
   }
 
   /**
@@ -1899,6 +2108,14 @@ export class MemoriesRuntime {
     const last = Number(this.state.getMeta(SWEEP_META_KEY) ?? '0')
     const when = Number.isFinite(last) && last > 0 ? new Date(last).toISOString() : 'never'
     return `, sweep every ${this.settings.sweepIntervalHours}h (last ${when})`
+  }
+
+  /** One line describing how much of the store has ever reached a session. */
+  private async exposureLine(): Promise<string> {
+    const unseen = await this.neverSeen().catch(() => ({ count: 0, total: 0, oldestDays: 0 }))
+    if (unseen.total === 0) return 'no memories stored'
+    if (unseen.count === 0) return `every one of ${unseen.total} memories has been injected or read`
+    return `${unseen.count} of ${unseen.total} never injected or read (oldest ${unseen.oldestDays}d)`
   }
 
   /**
@@ -2015,6 +2232,7 @@ export class MemoriesRuntime {
       `skills: ${drafts.length === 0 ? 'no staged drafts' : `${drafts.length} staged draft${drafts.length === 1 ? '' : 's'} waiting (promote with /memories promote <name>)`}`,
       `consolidation: ${await this.consolidationLine()}`,
       `retention: ${this.settings.maxUnusedDays > 0 ? `archive after ${this.settings.maxUnusedDays}d unused` : 'off'}${this.sweepLine()}`,
+      `exposure: ${await this.exposureLine()}`,
       `session mode: ${this.sessionMode(session)}`,
       `logging: ${this.settings.logLevel}${this.settings.traceMaintenance ? ' + maintenance trace' : ''} → ${this.logDestination()}`,
       `sessions: ${this.state.minedCount()} mined / ${this.state.sessionCount()} tracked`,
@@ -2040,10 +2258,12 @@ export class MemoriesRuntime {
   private async citationFlags(session: Session, entries: readonly MemoryEntry[]): Promise<Map<string, string>> {
     const flags = new Map<string, string>()
     if (entries.length === 0) return flags
-    const roots = citationRoots(await this.projectRoot(session), [this.deployment.dshHome])
+    const projectRoot = await this.projectRoot(session)
+    const roots = citationRoots(projectRoot, [this.deployment.dshHome])
     if (roots.length === 0) return flags
+    const ignored = ignoredUnder(projectRoot ?? this.deployment.dshHome)
     for (const entry of entries) {
-      const warning = citationWarning(missingCitations(entry.body, roots))
+      const warning = citationWarning(missingCitations(entry.body, roots, undefined, { isIgnored: ignored }))
       if (warning.length > 0) flags.set(entry.id, warning)
     }
     return flags
@@ -2179,12 +2399,12 @@ function helpText(): string {
 /**
  * Register the memory tool, the injector, the idle extractor, and `/memories`.
  *
- * The tunables live in the `memories` settings namespace: registering it here
- * is what puts them in `$DSH_HOME/settings.yaml` and in the DSH Settings shell,
- * and every knob takes effect on the next read — no restart.
+ * The tunables live in this plugin's own entry config, marked live in
+ * {@link Config}: that is what puts them in the DSH settings surface and what
+ * makes a committed write take effect on the next read — no restart.
  *
  * @param ctx - the plugin context.
- * @param config - deployment configuration (paths and workspace discovery).
+ * @param config - entry configuration (paths, workspace discovery, tunables).
  */
 export function apply(ctx: Context, config: MemoriesConfig = {}): void {
   const deployment = resolveConfig(config)
@@ -2195,51 +2415,35 @@ export function apply(ctx: Context, config: MemoriesConfig = {}): void {
   /**
    * Authoritative tunables.
    *
-   * The settings scope owns the lifecycle: `register` returns a scope whose
-   * `get()` is the resolved value (schema defaults, then the composition base,
-   * then the user's `settings.yaml` section) and whose `watch` fires on every
-   * commit. One source, so the settings document and the runtime can never
-   * disagree, and no restart is needed to change a knob.
+   * Read from the entry config rather than snapshotted: the fields are live, so
+   * the Loader hands them over as references and a committed settings write
+   * updates them in place. `loader/volatile-update` announces that they moved,
+   * and re-reading on it is what makes a knob take effect without a restart —
+   * one source, so the settings page and the runtime can never disagree.
    */
-  let current: MemoriesSettings = deployment.defaults
+  let current: MemoriesSettings = readTunables(config)
   const read = (): MemoriesSettings => current
   /** Assigned once the live registrations exist; a no-op until then. */
   let liveRegistrations = (): void => undefined
   /** Assigned once the runtime exists, so a settings commit can act on it. */
   let onSettingsCommit = (): void => undefined
 
-  // The settings seam is optional: a deployment that composes no provider
-  // keeps the row-level defaults and simply has no settings document.
-  const settings = ctx.get('settings') as SettingsProvider | undefined
-  if (settings !== undefined) {
-    try {
-      const scope = settings.register(SETTINGS_NS, MemoriesSettingsSchema, { base: deployment.defaults, applies: 'live' })
-      current = normalizeSettings(scope.get())
-      ctx.effect(() => scope.watch((next) => {
-        current = normalizeSettings(next)
-        liveRegistrations()
-        onSettingsCommit()
-      }), 'dsh-memories.settingsWatch')
-    } catch (error) {
-      log.warn('dsh-memories: settings registration failed, using row defaults: %o', error)
-    }
-  }
-
-  const runtime = new MemoriesRuntime(ctx, config, read)
-  ctx.effect(() => () => runtime.dispose(), 'dsh-memories.lifecycle')
-  onSettingsCommit = () => {
-    runtime.startPeriodicExtraction()
-    runtime.reportSettingsIssues()
-  }
-  runtime.startPeriodicExtraction()
-  runtime.reportSettingsIssues()
-
-  // The host logger drops `warn` and `debug` before any sink sees them: the only
-  // exporter a stock composition installs declares no level, so the threshold
-  // falls back to 1 and `warn` (2) is filtered out. Registering our own exporter
-  // for this plugin's logger name only raises that threshold for our lines, and
-  // the file then records whatever `logLevel` allows — which is what makes a
-  // failed extraction, a quota refusal, or a retention decision observable.
+  /**
+   * The plugin's own log file, opened before anything else can fail.
+   *
+   * Two reasons for the position. The host logger drops `warn` and `debug`
+   * before any sink sees them — the only exporter a stock composition installs
+   * declares no level, so the threshold falls back to 1 and `warn` (2) is
+   * filtered out — and registering our own exporter for this plugin's logger
+   * name raises that threshold for our lines only, which is what makes a failed
+   * extraction, a quota refusal, or a retention decision observable at all. And
+   * a composition error is the one failure this file used to miss entirely,
+   * because its sink only existed once the runtime did.
+   *
+   * The runtime is assigned below; the callback reaches it only when a write
+   * actually fails.
+   */
+  let runtime!: MemoriesRuntime
   const sink = createFileSink(deployment.logFile, undefined, (reason) => {
     // A failed write is the one failure the log file cannot report about itself:
     // the very channel is broken. Record it on the runtime so `/memories stats`
@@ -2256,22 +2460,54 @@ export function apply(ctx: Context, config: MemoriesConfig = {}): void {
     runtime.logSinkError = `unwritable: ${deployment.logFile}`
     log.warn('dsh-memories: could not open the log file %s', deployment.logFile)
   }
-  // The Settings page reads and edits memories through the Typert gateway, so
+  // The Memories page is this plugin's own, so the settings domain is asked not
+  // to derive a second one from the schema. Optional throughout: a deployment
+  // that composes no domain keeps every model-facing surface and simply has no
+  // page.
+  ctx.inject(['settings'], (child) => {
+    const domain = child.get('settings') as unknown as SettingsDomainLike | undefined
+    if (domain === undefined) return
+    child.effect(() => domain.configure({ auto: false }, ctx.fiber), 'dsh-memories.settingsPage')
+  })
+  ctx.on('loader/volatile-update', () => {
+    current = readTunables(config)
+    liveRegistrations()
+    onSettingsCommit()
+  })
+
+  runtime = new MemoriesRuntime(ctx, config, read)
+  ctx.effect(() => () => runtime.dispose(), 'dsh-memories.lifecycle')
+  onSettingsCommit = () => {
+    runtime.startPeriodicExtraction()
+    runtime.reportSettingsIssues()
+  }
+  runtime.startPeriodicExtraction()
+  runtime.reportSettingsIssues()
+
+  // The Memories page reads and edits memories through the Typert gateway, so
   // registering the invocation manifest and providing the `memories` service
   // are what make `ctx.remote.memories.*` callable from the browser. Both are
   // optional: a deployment that composes no gateway (headless, tui) keeps every
   // model-facing and command-facing surface and simply has no browser page.
-  const typert = ctx.get('typert') as TypertRegistryLike | undefined
-  if (typert !== undefined) {
+  //
+  // Reached through `ctx.inject` rather than `ctx.get`: a service only reads
+  // once its providing fiber is active, and in 0.1.7 the gateway registers after
+  // the rows that consume it — the same trap the settings domain above
+  // documents, and the one that silently left the page without an API.
+  ctx.inject(['typert'], (child) => {
+    const typert = child.get('typert') as TypertRegistryLike | undefined
+    if (typert === undefined) return
     try {
       const withdraw = typert.register(REMOTE_CONTRIBUTION)
-      ctx.effect(() => withdraw, 'dsh-memories.remoteContribution')
+      child.effect(() => withdraw, 'dsh-memories.remoteContribution')
       const service = createRemoteService({
         store: runtime.store,
         dshHome: deployment.dshHome,
         disputes: () => runtime.disputes(),
         resolveDispute: (id, decision) => runtime.resolveDispute(id, decision),
       })
+      // Provided on the plugin's own context, not the child's: the gateway is a
+      // sibling scope and resolves the service as a peer.
       ctx.effect(() => ctx.provide(REMOTE_SERVICE, service), 'dsh-memories.remoteService')
       log.info('dsh-memories: exposed the %s Remote namespace to the browser (%d methods)',
         REMOTE_NAMESPACE, REMOTE_CONTRIBUTION.invocations.length)
@@ -2281,7 +2517,7 @@ export function apply(ctx: Context, config: MemoriesConfig = {}): void {
       log.warn('dsh-memories: remote registration failed, the settings page stays unavailable: %s',
         error instanceof Error ? error.message : String(error))
     }
-  }
+  })
   // Import (and remove) a pre-SQLite watermark file once, so upgrading does not
   // re-mine conversations that were already processed.
   void importLegacyState(runtime.state, runtime.store.memoriesDir).then((imported) => {
@@ -2301,17 +2537,16 @@ export function apply(ctx: Context, config: MemoriesConfig = {}): void {
   // was a quarter of the whole log while saying nothing a reader could act on.
   // `/memories stats` reports the same facts on demand.
   log.debug(
-    'dsh-memories: store at %s autoExtract=%s idle=%d settings=%s log=%s',
+    'dsh-memories: store at %s autoExtract=%s idle=%d log=%s',
     runtime.store.memoriesDir,
     String(runtime.settings.autoExtract),
     runtime.settings.autoExtractIdleMs,
-    settings === undefined ? 'row-defaults' : SETTINGS_NS,
     deployment.logFile.length > 0 ? `${deployment.logFile} (${runtime.settings.logLevel})` : 'off',
   )
 
   // `enableTool`/`enableCommand` are live: each registration is torn down and
-  // re-created when the toggle flips, so the model's catalog follows the
-  // settings document without a restart.
+  // re-created when the toggle flips, so the model's catalog follows the entry
+  // config without a restart.
   const registerTool = (): (() => void) => registerMemoryTool(ctx, runtime)
   const registerCommand = (): (() => void) => ctx.commands.register({
     name: 'memories',

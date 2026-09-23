@@ -11,6 +11,8 @@
  *   node scripts/activation-smoke.mjs <pluginDir>
  */
 import { Context } from '@deepseek-ai/cordis'
+import { createVolatile, updateVolatile } from '@deepseek-ai/cosmokit'
+import { MEMORIES_SETTINGS_DEFAULTS } from '../lib/config.js'
 import { pathToFileURL } from 'node:url'
 import { resolve } from 'node:path'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
@@ -48,42 +50,20 @@ class Commands {
   }
 }
 
-/** Minimal settings provider stand-in: one namespace, resolved value tracked. */
-class Settings {
-  constructor(base) {
-    this.base = base
-    this.namespaces = new Map()
-    this.watchers = new Map()
+/**
+ * Minimal settings-domain stand-in: records the page policy the plugin asks for.
+ *
+ * Only `configure` exists here because that is the entire host-side contact a
+ * plugin that ships its own page has with the domain; the reads and writes go
+ * through the row's live references instead.
+ */
+class SettingsDomain {
+  constructor() {
+    this.policies = []
   }
-  register(ns, _schema, options) {
-    this.namespaces.set(ns, { value: { ...this.base, ...(options?.base ?? {}) }, base: options?.base ?? {} })
-    return {
-      get: () => this.namespaces.get(ns).value,
-      watch: (callback) => {
-        const set = this.watchers.get(ns) ?? new Set()
-        set.add(callback)
-        this.watchers.set(ns, set)
-        return () => set.delete(callback)
-      },
-      update: async (patch) => {
-        const entry = this.namespaces.get(ns)
-        const prev = entry.value
-        entry.value = { ...entry.value, ...patch }
-        for (const callback of this.watchers.get(ns) ?? []) await callback(entry.value, prev)
-      },
-      replace: async (section) => {
-        const entry = this.namespaces.get(ns)
-        const prev = entry.value
-        entry.value = { ...entry.base, ...section }
-        for (const callback of this.watchers.get(ns) ?? []) await callback(entry.value, prev)
-      },
-    }
-  }
-  describe() {
-    return [...this.namespaces.entries()].map(([ns, entry]) => ({ ns, value: entry.value, revision: 1, applies: 'live' }))
-  }
-  get(ns) {
-    return this.namespaces.get(ns)?.value
+  configure(presentation) {
+    this.policies.push({ presentation })
+    return () => { this.policies = this.policies.filter((candidate) => candidate.presentation !== presentation) }
   }
 }
 
@@ -119,8 +99,14 @@ const root = new Context()
 const ctx = root.extend({ name: 'smoke' })
 const tools = new Tools()
 const commands = new Commands()
-const settings = new Settings({})
+const settings = new SettingsDomain()
 const typert = new Typert()
+
+// `autoExtract` is off so the harness never runs a background pass against a
+// temp store. The tunables go in plain: the schema is what turns each one into
+// the live reference the plugin then reads, exactly as the Loader does it.
+const config = { memoriesDir, logFile: '', ...MEMORIES_SETTINGS_DEFAULTS, autoExtract: false }
+
 ctx.provide('tools', tools)
 ctx.provide('commands', commands)
 ctx.provide('settings', settings)
@@ -129,31 +115,43 @@ ctx.provide('llm', { stream: async function* () {} })
 
 const module = await import(entry)
 console.log('exports:', Object.keys(module).sort().join(', '))
-console.log('inject:', JSON.stringify(module.inject))
+console.log('inject:', JSON.stringify(module.inject), '(settings must NOT be required)')
+if (module.inject.includes('settings')) throw new Error('the settings domain has to stay optional')
 
-const plugin = ctx.plugin(module, { memoriesDir, autoExtract: false, logFile: '' })
+const plugin = ctx.plugin(module, config)
 await new Promise((settle) => setTimeout(settle, 200))
 
-console.log('settings namespaces:', settings.describe().map((d) => d.ns).join(', ') || '(none)')
+/** What the plugin is running with: its resolved entry config, refs and all. */
+const mounted = [...(ctx.registry.get(module)?.fibers ?? [])][0]?.config
+
+/**
+ * Commit a tunable change the way the Loader does.
+ *
+ * Update the entry config's references in place, then announce the paths —
+ * nothing re-mounts, which is exactly what the live fields are for.
+ * @param patch - the tunables to change.
+ */
+const flip = (patch) => {
+  for (const [key, value] of Object.entries(patch)) updateVolatile(mounted[key], createVolatile(value))
+  ctx.emit('loader/volatile-update', Object.keys(patch).map((key) => [key]))
+}
+
+console.log('page policy:', settings.policies.map((policy) => JSON.stringify(policy.presentation)).join(', ') || '(none)')
+console.log('live tunables:', mounted === undefined ? '(no fiber)' : `enableTool=${String(mounted.enableTool?.get())} autoExtract=${String(mounted.autoExtract?.get())}`)
 console.log('tools registered:', [...tools.registered.keys()].join(', ') || '(none)')
 console.log('commands registered:', [...commands.registered.keys()].join(', ') || '(none)')
 console.log('typert invocations:', typert.contributions[0]?.invocations.map((i) => i.method).join(', ') || '(none)')
 
-// Live toggle: disabling the tool through the settings scope must unregister it.
-const flip = async (patch) => {
-  const entry = settings.namespaces.get('memories')
-  const prev = entry.value
-  entry.value = { ...entry.value, ...patch }
-  for (const callback of [...(settings.watchers.get('memories') ?? [])]) await callback(entry.value, prev)
-}
-await flip({ enableTool: false })
+// Live toggle: a knob changed through the entry's live fields must take effect
+// on the running plugin, without a restart.
+flip({ enableTool: false })
 await new Promise((settle) => setTimeout(settle, 50))
 console.log('after enableTool=false, tools:', [...tools.registered.keys()].join(', ') || '(none)')
-await flip({ enableTool: true, enableCommand: false })
+flip({ enableTool: true, enableCommand: false })
 await new Promise((settle) => setTimeout(settle, 50))
 console.log('after enableTool=true/enableCommand=false, tools:', [...tools.registered.keys()].join(', ') || '(none)', '| commands:', [...commands.registered.keys()].join(', ') || '(none)')
 // Restore both so the command smoke below exercises a fully enabled plugin.
-await flip({ enableCommand: true })
+flip({ enableCommand: true })
 await new Promise((settle) => setTimeout(settle, 50))
 console.log('after re-enable, commands:', [...commands.registered.keys()].join(', ') || '(none)')
 

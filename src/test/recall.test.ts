@@ -15,6 +15,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { MemoriesRuntime } from '../index.js'
+import { MEMORY_SOURCE_KIND } from '../types.js'
 import type { MemoriesConfig } from '../config.js'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Session } from '@deepseek-ai/dsh-session'
@@ -84,7 +85,7 @@ test('an on-demand delta surfaces the memory the current turn matches', async (t
   assert.ok(delta !== undefined, 'a strong match injects')
   assert.match(textOf(delta), /<memory-recall>/u)
   assert.match(textOf(delta), /Prefer pnpm/u)
-  assert.equal(delta?.source.kind, 'plugin')
+  assert.equal(delta?.source.kind, MEMORY_SOURCE_KIND)
 })
 
 test('a delta is injected once per entry and capped per conversation', async (t) => {

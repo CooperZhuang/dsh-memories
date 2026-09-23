@@ -1,25 +1,33 @@
 /**
  * Configuration for `dsh-memories`.
  *
- * Two layers, deliberately separated:
+ * One row config, two kinds of field, deliberately separated:
  *
- * - **Deployment** (cordis row config): where the store lives and how a
- *   workspace root is identified. These are composition facts; changing them
- *   means restarting the surface.
- * - **Tunables** (the `memories` settings namespace): every behavioural knob,
- *   hot-reloaded from `$DSH_HOME/settings.yaml` and editable from the DSH
- *   Settings shell. {@link MemoriesSettingsSchema} is exactly the schema the
- *   settings seam publishes, so the GUI form and the runtime read one
- *   definition.
+ * - **Deployment** (`dshHome`, `memoriesDir`, `projectRootMarkers`, `logFile`):
+ *   where the store lives and how a workspace root is identified. Composition
+ *   facts; changing one means remounting the row.
+ * - **Tunables**: every behavioural knob, declared in {@link Config} with
+ *   `.volatile()`. That marker is what makes a field live — the Loader hands it
+ *   to `apply` as a reference rather than a value, the settings domain projects
+ *   it into the browser, and a write from the Memories page updates the
+ *   reference in place (announced as `loader/volatile-update`), so a knob takes
+ *   effect without a restart or a reload. {@link MemoriesSettings} is the same
+ *   field list as plain data, which is what the runtime reads.
  *
  * @module dsh-memories/config
  */
 import z from '@deepseek-ai/schemastery'
+import { isVolatile, type Volatile } from '@deepseek-ai/cosmokit'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import { logPath, toLogLevel } from './log.js'
 
-/** Settings namespace owning every tunable. */
-export const SETTINGS_NS = 'memories'
+/**
+ * Profile entry id owning this plugin, and therefore the key its tunables are
+ * addressed by: the Memories page asks for its form as
+ * `ctx.configForms.get('memories')`, and a composition row in
+ * `cordis.patch.yml` overrides it under the same id.
+ */
+export const ENTRY_ID = 'memories'
 
 /** Default child-name markers that identify a workspace root. */
 export const DEFAULT_PROJECT_ROOT_MARKERS = ['.git'] as const
@@ -238,101 +246,180 @@ export const DEFAULT_TRACE_MAINTENANCE = false
  */
 export const DEFAULT_PEAK_HOURS = ''
 /**
- * The tunable settings section: one schema shared by the settings seam, the
- * GUI form, and the runtime. Every field carries its default, so an absent
- * `memories:` section in `settings.yaml` resolves to exactly the shipped
- * behaviour.
+ * This plugin's entry config: the deployment facts plus every tunable.
+ *
+ * The tunables are live — declared `.volatile()`, which is what the settings
+ * domain projects into the Memories page and what makes the Loader hand them to
+ * `apply` as references rather than values, so a committed write reaches the
+ * running plugin in place. The deployment fields stay ordinary: changing a path
+ * is a remount, not a knob.
  */
-export const MemoriesSettingsSchema = z.object({
+export const Config = z.object({
+  /** Harness home; defaults to `$DSH_HOME` (or `~/.dsh`). */
+  dshHome: z.string(),
+  /** Directory holding every memory store; defaults to `<dshHome>/memories`. */
+  memoriesDir: z.string(),
+  /** Child names that mark a workspace root during the upward walk. */
+  projectRootMarkers: z.array(z.string()).default([...DEFAULT_PROJECT_ROOT_MARKERS]),
+  /** Plugin log file; defaults to `<dshHome>/logs/dsh-memories.log`. Empty disables file logging. */
+  logFile: z.string(),
   /** Byte budget for the injected summary. `0` disables injection. */
-  maxSummaryBytes: z.number().default(DEFAULT_MAX_SUMMARY_BYTES).description('Byte budget for the memory summary injected once per conversation. 0 disables injection and leaves only the memory tool.'),
+  maxSummaryBytes: z.number().default(DEFAULT_MAX_SUMMARY_BYTES).description('Byte budget for the memory summary injected once per conversation. 0 disables injection and leaves only the memory tool.').volatile(),
   /** Max entries listed per scope in the injected summary. */
-  maxSummaryEntries: z.number().default(DEFAULT_MAX_SUMMARY_ENTRIES).description('How many memories each scope lists in the injected summary.'),
+  maxSummaryEntries: z.number().default(DEFAULT_MAX_SUMMARY_ENTRIES).description('How many memories each scope lists in the injected summary.').volatile(),
   /** Max entries listed for the global scope, which every session shares. */
-  globalSummaryEntries: z.number().default(DEFAULT_GLOBAL_SUMMARY_ENTRIES).description('How many memories the GLOBAL section may list, capped below maxSummaryEntries. Both scopes share one byte budget and global renders first, so without this the global half grows to fill whatever the project half leaves (measured: 87% of a small project\'s summary). 0 removes the global section entirely.'),
+  globalSummaryEntries: z.number().default(DEFAULT_GLOBAL_SUMMARY_ENTRIES).description('How many memories the GLOBAL section may list, capped below maxSummaryEntries. Both scopes share one byte budget and global renders first, so without this the global half grows to fill whatever the project half leaves (measured: 87% of a small project\'s summary). 0 removes the global section entirely.').volatile(),
   /** Byte budget for the global section alone. */
-  globalSummaryBytes: z.number().default(DEFAULT_GLOBAL_SUMMARY_BYTES).description('Byte budget for the GLOBAL section, inside maxSummaryBytes. A count cap is not enough because Chinese entries are ~3 bytes per character: four of them still filled 60% of a 4 KB block. 0 removes the global section entirely.'),
+  globalSummaryBytes: z.number().default(DEFAULT_GLOBAL_SUMMARY_BYTES).description('Byte budget for the GLOBAL section, inside maxSummaryBytes. A count cap is not enough because Chinese entries are ~3 bytes per character: four of them still filled 60% of a 4 KB block. 0 removes the global section entirely.').volatile(),
   /** How many of those entries are reserved for never-listed memories. */
-  summaryFreshSlots: z.number().default(DEFAULT_SUMMARY_FRESH_SLOTS).description('How many of each scope\'s summary entries are reserved for memories that have never been listed before, preferring ones written deliberately over extracted ones. 0 leaves selection to the ranking alone, which on a full scope never shows anything new.'),
+  summaryFreshSlots: z.number().default(DEFAULT_SUMMARY_FRESH_SLOTS).description('How many of each scope\'s summary entries are reserved for memories that have never been listed before, preferring ones written deliberately over extracted ones. 0 leaves selection to the ranking alone, which on a full scope never shows anything new.').volatile(),
   /** How the injected summary is refreshed as the conversation moves on. */
-  recallMode: z.string().default(DEFAULT_RECALL_MODE).description('once injects the summary once per conversation; on-demand also injects a small delta when the current turn clearly matches a memory; off disables injection and leaves only the memory tool.'),
+  recallMode: z.string().default(DEFAULT_RECALL_MODE).description('once injects the summary once per conversation; on-demand also injects a small delta when the current turn clearly matches a memory; off disables injection and leaves only the memory tool.').volatile(),
   /** Minimum relevance a recall delta must reach. */
-  recallMinScore: z.number().default(DEFAULT_RECALL_MIN_SCORE).description('Minimum relevance a memory must reach before it is injected as a recall delta. A strictness knob, not the precision gate: recallMinTerms is what keeps generic overlap out. Raise it to demand a stronger lexical match.'),
+  recallMinScore: z.number().default(DEFAULT_RECALL_MIN_SCORE).description('Minimum relevance a memory must reach before it is injected as a recall delta. A strictness knob, not the precision gate: recallMinTerms is what keeps generic overlap out. Raise it to demand a stronger lexical match.').volatile(),
   /** Cap on recall deltas injected into one conversation. */
-  recallMaxPerConversation: z.number().default(DEFAULT_RECALL_MAX_PER_CONVERSATION).description('Maximum recall deltas injected into one conversation, counted per memory. 0 disables them.'),
+  recallMaxPerConversation: z.number().default(DEFAULT_RECALL_MAX_PER_CONVERSATION).description('Maximum recall deltas injected into one conversation, counted per memory. 0 disables them.').volatile(),
   /** Byte budget for one recall delta block. */
-  recallMaxBytes: z.number().default(DEFAULT_RECALL_MAX_BYTES).description('Byte budget for one on-demand recall block. 0 disables recall deltas.'),
+  recallMaxBytes: z.number().default(DEFAULT_RECALL_MAX_BYTES).description('Byte budget for one on-demand recall block. 0 disables recall deltas.').volatile(),
   /** Shortest user turn worth a recall decision. */
-  recallMinQueryChars: z.number().default(DEFAULT_RECALL_MIN_QUERY_CHARS).description('Shortest user turn, in characters, that may trigger a recall delta. Short acknowledgements are skipped instead of scanning the store.'),
+  recallMinQueryChars: z.number().default(DEFAULT_RECALL_MIN_QUERY_CHARS).description('Shortest user turn, in characters, that may trigger a recall delta. Short acknowledgements are skipped instead of scanning the store.').volatile(),
   /** Distinct strong-field terms a recall needs before it is credited. */
-  recallMinTerms: z.number().default(DEFAULT_RECALL_MIN_TERMS).description('Distinct query terms that must land in the title, keys, tags, or appliesTo before a memory may be recalled on demand. This is what keeps a Chinese turn from recalling every memory that shares a common word like 插件 or 日志. 1 makes the relevance floor the only gate, which is noticeably noisier for Chinese; 0 disables the check.'),
+  recallMinTerms: z.number().default(DEFAULT_RECALL_MIN_TERMS).description('Distinct query terms that must land in the title, keys, tags, or appliesTo before a memory may be recalled on demand. This is what keeps a Chinese turn from recalling every memory that shares a common word like 插件 or 日志. 1 makes the relevance floor the only gate, which is noticeably noisier for Chinese; 0 disables the check.').volatile(),
   /** Max stored entries per scope; the least-recently-updated are evicted. */
-  maxEntriesPerScope: z.number().default(DEFAULT_MAX_ENTRIES_PER_SCOPE).description('Stored memories per scope; past this cap the least recently used are deleted.'),
+  maxEntriesPerScope: z.number().default(DEFAULT_MAX_ENTRIES_PER_SCOPE).description('Stored memories per scope; past this cap the least recently used are deleted.').volatile(),
   /** Days an unused memory survives before it is archived. `0` disables archival. */
-  maxUnusedDays: z.number().default(DEFAULT_MAX_UNUSED_DAYS).description('Days an unused memory survives before it is archived. Archived entries are recoverable with /memories restore. 0 disables archival.'),
+  maxUnusedDays: z.number().default(DEFAULT_MAX_UNUSED_DAYS).description('Days an unused memory survives before it is archived. Archived entries are recoverable with /memories restore. 0 disables archival.').volatile(),
   /** Days a snapshot memory survives regardless of use. `0` disables. */
-  snapshotMaxAgeDays: z.number().default(DEFAULT_SNAPSHOT_MAX_AGE_DAYS).description('Days a memory marked durability=snapshot survives before it is archived, counted from when it was measured rather than from when it was last read. A stale number is worse than no number, and being read does not make it right. 0 disables snapshot expiry.'),
+  snapshotMaxAgeDays: z.number().default(DEFAULT_SNAPSHOT_MAX_AGE_DAYS).description('Days a memory marked durability=snapshot survives before it is archived, counted from when it was measured rather than from when it was last read. A stale number is worse than no number, and being read does not make it right. 0 disables snapshot expiry.').volatile(),
   /** Token overlap above which a new memory supersedes an existing one. */
-  dedupeSimilarity: z.number().default(DEFAULT_DEDUPE_SIMILARITY).description('Share of title and body tokens two memories must have in common before the newer one supersedes the older. 0 keeps only the exact-match rule.'),
+  dedupeSimilarity: z.number().default(DEFAULT_DEDUPE_SIMILARITY).description('Share of title and body tokens two memories must have in common before the newer one supersedes the older. 0 keeps only the exact-match rule.').volatile(),
   /** Hours between periodic maintenance sweeps. `0` disables the sweep. */
-  sweepIntervalHours: z.number().default(DEFAULT_SWEEP_INTERVAL_HOURS).description('Hours between periodic maintenance sweeps, which apply retention across every known workspace. 0 disables the sweep.'),
+  sweepIntervalHours: z.number().default(DEFAULT_SWEEP_INTERVAL_HOURS).description('Hours between periodic maintenance sweeps, which apply retention across every known workspace. 0 disables the sweep.').volatile(),
   /** Whether the idle-time background extractor runs at all. */
-  autoExtract: z.boolean().default(true).description('Mine finished sessions for durable facts after they have been idle.'),
+  autoExtract: z.boolean().default(true).description('Mine finished sessions for durable facts after they have been idle.').volatile(),
   /** Idle milliseconds before a session is mined. */
-  autoExtractIdleMs: z.number().default(DEFAULT_AUTO_EXTRACT_IDLE_MS).description('How long a session must stay idle before it is mined.'),
+  autoExtractIdleMs: z.number().default(DEFAULT_AUTO_EXTRACT_IDLE_MS).description('How long a session must stay idle before it is mined.').volatile(),
   /** Surface messages included in one extraction window. */
-  extractWindowMessages: z.number().default(DEFAULT_EXTRACT_WINDOW_MESSAGES).description('How many recent conversation messages one extraction reads.'),
+  extractWindowMessages: z.number().default(DEFAULT_EXTRACT_WINDOW_MESSAGES).description('How many recent conversation messages one extraction reads.').volatile(),
   /** Character budget for the extraction transcript. */
-  extractMaxInputChars: z.number().default(DEFAULT_EXTRACT_MAX_INPUT_CHARS).description('Character budget for the transcript handed to the extractor.'),
+  extractMaxInputChars: z.number().default(DEFAULT_EXTRACT_MAX_INPUT_CHARS).description('Character budget for the transcript handed to the extractor.').volatile(),
   /** Output-token cap for one extraction call. */
-  extractMaxOutputTokens: z.number().default(DEFAULT_EXTRACT_MAX_OUTPUT_TOKENS).description('Output token cap for one extraction call.'),
+  extractMaxOutputTokens: z.number().default(DEFAULT_EXTRACT_MAX_OUTPUT_TOKENS).description('Output token cap for one extraction call.').volatile(),
   /** Timeout for one extraction call. */
-  extractTimeoutMs: z.number().default(DEFAULT_EXTRACT_TIMEOUT_MS).description('Timeout for one extraction call.'),
+  extractTimeoutMs: z.number().default(DEFAULT_EXTRACT_TIMEOUT_MS).description('Timeout for one extraction call.').volatile(),
   /** Max drafts one extraction may produce. */
-  extractMaxMemories: z.number().default(DEFAULT_EXTRACT_MAX_MEMORIES).description('Maximum memories one extraction pass may store.'),
+  extractMaxMemories: z.number().default(DEFAULT_EXTRACT_MAX_MEMORIES).description('Maximum memories one extraction pass may store.').volatile(),
   /** Minutes between periodic extraction checks over every open session. */
-  extractIntervalMinutes: z.number().default(DEFAULT_EXTRACT_INTERVAL_MINUTES).description('How often to check every open session for new material and mine it in slices. Fractions are allowed. 0 disables the periodic check, leaving mining to the settle timer and the exit flush. Peak hours and the quota gate still apply; a session with nothing new costs no model call.'),
+  extractIntervalMinutes: z.number().default(DEFAULT_EXTRACT_INTERVAL_MINUTES).description('How often to check every open session for new material and mine it in slices. Fractions are allowed. 0 disables the periodic check, leaving mining to the settle timer and the exit flush. Peak hours and the quota gate still apply; a session with nothing new costs no model call.').volatile(),
   /** A session must have been idle this long before it is mined. */
-  minIdleHours: z.number().default(DEFAULT_MIN_IDLE_HOURS).description('A session must have been idle at least this many hours before it is mined.'),
+  minIdleHours: z.number().default(DEFAULT_MIN_IDLE_HOURS).description('A session must have been idle at least this many hours before it is mined.').volatile(),
   /** Sessions older than this are never mined. */
-  maxAgeDays: z.number().default(DEFAULT_MAX_AGE_DAYS).description('Sessions whose last activity is older than this are never mined.'),
+  maxAgeDays: z.number().default(DEFAULT_MAX_AGE_DAYS).description('Sessions whose last activity is older than this are never mined.').volatile(),
   /** Sessions mined per pass; bounds one pass\'s quota cost. */
-  maxSessionsPerPass: z.number().default(DEFAULT_MAX_SESSIONS_PER_PASS).description('How many sessions one extraction pass may mine, newest first.'),
-  consolidate: z.boolean().default(true).description('After new memories land, merge and reconcile them through a restricted sub-agent.'),
-  consolidateCooldownHours: z.number().default(DEFAULT_CONSOLIDATE_COOLDOWN_HOURS).description('Minimum hours between consolidation passes; bounds background quota use.'),
-  consolidateProposalMaxAgeHours: z.number().default(DEFAULT_CONSOLIDATE_PROPOSAL_MAX_AGE_HOURS).description('Hours a staged consolidation proposal waits for /memories apply or reject before a later pass may replace it with a fresh one. Inside the window a background pass leaves the pending question alone (proposing again would spend a model call to overwrite it); /memories consolidate always proposes now. 0 keeps a proposal until it is answered.'),
-  consolidateMaxEntries: z.number().default(DEFAULT_CONSOLIDATE_MAX_ENTRIES).description('How many memories one consolidation pass may consider.'),
-  consolidateTimeoutMs: z.number().default(DEFAULT_CONSOLIDATE_TIMEOUT_MS).description('Timeout for one consolidation sub-agent run.'),
+  maxSessionsPerPass: z.number().default(DEFAULT_MAX_SESSIONS_PER_PASS).description('How many sessions one extraction pass may mine, newest first.').volatile(),
+  consolidate: z.boolean().default(true).description('After new memories land, merge and reconcile them through a restricted sub-agent.').volatile(),
+  consolidateCooldownHours: z.number().default(DEFAULT_CONSOLIDATE_COOLDOWN_HOURS).description('Minimum hours between consolidation passes; bounds background quota use.').volatile(),
+  consolidateProposalMaxAgeHours: z.number().default(DEFAULT_CONSOLIDATE_PROPOSAL_MAX_AGE_HOURS).description('Hours a staged consolidation proposal waits for /memories apply or reject before a later pass may replace it with a fresh one. Inside the window a background pass leaves the pending question alone (proposing again would spend a model call to overwrite it); /memories consolidate always proposes now. 0 keeps a proposal until it is answered.').volatile(),
+  consolidateMaxEntries: z.number().default(DEFAULT_CONSOLIDATE_MAX_ENTRIES).description('How many memories one consolidation pass may consider.').volatile(),
+  consolidateTimeoutMs: z.number().default(DEFAULT_CONSOLIDATE_TIMEOUT_MS).description('Timeout for one consolidation sub-agent run.').volatile(),
   /** Stop background passes while the provider is refusing for quota or rate. */
-  pauseOnQuotaError: z.boolean().default(true).description('Stop background extraction and consolidation after a rate-limit or exhausted-quota error, until the cooldown elapses.'),
+  pauseOnQuotaError: z.boolean().default(true).description('Stop background extraction and consolidation after a rate-limit or exhausted-quota error, until the cooldown elapses.').volatile(),
   /** Wait after the first such refusal; doubles per consecutive refusal. */
-  quotaCooldownMinutes: z.number().default(DEFAULT_QUOTA_COOLDOWN_MINUTES).description('Minutes to wait after a rate-limit or quota refusal. Doubles per consecutive refusal.'),
+  quotaCooldownMinutes: z.number().default(DEFAULT_QUOTA_COOLDOWN_MINUTES).description('Minutes to wait after a rate-limit or quota refusal. Doubles per consecutive refusal.').volatile(),
   /** Ceiling for that doubling. */
-  quotaCooldownMaxMinutes: z.number().default(DEFAULT_QUOTA_COOLDOWN_MAX_MINUTES).description('Upper bound for the quota cooldown.'),
+  quotaCooldownMaxMinutes: z.number().default(DEFAULT_QUOTA_COOLDOWN_MAX_MINUTES).description('Upper bound for the quota cooldown.').volatile(),
   /** Explicit extraction provider route; empty reuses the session route. */
-  extractProvider: z.string().default('').description("Provider route for extraction. Empty reuses the session's own logged route."),
+  extractProvider: z.string().default('').description("Provider route for extraction. Empty reuses the session's own logged route.").volatile(),
   /** Explicit extraction model; empty reuses the session route. */
-  extractModel: z.string().default('').description("Model for extraction. Empty reuses the session's own logged route."),
+  extractModel: z.string().default('').description("Model for extraction. Empty reuses the session's own logged route.").volatile(),
   /** Explicit consolidation provider route; empty falls back to the extraction route. */
-  consolidateProvider: z.string().default('').description('Provider route for consolidation. Empty falls back to the extraction route, then the session route.'),
+  consolidateProvider: z.string().default('').description('Provider route for consolidation. Empty falls back to the extraction route, then the session route.').volatile(),
   /** Explicit consolidation model; empty falls back to the extraction route. */
-  consolidateModel: z.string().default('').description('Model for consolidation. Empty falls back to the extraction route, then the session route.'),
+  consolidateModel: z.string().default('').description('Model for consolidation. Empty falls back to the extraction route, then the session route.').volatile(),
   /** Whether the `memory` tool is registered for the model. */
-  enableTool: z.boolean().default(true).description('Register the model-facing memory tool.'),
+  enableTool: z.boolean().default(true).description('Register the model-facing memory tool.').volatile(),
   /** Whether `/memories` is registered. */
-  enableCommand: z.boolean().default(true).description('Register the /memories slash command.'),
+  enableCommand: z.boolean().default(true).description('Register the /memories slash command.').volatile(),
   /** How much this plugin records in its own log file. */
-  logLevel: z.string().default(DEFAULT_LOG_LEVEL).description('How much dsh-memories writes to its log file: off, error, warn, info, or debug. info keeps errors, warnings, and pass summaries; debug adds per-entry decisions.'),
+  logLevel: z.string().default(DEFAULT_LOG_LEVEL).description('How much dsh-memories writes to its log file: off, error, warn, info, or debug. info keeps errors, warnings, and pass summaries; debug adds per-entry decisions.').volatile(),
   /** Whether maintenance decisions are logged at info, where a stock logLevel keeps them. */
-  traceMaintenance: z.boolean().default(DEFAULT_TRACE_MAINTENANCE).description('Log every retention, recall, and selection decision at info instead of debug. Off keeps the file to one line per pass.'),
+  traceMaintenance: z.boolean().default(DEFAULT_TRACE_MAINTENANCE).description('Log every retention, recall, and selection decision at info instead of debug. Off keeps the file to one line per pass.').volatile(),
   /** Local-time windows whose tokens are the expensive ones. */
-  peakHours: z.string().default(DEFAULT_PEAK_HOURS).description('Local-time peak windows to keep the plugin\'s model calls out of, for example "Mon-Fri 09:00-12:00, Mon-Fri 14:00-18:00" (DeepSeek charges double then, Beijing time). Background extraction and consolidation are deferred to the next off-peak moment; /memories mine and /memories consolidate ignore this. Empty disables the restriction.'),
+  peakHours: z.string().default(DEFAULT_PEAK_HOURS).description('Local-time peak windows to keep the plugin\'s model calls out of, for example "Mon-Fri 09:00-12:00, Mon-Fri 14:00-18:00" (DeepSeek charges double then, Beijing time). Background extraction and consolidation are deferred to the next off-peak moment; /memories mine and /memories consolidate ignore this. Empty disables the restriction.').volatile(),
 })
 
-/** The tunable section's value type, inferred from the settings schema. */
-export type MemoriesSettings = Schemastery.TypeT<typeof MemoriesSettingsSchema>
+/**
+ * The tunables as plain data: the entry config's live half, unwrapped.
+ *
+ * Spelled out rather than derived from {@link Config} because a schemastery
+ * schema's output type does not survive `keyof` (the library builds it through a
+ * deferred conditional), and a mistyped runtime contract is worse than a
+ * duplicated one. What keeps the two in step is a test, not the type system: see
+ * `test/settings-card.test.ts`, which holds this list, the entry schema's live
+ * fields, and the card's field list against each other.
+ */
+export interface MemoriesSettings {
+  /** Summary injection: budget, per-scope caps, and the recall delta. */
+  maxSummaryBytes: number
+  maxSummaryEntries: number
+  globalSummaryEntries: number
+  globalSummaryBytes: number
+  summaryFreshSlots: number
+  recallMode: string
+  recallMinScore: number
+  recallMaxPerConversation: number
+  recallMaxBytes: number
+  recallMinQueryChars: number
+  recallMinTerms: number
+  /** Retention: what the store keeps, and for how long. */
+  maxEntriesPerScope: number
+  maxUnusedDays: number
+  snapshotMaxAgeDays: number
+  dedupeSimilarity: number
+  sweepIntervalHours: number
+  /** Background extraction: when it runs and how much it reads. */
+  autoExtract: boolean
+  autoExtractIdleMs: number
+  extractWindowMessages: number
+  extractMaxInputChars: number
+  extractMaxOutputTokens: number
+  extractTimeoutMs: number
+  extractMaxMemories: number
+  extractIntervalMinutes: number
+  minIdleHours: number
+  maxAgeDays: number
+  maxSessionsPerPass: number
+  /** Consolidation: the restricted sub-agent pass that merges new memories. */
+  consolidate: boolean
+  consolidateCooldownHours: number
+  consolidateProposalMaxAgeHours: number
+  consolidateMaxEntries: number
+  consolidateTimeoutMs: number
+  pauseOnQuotaError: boolean
+  quotaCooldownMinutes: number
+  quotaCooldownMaxMinutes: number
+  /** Model routes for the plugin's own calls; empty reuses the session's route. */
+  extractProvider: string
+  extractModel: string
+  consolidateProvider: string
+  consolidateModel: string
+  /** Registrations the model sees. */
+  enableTool: boolean
+  enableCommand: boolean
+  /** This plugin's own log file and how much it records. */
+  logLevel: string
+  traceMaintenance: boolean
+  peakHours: string
+}
 
-/** The shipped tunables, used as the composition base and fallback. */
+/**
+ * Every tunable with its shipped value.
+ *
+ * The runtime never reads this object for behaviour — the Loader resolves the
+ * schema defaults — but it is the same set as plain data: the key list the
+ * runtime and the card are both checked against, with the values a harness (or
+ * any deployment that configures nothing) starts from.
+ */
 export const MEMORIES_SETTINGS_DEFAULTS: MemoriesSettings = {
   maxSummaryBytes: DEFAULT_MAX_SUMMARY_BYTES,
   maxSummaryEntries: DEFAULT_MAX_SUMMARY_ENTRIES,
@@ -380,71 +467,28 @@ export const MEMORIES_SETTINGS_DEFAULTS: MemoriesSettings = {
   peakHours: DEFAULT_PEAK_HOURS,
 }
 
-/** Deployment-layer configuration: paths and workspace discovery. */
-export const Config = z.object({
-  /** Harness home; defaults to `$DSH_HOME` (or `~/.dsh`). */
-  dshHome: z.string(),
-  /** Directory holding every memory store; defaults to `<dshHome>/memories`. */
-  memoriesDir: z.string(),
-  /** Child names that mark a workspace root during the upward walk. */
-  projectRootMarkers: z.array(z.string()).default([...DEFAULT_PROJECT_ROOT_MARKERS]),
-})
-
-/** The raw, possibly partial deployment configuration the loader hands `apply`. */
-export interface MemoriesConfig {
+/**
+ * The raw, possibly partial entry configuration the loader hands `apply`.
+ *
+ * The tunables are spelled flat on the row, and how they arrive depends on who
+ * composed it: a row the Loader mounted against {@link Config} carries them as
+ * live references, while a hand-written one (a composition without the schema, a
+ * test harness) carries plain values. Both are accepted here, and
+ * {@link plainRow} is what reads them out.
+ */
+export interface MemoriesConfig extends Partial<RowTunables> {
   dshHome?: string
   memoriesDir?: string
   projectRootMarkers?: string[]
   /** Plugin log file; defaults to `<dshHome>/logs/dsh-memories.log`. Empty disables file logging. */
   logFile?: string
-  /** Deployment-layer tunable defaults, below the settings user layer. */
-  defaults?: Partial<MemoriesSettings>
-  /** Legacy flat spellings, accepted so an existing row keeps working. */
-  maxSummaryBytes?: number
-  maxSummaryEntries?: number
-  globalSummaryEntries?: number
-  globalSummaryBytes?: number
-  summaryFreshSlots?: number
-  maxEntriesPerScope?: number
-  maxUnusedDays?: number
-  snapshotMaxAgeDays?: number
-  dedupeSimilarity?: number
-  sweepIntervalHours?: number
-  recallMode?: string
-  recallMinScore?: number
-  recallMaxPerConversation?: number
-  recallMaxBytes?: number
-  recallMinQueryChars?: number
-  recallMinTerms?: number
-  autoExtract?: boolean
-  autoExtractIdleMs?: number
-  extractWindowMessages?: number
-  extractMaxInputChars?: number
-  extractMaxOutputTokens?: number
-  extractTimeoutMs?: number
-  extractMaxMemories?: number
-  extractIntervalMinutes?: number
-  minIdleHours?: number
-  maxAgeDays?: number
-  maxSessionsPerPass?: number
-  consolidate?: boolean
-  consolidateCooldownHours?: number
-  consolidateProposalMaxAgeHours?: number
-  consolidateMaxEntries?: number
-  consolidateTimeoutMs?: number
-  extractProvider?: string
-  extractModel?: string
-  consolidateProvider?: string
-  consolidateModel?: string
-  pauseOnQuotaError?: boolean
-  quotaCooldownMinutes?: number
-  quotaCooldownMaxMinutes?: number
-  enableTool?: boolean
-  enableCommand?: boolean
-  logLevel?: string
-  traceMaintenance?: boolean
-  peakHours?: string
 }
+
+/** One tunable as a row carries it: the value itself, or the reference to it. */
+type RowField<T> = T | Volatile<T>
+
+/** Every tunable, keyed as the row spells it. */
+type RowTunables = { [K in keyof MemoriesSettings]: RowField<MemoriesSettings[K]> }
 
 /** Fully resolved deployment configuration. */
 export interface ResolvedConfig {
@@ -458,8 +502,8 @@ export interface ResolvedConfig {
    * day to day is `logLevel`.
    */
   readonly logFile: string
-  /** Deployment-layer tunable defaults (below the settings user layer). */
-  readonly defaults: MemoriesSettings
+  /** The tunables this row resolves to, as read when the plugin was mounted. */
+  readonly tunables: MemoriesSettings
 }
 
 /** Clamp one tunable into a usable range. */
@@ -568,33 +612,69 @@ export function consolidationRouteOf(settings: MemoriesSettings): { provider?: s
   return {}
 }
 /**
- * Resolve deployment paths and the tunable defaults.
+ * One entry config with its live references read out.
  *
- * Flat legacy keys are read first so an existing single-level row keeps
- * working; `defaults` wins over them when both are present.
- * @param config - user-facing plugin configuration.
- * @returns normalized deployment configuration.
+ * A row the Loader mounted arrives with every tunable as a `Volatile` reference
+ * that a committed settings write updates in place; a plain row (a test harness,
+ * a hand-written composition) arrives with the values themselves. Both pass
+ * through here unchanged in shape, so every reader downstream sees plain data
+ * and the same code serves the two cases.
+ *
+ * @param config - the row as `apply` received it.
+ * @returns the same row with references replaced by their current values.
+ */
+export function plainRow(config: MemoriesConfig): MemoriesConfig {
+  return Object.fromEntries(
+    Object.entries(config).map(([key, value]) => [key, isVolatile(value) ? value.get() : value]),
+  ) as MemoriesConfig
+}
+
+/** The tunables a plain row carries, in one place, keyed by tunable name. */
+function flatTunables(row: MemoriesConfig): Partial<MemoriesSettings> {
+  const source = row as Record<string, unknown>
+  const tunables: Partial<MemoriesSettings> = {}
+  for (const key of Object.keys(MEMORIES_SETTINGS_DEFAULTS) as (keyof MemoriesSettings)[]) {
+    const value = source[key]
+    if (value !== undefined) (tunables as Record<string, unknown>)[key] = value
+  }
+  return tunables
+}
+
+/**
+ * The tunables an entry config holds right now.
+ *
+ * A read rather than a value on purpose: a committed settings write lands in the
+ * row's references without re-mounting the plugin, so the runtime asks again
+ * instead of holding a snapshot.
+ *
+ * @param config - the row as `apply` received it.
+ * @returns the normalized tunables in force.
+ */
+export function readTunables(config: MemoriesConfig): MemoriesSettings {
+  return normalizeSettings(flatTunables(plainRow(config)))
+}
+
+/**
+ * Resolve the deployment facts and the tunables of one entry config.
+ *
+ * @param config - the entry configuration the Loader hands `apply`.
+ * @returns normalized paths, workspace markers, and tunables.
  */
 export function resolveConfig(config: MemoriesConfig = {}): ResolvedConfig {
-  const dshHome = resolveDshHome(config.dshHome)
-  const memoriesDir = config.memoriesDir !== undefined && config.memoriesDir.trim().length > 0
-    ? config.memoriesDir
+  const row = plainRow(config)
+  const dshHome = resolveDshHome(row.dshHome)
+  const memoriesDir = row.memoriesDir !== undefined && row.memoriesDir.trim().length > 0
+    ? row.memoriesDir
     : `${dshHome}/memories`
-  const markers = (config.projectRootMarkers ?? [...DEFAULT_PROJECT_ROOT_MARKERS])
+  const markers = (row.projectRootMarkers ?? [...DEFAULT_PROJECT_ROOT_MARKERS])
     .filter((marker) => marker.trim().length > 0)
-  const legacySource = config as Record<string, unknown>
-  const legacy: Partial<MemoriesSettings> = {}
-  for (const key of Object.keys(MEMORIES_SETTINGS_DEFAULTS) as (keyof MemoriesSettings)[]) {
-    const value = legacySource[key]
-    if (value !== undefined) (legacy as Record<string, unknown>)[key] = value
-  }
   return {
     dshHome,
     memoriesDir,
     projectRootMarkers: markers.length > 0 ? markers : [...DEFAULT_PROJECT_ROOT_MARKERS],
     // Only `undefined` falls back to the default location, so an explicit empty
     // string disables file logging.
-    logFile: config.logFile?.trim() ?? logPath(dshHome),
-    defaults: normalizeSettings({ ...legacy, ...config.defaults }),
+    logFile: row.logFile?.trim() ?? logPath(dshHome),
+    tunables: normalizeSettings(flatTunables(row)),
   }
 }

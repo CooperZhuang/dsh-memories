@@ -1,9 +1,9 @@
 /**
  * Host→browser Remote surface for the Settings page.
  *
- * The settings card (`settings.plugin.item`) only edits tunables; a human also
- * wants to see what is remembered. That needs the browser to call the host, and
- * the harness already owns that transport: the Typert registry (`ctx.typert`)
+ * The Memories page's tunables card only edits this plugin's own config; a human
+ * also wants to see what is remembered. That needs the browser to call the host,
+ * and the harness already owns that transport: the Typert registry (`ctx.typert`)
  * holds invocation descriptors, the API gateway serves them over the connection
  * the shell already authenticated, and the browser half reaches them as
  * `ctx.remote.<namespace>.<method>`.

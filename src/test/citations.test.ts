@@ -8,7 +8,7 @@
  */
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { citationRoots, citationWarning, extractCitations, missingCitations } from '../citations.js'
+import { citationRoots, citationWarning, extractCitations, ignoredUnder, isIgnoredPath, missingCitations, parseGitignore } from '../citations.js'
 
 /** A probe backed by a set of paths, so the rule is tested without a filesystem. */
 function probe(paths: readonly string[]) {
@@ -54,4 +54,48 @@ test('the warning names at most two paths and counts the rest', () => {
   assert.equal(citationWarning([]), '')
   assert.match(citationWarning(['a/b.py']), /a\/b\.py/u)
   assert.match(citationWarning(['a/b.py', 'c/d.py', 'e/f.py']), /等 3 处/u)
+})
+
+test('a repository-ignored path is generated, not stale', () => {
+  const rules = parseGitignore([
+    '# comment',
+    '',
+    'state/',
+    '*.log',
+    '/build/',
+    'cache/**/*.db',
+    '!cache/keep.db',
+  ].join('\n'))
+  // An unanchored directory rule matches that directory at any depth.
+  assert.equal(isIgnoredPath('state/run.json', rules), true)
+  assert.equal(isIgnoredPath('nested/state/run.json', rules), true)
+  // A file glob matches the basename at any depth.
+  assert.equal(isIgnoredPath('logs/sniper.log', rules), true)
+  assert.equal(isIgnoredPath('sniper.log', rules), true)
+  // An anchored rule only matches from the root.
+  assert.equal(isIgnoredPath('build/out.js', rules), true)
+  assert.equal(isIgnoredPath('packages/x/build/out.js', rules), false)
+  // `**` spans directories, and the last matching rule wins.
+  assert.equal(isIgnoredPath('cache/a/recognition.db', rules), true)
+  assert.equal(isIgnoredPath('cache/keep.db', rules), false, 'the negation re-includes exactly the path it names')
+  assert.equal(isIgnoredPath('cache/a/keep.db', rules), true, 'and nothing else')
+  // Anything the rules do not name is still checkable.
+  assert.equal(isIgnoredPath('tools/verify_all.py', rules), false)
+  assert.equal(isIgnoredPath('state/run.json', []), false, 'no rules mean no suppression')
+})
+
+test('an ignored citation is not reported as missing', () => {
+  const roots = ['C:\\repo']
+  // The parent directory exists and the file does not — the case that used to
+  // flag every runtime artifact a repository generates.
+  const exists = probe(['C:/repo/state', 'C:/repo/scripts', 'C:/repo/scripts/verify_all.py'])
+  const body = 'state lives in state/run.json; run scripts/verify_all.py'
+  assert.deepEqual(missingCitations(body, roots, exists), ['state/run.json'])
+  assert.deepEqual(missingCitations(body, roots, exists, { isIgnored: (path) => path.startsWith('state/') }), [])
+})
+
+test('ignoredUnder reads a root’s own .gitignore', () => {
+  const isIgnored = ignoredUnder(process.cwd())
+  assert.equal(typeof isIgnored('src/index.ts'), 'boolean')
+  assert.equal(ignoredUnder('C:\\definitely-not-a-repo-xyz')('state/run.json'), false)
 })

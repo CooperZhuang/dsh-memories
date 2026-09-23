@@ -8,9 +8,9 @@
  *
  * It contributes one surface, the **Memories page** (`settings.section`): it
  * lists, searches, adds, and deletes memories through the Remote namespace the
- * host registers, and it embeds the tunables card at its foot. The card is not
- * also registered under `settings.plugin.item` — everything about this plugin
- * lives on its own page, not in the crowded host-plugin configuration list.
+ * host registers, and it embeds the tunables card at its foot — the entry's own
+ * live form, not a second card in the host-plugin configuration list, so
+ * everything about this plugin lives on its own page.
  *
  * Written as plain CJS with `createElement` instead of JSX so the package needs
  * no bundler: the bundle only requires modules the browser already provides
@@ -41,8 +41,10 @@ function createPlugin(require) {
 
   const apply = async (ctx) => {
     ensureStyles()
-    const scope = ctx.settingsScope.bind({ namespace: NS })
-    ctx.effect(() => () => { void scope.dispose() }, 'dsh-memories: settings scope')
+    // The form is shared with every other editor of this entry and owned by the
+    // settings provider, so this half only subscribes to it (inside
+    // `useSnapshot`) and never disposes it.
+    const scope = ctx.configForms.get(NS)
     const useSnapshot = (select) => {
       const [value, setValue] = React.useState(() => select(scope.getSnapshot()))
       React.useEffect(() => scope.subscribe(() => setValue(select(scope.getSnapshot()))), [scope])
@@ -66,5 +68,5 @@ function createPlugin(require) {
     }, Section))
   }
 
-  return { apply, inject: ['slots', 'settingsScope'] }
+  return { apply, inject: ['slots', 'configForms'] }
 }
