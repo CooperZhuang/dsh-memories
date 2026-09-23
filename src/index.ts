@@ -1331,6 +1331,15 @@ export class MemoriesRuntime {
         note('nothing-new')
         continue
       }
+      // A refusal that costs nothing must not consume the per-pass budget.
+      // Checked before the cap so a peak window reports `peak N` instead of
+      // `peak N-1, pass-cap 1` — the cap is about model calls, and a peak hour
+      // is the one gate that spends none.
+      if (peakDelayMs(this.settings.peakHours, new Date()) > 0) {
+        counts.skipped += 1
+        note('peak')
+        continue
+      }
       if (limit > 0 && mined >= limit) {
         counts.skipped += 1
         note('pass-cap')

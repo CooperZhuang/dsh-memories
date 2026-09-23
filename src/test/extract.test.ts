@@ -16,6 +16,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 import { MemoriesRuntime } from '../index.js'
 import { EXTRACT_JSON_SCHEMA, collectWindow, parseExtraction, redactSecrets, runExtraction } from '../extract.js'
+import { peakDelayMs } from '../schedule.js'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Session } from '@deepseek-ai/dsh-session'
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
@@ -460,6 +461,56 @@ test('a capped extraction is a reported outcome, not an error the command layer 
   assert.equal(runtime.state.getSession('extract-session')?.lastSeq, 1, 'the watermark still advances')
   assert.ok(lines.some((line) => line.includes('raise extractMaxOutputTokens')), 'the cap is reported at info, with the knob to raise')
   assert.equal(await runtime.mineNow(agent), 0, 'the forced path returns a count instead of throwing')
+  t.after(() => rm(dir, { recursive: true, force: true }))
+})
+
+test('a peak window refuses every session without spending the per-pass budget', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-peak-cap-'))
+  const lines: string[] = []
+  const sessionWithId = (id: string): Session => {
+    const session = stubSession(process.cwd(), [{ seq: 1, role: 'user', text: 'Something worth remembering.' }])
+    ;(session as unknown as { id: string }).id = id
+    ;(session.header as unknown as { id: string }).id = id
+    return session
+  }
+  const sessions = [sessionWithId('peak-a'), sessionWithId('peak-b')]
+  const agents = sessions.map((session) => ({
+    id: session.id,
+    session,
+    status: 'idle',
+    runMaintenance: (job: (signal: AbortSignal) => Promise<unknown>) => job(new AbortController().signal),
+  })) as unknown as Agent[]
+  const ctx = {
+    get: (name: string) => {
+      if (name === 'llm') return fakeLlm('{"memories":[]}')
+      if (name === 'agents') return { roots: () => agents }
+      return undefined
+    },
+    logger: {
+      info: (format: string, ...args: unknown[]) => lines.push(`${format} ${args.join(' ')}`),
+      warn: (format: string, ...args: unknown[]) => lines.push(`${format} ${args.join(' ')}`),
+      debug: (format: string, ...args: unknown[]) => lines.push(`${format} ${args.join(' ')}`),
+    },
+  } as never
+  // A window that always contains "now": every day, midnight to midnight.
+  const runtime = new MemoriesRuntime(ctx, {
+    memoriesDir: dir,
+    autoExtract: true,
+    extractTimeoutMs: 5_000,
+    maxSessionsPerPass: 1,
+    peakHours: '* 00:00-24:00',
+  })
+  t.after(() => runtime.dispose())
+  assert.ok(peakDelayMs('* 00:00-24:00', new Date()) > 0, 'the test window really covers now')
+
+  await runtime.runPeriodicPass()
+
+  // Nothing was mined, and the reason is the peak window — not the pass cap,
+  // even though the cap is 1 and there were two candidates.
+  assert.equal(runtime.state.getSession('peak-a')?.at ?? 0, 0)
+  const pass = lines.find((line) => line.startsWith('dsh-memories: extract pass:'))
+  assert.match(pass ?? '', /peak 2/u)
+  assert.doesNotMatch(pass ?? '', /pass-cap/u, 'a refusal that costs no model call leaves the budget alone')
   t.after(() => rm(dir, { recursive: true, force: true }))
 })
 
