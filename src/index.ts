@@ -2171,6 +2171,17 @@ export class MemoriesRuntime {
     this.log.warn('dsh-memories: command %s failed: %o', name, error)
   }
 
+  /**
+   * Record one failed injection attempt.
+   *
+   * Called from the pre-step seam, which runs on every step of every turn: the
+   * turn continues without the memory block rather than failing, and the reason
+   * stays in the log.
+   */
+  notePreStepFailure(sessionId: string, error: unknown): void {
+    this.log.warn('dsh-memories: injection failed for session %s, the turn continues without it: %o', sessionId, error)
+  }
+
   /** One line describing how much of the store has ever reached a session. */
   private async exposureLine(): Promise<string> {    const unseen = await this.neverSeen().catch(() => ({ count: 0, total: 0, oldestDays: 0 }))
     if (unseen.total === 0) return 'no memories stored'
@@ -2675,26 +2686,34 @@ export function apply(ctx: Context, config: MemoriesConfig = {}): void {
   ctx.on('agent/pre-step', async ({ agent }, next) => {
     const decision = await next()
     if (decision.kind === 'reject') return decision
-    const addition: UserMessage[] = []
-    const summary = await runtime.injectionFor(agent)
-    if (summary !== undefined) addition.push(summary)
-    // Credit the memories the block already handed over and this turn is now
-    // actually about. Without it the only "demand" signal the ranking has is a
-    // search hit, which measures lookup-style knowledge and misses the memory
-    // that was injected and used.
-    await runtime.creditInjectedUse(agent)
-    // The on-demand delta is a second, independent decision: a conversation can
-    // already carry the summary and still meet a memory that only matters now.
-    const delta = await runtime.recallFor(agent)
-    if (delta !== undefined) addition.push(delta)
-    const fresh = addition.filter((message) => !decision.messages.some((existing) => existing.id === message.id))
-    if (fresh.length === 0) return decision
-    // APPEND ONLY. DeepSeek's context cache is keyed on an unchanged prefix, so
-    // this seam may extend the tail and nothing else: no rewriting, reordering,
-    // or dropping an existing message, and never moving a memory block into the
-    // system prompt. The harness deep-freezes request messages for the same
-    // reason; see the "前缀缓存约束" section of README.md before changing this.
-    return { ...decision, messages: [...decision.messages, ...fresh] }
+    // Memory is an enhancement, never a precondition: this seam runs on every
+    // step of every turn, and an exception here fails the user's turn. Contain
+    // everything and fall through to the unmodified decision instead.
+    try {
+      const addition: UserMessage[] = []
+      const summary = await runtime.injectionFor(agent)
+      if (summary !== undefined) addition.push(summary)
+      // Credit the memories the block already handed over and this turn is now
+      // actually about. Without it the only "demand" signal the ranking has is a
+      // search hit, which measures lookup-style knowledge and misses the memory
+      // that was injected and used.
+      await runtime.creditInjectedUse(agent)
+      // The on-demand delta is a second, independent decision: a conversation can
+      // already carry the summary and still meet a memory that only matters now.
+      const delta = await runtime.recallFor(agent)
+      if (delta !== undefined) addition.push(delta)
+      const fresh = addition.filter((message) => !decision.messages.some((existing) => existing.id === message.id))
+      if (fresh.length === 0) return decision
+      // APPEND ONLY. DeepSeek's context cache is keyed on an unchanged prefix, so
+      // this seam may extend the tail and nothing else: no rewriting, reordering,
+      // or dropping an existing message, and never moving a memory block into the
+      // system prompt. The harness deep-freezes request messages for the same
+      // reason; see the "前缀缓存约束" section of README.md before changing this.
+      return { ...decision, messages: [...decision.messages, ...fresh] }
+    } catch (error) {
+      runtime.notePreStepFailure(agent.session.id, error)
+      return decision
+    }
   })
 }
 
