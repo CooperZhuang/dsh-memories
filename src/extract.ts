@@ -311,6 +311,14 @@ export type ExtractionOutcome =
     readonly dropped: number
     readonly route: { provider: string; model: string }
     /**
+     * Whether the reply was cut short by the output cap and salvaged.
+     *
+     * A caller must be able to tell "the extractor found three facts" from "the
+     * extractor found three facts and was cut off before it finished", because
+     * only the second one means `extractMaxOutputTokens` is the binding knob.
+     */
+    readonly truncated?: boolean
+    /**
      * What the call cost, when the adapter reported it.
      *
      * Carried out of here because background extraction runs outside any
@@ -319,7 +327,18 @@ export type ExtractionOutcome =
      */
     readonly usage?: ExtractionUsage
   }
-  | { readonly kind: 'none'; readonly reason: 'empty-window' | 'no-route' | 'empty-reply'; readonly usage?: ExtractionUsage }
+  | {
+    readonly kind: 'none'
+    /**
+     * Why the call produced no memory.
+     *
+     * `max-tokens` and `incomplete` are capped/failed finishes rather than an
+     * empty answer: they are reported, never thrown, and `max-tokens` is the
+     * one that tells a reader which configuration knob to raise.
+     */
+    readonly reason: 'empty-window' | 'no-route' | 'empty-reply' | 'max-tokens' | 'incomplete'
+    readonly usage?: ExtractionUsage
+  }
 
 /**
  * Run one extraction call and return the drafts it produced.
@@ -365,9 +384,7 @@ export async function runExtraction(llm: LlmRuntime, request: ExtractionRequest)
   }
   const assembler = new BlockAssembler()
   for await (const chunk of llm.stream(options)) assembler.push(chunk)
-  if (assembler.finish.kind !== 'stop') {
-    throw new Error(`dsh-memories: extraction finished as ${assembler.finish.kind}`)
-  }
+  const finish = assembler.finish.kind
   const text = assembler.blocks()
     .filter((block): block is Extract<ContentBlock, { type: 'text' }> => block.type === 'text')
     .map((block) => block.text)
@@ -378,7 +395,65 @@ export async function runExtraction(llm: LlmRuntime, request: ExtractionRequest)
   const usage: ExtractionUsage | undefined = reported === undefined
     ? undefined
     : { inputTokens: reported.inputTokens, outputTokens: reported.outputTokens }
+  if (finish !== 'stop') {
+    // A reply the output cap cut short is not a failure of the pass. Throwing
+    // here turned an ordinary "raise `extractMaxOutputTokens`" into an exception
+    // that reached the user's own command line (`/memories mine` reports the
+    // handler error verbatim) and made a background pass look broken — measured
+    // 2026-09-23, the first `/memories mine` in the field died this way.
+    //
+    // The extractor is asked for one object with a `summary` and a `memories`
+    // array, so a truncated reply is normally an unterminated array of COMPLETE
+    // objects: keep what parsed, and only when nothing did does the caller hear
+    // about the cap.
+    const complete = parseExtraction(text, request.maxMemories, request.session.id)
+    const salvaged = complete.drafts.length > 0
+      ? complete
+      : parseExtraction(repairTruncatedJson(text), request.maxMemories, request.session.id)
+    if (salvaged.drafts.length > 0) {
+      return {
+        kind: 'memories',
+        drafts: salvaged.drafts,
+        summary: salvaged.summary,
+        dropped: salvaged.dropped,
+        route,
+        truncated: true,
+        ...usage === undefined ? {} : { usage },
+      }
+    }
+    return { kind: 'none', reason: finish === 'max-tokens' ? 'max-tokens' : 'incomplete', ...usage === undefined ? {} : { usage } }
+  }
   const parsed = parseExtraction(text, request.maxMemories, request.session.id)
   if (parsed.drafts.length === 0) return { kind: 'none', reason: 'empty-reply', ...usage === undefined ? {} : { usage } }
   return { kind: 'memories', drafts: parsed.drafts, summary: parsed.summary, dropped: parsed.dropped, route, ...usage === undefined ? {} : { usage } }
+}
+
+/**
+ * Close a JSON reply the output cap cut in half.
+ *
+ * The reply is one object holding a `summary` and a `memories` array, so a
+ * truncated reply is an unterminated array whose earlier elements are complete.
+ * Candidate cut points are tried from the end backwards — the first one that
+ * parses wins — which keeps every memory that was fully written. A reply cut
+ * inside a string, or before the first object, yields `''` so the caller can
+ * report the cap instead of pretending it salvaged something.
+ *
+ * @param text - the truncated reply.
+ * @returns parseable JSON, or an empty string when no cut point parses.
+ */
+export function repairTruncatedJson(text: string): string {
+  const trimmed = text.trim().replace(/^```(?:json)?\s*/iu, '')
+  let cursor = trimmed.lastIndexOf('}')
+  let attempts = 0
+  while (cursor > 0 && attempts < 64) {
+    const candidate = `${trimmed.slice(0, cursor + 1)}]}`
+    try {
+      JSON.parse(candidate)
+      return candidate
+    } catch {
+      cursor = trimmed.lastIndexOf('}', cursor - 1)
+      attempts += 1
+    }
+  }
+  return ''
 }

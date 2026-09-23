@@ -211,7 +211,7 @@ dsh plugin --profile web add github:you/dsh-memories
 | `autoExtractIdleMs` | `300000` | 空闲多久后开始抽取（最小 1000）；实际等待见 `minIdleHours` |
 | `extractWindowMessages` | `60` | 一次抽取最多看多少条对话消息（按一个周期间隔的增量来定） |
 | `extractMaxInputChars` | `48000` | 抽取输入的字符预算 |
-| `extractMaxOutputTokens` | `2048` | 抽取调用的输出上限 |
+| `extractMaxOutputTokens` | `4096` | 抽取调用的输出上限（2026-09-23 由 2048 提高：中文写满 5 条记忆加摘要会超过 2048，实测第一次 `/memories mine` 就被截断。上限是天花板不是花费，提前结束的回复不花这部分；真的被截断时会抢救已写完的条目并在日志里说明要调这个旋钮） |
 | `extractTimeoutMs` | `120000` | 抽取调用超时 |
 | `extractMaxMemories` | `5` | 一次抽取最多产出多少条记忆 |
 | `extractIntervalMinutes` | `30` | 周期性抽取间隔（分钟，可小数）：只要有新内容且会话当时空闲就抽一段；无新内容不花调用；受错峰与额度闸门约束；`0` 关闭 |
@@ -651,6 +651,7 @@ DeepSeek 的上下文缓存按**前缀**命中的 token 计费：只有请求开
 | 抽取花费可见（2026-09-23） | ✅ 单测：抽取结果带回 `usage`，`stored …` 行尾附 `[N in / M out tokens]`（后台调用不建会话，成本面板看不到它，插件日志是唯一出口） |
 | 陈旧引用误报（2026-09-23） | ✅ 真机复核：对真实库跑引用校验，13 条 → 10 条，被抑制的 3 条正是 example-probe 的运行时产物（`state/run.json`、`state/cache.json`，该仓库 `.gitignore` 已忽略 `state/`）。规则：每个作用域读自己根目录的 `.gitignore`（含 `**`、锚定、目录、`!` 反选），命中即跳过；父目录规则与全局 excludes 不读（宁可多报） |
 | 抽取轮次的会话上限（2026-09-23） | ✅ 单测：两个候选 + `maxSessionsPerPass: 1` → 只抽最新的那个，被挡下的那个在行里计成 `pass-cap`。这条是在把 `agents` 注册表并入候选之后才补上的：否则一轮会给每个活跃会话各发一次模型调用，而 `maxSessionsPerPass` 的说明一直承诺的是「一轮的上限」，此前只有退出兜底在遵守 |
+| 抽取被输出上限截断（2026-09-23 现场事故） | ✅ 真机复现 + 修复：`/memories mine` 的抽取回复被 2048-token 上限截断，旧代码**抛异常**，异常穿过命令层被原样报给用户（`command/done kind=error: dsh-memories: extraction finished as max-tokens`），用户侧表现为 dsh 被强停。现在：①非 `stop` 结束不再抛，改为「抢救已写完的条目」（`repairTruncatedJson` 从后往前找能解析的截断点）→ 有产出就照常落盘并标 `truncated`，没有就把 `max-tokens`/`incomplete` 作为**原因**上报；②`max-tokens` 在 `info` 级明说要调 `extractMaxOutputTokens`；③默认上限提到 4096；④命令 facade 兜住一切异常，改成返回错误**结果**而不是抛；⑤三处 `void` 链（周期定时器、settle 定时器的后续整理、合并 pass）都补上 `.catch`——未处理的 rejection 在 Node 里默认直接结束进程，后台记忆任务绝不能杀掉宿主 |
 
 > 「多轮不重注入」这一条目前是**单元测试 + 单轮真机进程**两重证据：本轮想用浏览器复核时，web
 > profile 里另外几个插件把 GUI 挡住了（`dsh-message-edit` 缺 `@deepseek-ai/dsh-client-runtime/client`、

@@ -182,7 +182,7 @@ interface AgentRegistryLike {
 }
 
 /** Why one session was not mined, for the pass line. */
-type MineSkip = 'off' | 'peak' | 'not-idle' | 'quiet' | 'claim' | 'no-llm' | 'no-route' | 'empty'
+type MineSkip = 'off' | 'peak' | 'not-idle' | 'quiet' | 'claim' | 'no-llm' | 'no-route' | 'empty' | 'max-tokens'
 
 /** One scope's loaded state. */
 interface ScopeState {
@@ -1192,7 +1192,14 @@ export class MemoriesRuntime {
         (error: unknown) => {
           if (!this.lifecycle.signal.aborted) this.log.warn('dsh-memories: extraction failed for session %s: %o', agent.session.id, error)
         },
-      )
+      ).catch((error: unknown) => {
+        // The rejection handler above only covers `mine` itself. Anything the
+        // fulfilled branch throws (retention, a consolidation enqueue) would
+        // otherwise surface as an unhandled rejection, and Node's default for
+        // that is to end the process — a background memory pass must never be
+        // able to stop the host.
+        this.log.warn('dsh-memories: post-extraction bookkeeping failed for session %s: %o', agent.session.id, error)
+      })
     }, delayMs)
     timer.unref?.()
     this.idleTimers.set(agent, timer)
@@ -1213,7 +1220,13 @@ export class MemoriesRuntime {
     // most once per interval, and leaving it in flight makes the pass's side
     // effects land after the caller thinks the pass is over.
     await this.sweepIfDue()
-    void this.consolidateIfDue(agent)
+    // The consolidation pass spends a model call through the subagent seam, so it
+    // can fail in ways this file does not enumerate. It is fired and forgotten
+    // (the job lease owns its retry), which makes an unguarded rejection here an
+    // unhandled one — and an unhandled rejection ends the host by default.
+    void this.consolidateIfDue(agent).catch((error: unknown) => {
+      this.log.warn('dsh-memories: consolidation pass failed: %o', error)
+    })
   }
 
   /**
@@ -1227,7 +1240,12 @@ export class MemoriesRuntime {
     const minutes = this.settings.extractIntervalMinutes
     if (!(minutes > 0)) return
     const timer = setInterval(() => {
-      void this.runPeriodicPass()
+      // Swallowed here as well as inside the pass: a timer callback that rejects
+      // is an unhandled rejection, and Node's default for one is to exit. No
+      // background memory pass is allowed to take the host down with it.
+      void this.runPeriodicPass().catch((error: unknown) => {
+        this.log.warn('dsh-memories: periodic pass failed: %o', error)
+      })
     }, minutes * 60_000)
     timer.unref?.()
     this.periodicTimer = timer
@@ -1670,8 +1688,16 @@ export class MemoriesRuntime {
       const spend = outcome.usage === undefined ? '' : ` [${outcome.usage.inputTokens} in / ${outcome.usage.outputTokens} out tokens]`
       let refusal: MineSkip | undefined
       if (outcome.kind === 'none') {
-        refusal = outcome.reason === 'no-route' ? 'no-route' : 'empty'
-        this.log.decision('dsh-memories: session %s produced no memories (%s)%s', key, outcome.reason, spend)
+        refusal = outcome.reason === 'no-route' ? 'no-route' : outcome.reason === 'max-tokens' ? 'max-tokens' : 'empty'
+        if (outcome.reason === 'max-tokens') {
+          // At info, not decision: this one is actionable. The extraction reply was
+          // cut off before it produced anything usable, which is exactly the state
+          // that says `extractMaxOutputTokens` is too small for this transcript.
+          this.log.info('dsh-memories: session %s hit the %d-token extraction cap before writing anything usable; raise extractMaxOutputTokens%s',
+            key, this.settings.extractMaxOutputTokens, spend)
+        } else {
+          this.log.decision('dsh-memories: session %s produced no memories (%s)%s', key, outcome.reason, spend)
+        }
       } else {
         const stored: string[] = []
         for (const draft of outcome.drafts) {
@@ -1689,7 +1715,8 @@ export class MemoriesRuntime {
         }).catch((error: unknown) => {
           this.log.warn('dsh-memories: could not write the evidence note for session %s: %o', key, error)
         })
-        this.log.info('dsh-memories: stored %d memories from session %s (%s)%s', outcome.drafts.length, key, stored.join(', '), spend)
+        this.log.info('dsh-memories: stored %d memories from session %s (%s)%s%s', outcome.drafts.length, key, stored.join(', '), spend,
+          outcome.truncated === true ? ` — the reply hit the ${this.settings.extractMaxOutputTokens}-token cap and was salvaged; raise extractMaxOutputTokens to keep the rest` : '')
         // A pass that always lands on the cap is a pass whose ceiling is the
         // binding constraint. Saying so is the only way anybody can tell that
         // `extractMaxMemories` is the knob to raise — measured on a real store,
@@ -2133,9 +2160,19 @@ export class MemoriesRuntime {
     return `, sweep every ${this.settings.sweepIntervalHours}h (last ${when})`
   }
 
+  /**
+   * Record one failed `/memories` invocation.
+   *
+   * The command facade returns an error RESULT instead of letting an exception
+   * cross into the harness; this is where the same failure stays visible in the
+   * plugin's own log.
+   */
+  noteCommandFailure(name: string, error: unknown): void {
+    this.log.warn('dsh-memories: command %s failed: %o', name, error)
+  }
+
   /** One line describing how much of the store has ever reached a session. */
-  private async exposureLine(): Promise<string> {
-    const unseen = await this.neverSeen().catch(() => ({ count: 0, total: 0, oldestDays: 0 }))
+  private async exposureLine(): Promise<string> {    const unseen = await this.neverSeen().catch(() => ({ count: 0, total: 0, oldestDays: 0 }))
     if (unseen.total === 0) return 'no memories stored'
     if (unseen.count === 0) return `every one of ${unseen.total} memories has been injected or read`
     return `${unseen.count} of ${unseen.total} never injected or read (oldest ${unseen.oldestDays}d)`
@@ -2575,7 +2612,19 @@ export function apply(ctx: Context, config: MemoriesConfig = {}): void {
     name: 'memories',
     description: 'Inspect and manage cross-session memories',
     input: { hint: 'list | search <query> [--kind <k>] | show <id> | add <scope> <text> [--kind <k>] | forget <id> | archive | restore <id> | mode [on|off] | mine | consolidate | sweep | skills | stats' },
-    handler: async (invocation: CommandInvocation) => handleCommand(runtime, invocation),
+    // The handler never throws: an exception here crosses into the harness's
+    // command layer, which reports it verbatim and — measured 2026-09-23 — is
+    // where a truncated extraction surfaced to the user as a failed command.
+    // Every failure inside this plugin becomes an error RESULT instead.
+    handler: async (invocation: CommandInvocation) => {
+      try {
+        return await handleCommand(runtime, invocation)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        runtime.noteCommandFailure(invocation.rawInput.trim().split(/\s+/u)[0] ?? 'memories', error)
+        return { kind: 'error' as const, text: `dsh-memories: ${message}` }
+      }
+    },
   })
   let toolDisposer: (() => void) | undefined
   let commandDisposer: (() => void) | undefined

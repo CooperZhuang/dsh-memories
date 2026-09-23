@@ -184,8 +184,17 @@ export const DEFAULT_EXTRACT_MAX_INPUT_CHARS = 48_000
  */
 export const DEFAULT_EXTRACT_INTERVAL_MINUTES = 30
 
-/** Default output-token cap for one extraction call. */
-export const DEFAULT_EXTRACT_MAX_OUTPUT_TOKENS = 2048
+/**
+ * Default output-token cap for one extraction call.
+ *
+ * Raised from 2048 on 2026-09-23: asked for up to five memories with tags, keys,
+ * `appliesTo` and a summary paragraph in Chinese, a rich reply runs past 2048
+ * tokens, and the first real `/memories mine` in the field came back cut in half
+ * (`max-tokens`). The cap is a ceiling rather than a spend, so the larger value
+ * costs nothing on replies that finish early; a reply that still hits it is
+ * salvaged and reported (see `extract.ts`).
+ */
+export const DEFAULT_EXTRACT_MAX_OUTPUT_TOKENS = 4096
 
 /** Default timeout for one extraction call. */
 export const DEFAULT_EXTRACT_TIMEOUT_MS = 120_000

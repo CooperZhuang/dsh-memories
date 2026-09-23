@@ -217,15 +217,43 @@ test('runExtraction reports an empty window and a missing route without calling 
   assert.deepEqual(noRoute, { kind: 'none', reason: 'no-route' })
 })
 
-test('runExtraction throws on a non-stop finish reason', async () => {
+test('a reply the output cap cut short is salvaged, never thrown', async () => {
   const session = stubSession('C:\\work', [{ seq: 1, role: 'user', text: 'hi' }])
   const truncated = {
     stream: () => (async function* chunks() {
-      yield textChunk('{"memories":[')
+      // Two complete memories, then the cut lands inside the third object.
+      yield textChunk('{"summary":"The user set up a workflow.","memories":['
+        + '{"scope":"project","title":"First fact","body":"Body one.","tags":["a"]},'
+        + '{"scope":"global","title":"Second fact","body":"Body two.","tags":["b"]},'
+        + '{"scope":"project","title":"Third fac')
       yield { type: 'finish', reason: { kind: 'max-tokens' } } as unknown as StreamChunk
     })(),
   }
-  await assert.rejects(() => runExtraction(truncated as never, {
+  const salvaged = await runExtraction(truncated as never, {
+    session,
+    window: collectWindow(session, 0, 10, 1_000),
+    projectLabel: 'project:work',
+    maxOutputTokens: 8,
+    maxMemories: 5,
+    timeoutMs: 1_000,
+    signal: new AbortController().signal,
+  })
+  assert.equal(salvaged.kind, 'memories')
+  if (salvaged.kind !== 'memories') throw new Error('unreachable')
+  assert.deepEqual(salvaged.drafts.map((draft) => draft.title), ['First fact', 'Second fact'])
+  assert.equal(salvaged.summary, 'The user set up a workflow.')
+  assert.equal(salvaged.truncated, true, 'the caller can tell the cap was the binding limit')
+})
+
+test('a capped reply with nothing usable reports the cap instead of throwing', async () => {
+  const session = stubSession('C:\\work', [{ seq: 1, role: 'user', text: 'hi' }])
+  const cutEarly = {
+    stream: () => (async function* chunks() {
+      yield textChunk('{"summary":"The user was just getting start')
+      yield { type: 'finish', reason: { kind: 'max-tokens' } } as unknown as StreamChunk
+    })(),
+  }
+  const outcome = await runExtraction(cutEarly as never, {
     session,
     window: collectWindow(session, 0, 10, 1_000),
     projectLabel: 'project:work',
@@ -233,7 +261,26 @@ test('runExtraction throws on a non-stop finish reason', async () => {
     maxMemories: 1,
     timeoutMs: 1_000,
     signal: new AbortController().signal,
-  }), /max-tokens/u)
+  })
+  assert.deepEqual(outcome, { kind: 'none', reason: 'max-tokens' })
+
+  // Any other non-stop finish is reported the same way: a background pass must
+  // not turn a provider-side stop into an exception the user sees.
+  const aborted = {
+    stream: () => (async function* chunks() {
+      yield textChunk('{"memories":[')
+      yield { type: 'finish', reason: { kind: 'aborted' } } as unknown as StreamChunk
+    })(),
+  }
+  assert.deepEqual(await runExtraction(aborted as never, {
+    session,
+    window: collectWindow(session, 0, 10, 1_000),
+    projectLabel: 'project:work',
+    maxOutputTokens: 8,
+    maxMemories: 1,
+    timeoutMs: 1_000,
+    signal: new AbortController().signal,
+  }), { kind: 'none', reason: 'incomplete' })
 })
 
 test('runExtraction stores drafts, advances the watermark, and never mines twice', async (t) => {
@@ -372,6 +419,47 @@ test('one pass mines at most maxSessionsPerPass sessions, newest first', async (
   assert.equal(runtime.state.getSession('older-session')?.at, 0, 'the cap stops the pass after one model call')
   const pass = lines.find((line) => line.startsWith('dsh-memories: extract pass:'))
   assert.match(pass ?? '', /pass-cap 1/u, 'a session held back by the cap is named as such, not as nothing-new')
+  t.after(() => rm(dir, { recursive: true, force: true }))
+})
+
+test('a capped extraction is a reported outcome, not an error the command layer sees', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-cap-outcome-'))
+  const lines: string[] = []
+  const session = stubSession(process.cwd(), [{ seq: 1, role: 'user', text: 'Something worth remembering.' }])
+  const capped = {
+    stream: () => (async function* chunks() {
+      yield textChunk('{"summary":"Cut off before the first memory.')
+      yield { type: 'finish', reason: { kind: 'max-tokens' } } as unknown as StreamChunk
+    })(),
+  }
+  const ctx = {
+    get: (name: string) => (name === 'llm' ? capped : undefined),
+    logger: {
+      info: (format: string, ...args: unknown[]) => lines.push(`${format} ${args.join(' ')}`),
+      warn: (format: string, ...args: unknown[]) => lines.push(`${format} ${args.join(' ')}`),
+      debug: (format: string, ...args: unknown[]) => lines.push(`${format} ${args.join(' ')}`),
+    },
+  } as never
+  const runtime = new MemoriesRuntime(ctx, {
+    memoriesDir: dir,
+    autoExtract: true,
+    extractTimeoutMs: 5_000,
+    extractMaxOutputTokens: 128,
+  })
+  t.after(() => runtime.dispose())
+  const agent = {
+    id: 'extract-session',
+    session,
+    status: 'idle',
+    runMaintenance: (job: (signal: AbortSignal) => Promise<unknown>) => job(new AbortController().signal),
+  } as unknown as Agent
+
+  // This is the exact path `/memories mine` drives. It used to throw, and the
+  // command layer reports a handler error verbatim to the user.
+  assert.deepEqual(await runtime.runExtraction(agent), { stored: 0, reason: 'max-tokens' })
+  assert.equal(runtime.state.getSession('extract-session')?.lastSeq, 1, 'the watermark still advances')
+  assert.ok(lines.some((line) => line.includes('raise extractMaxOutputTokens')), 'the cap is reported at info, with the knob to raise')
+  assert.equal(await runtime.mineNow(agent), 0, 'the forced path returns a count instead of throwing')
   t.after(() => rm(dir, { recursive: true, force: true }))
 })
 
