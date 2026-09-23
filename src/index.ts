@@ -1287,7 +1287,14 @@ export class MemoriesRuntime {
     const live = this.liveAgents()
     counts.live = live.length
     for (const agent of live) if (!candidates.has(agent.session.id)) candidates.set(agent.session.id, agent)
-    for (const agent of candidates.values()) {
+    // Newest first, and bounded by `maxSessionsPerPass`. The registry made this
+    // pass able to see sessions it never tracked before, and without a bound that
+    // means one model call per live session in a single tick — the knob has
+    // promised a per-pass ceiling all along; only the exit flush applied it.
+    const limit = this.settings.maxSessionsPerPass
+    const ordered = [...candidates.values()].sort((left, right) => this.activityOf(right) - this.activityOf(left))
+    let mined = 0
+    for (const agent of ordered) {
       if (this.lifecycle.signal.aborted) return
       counts.tracked += 1
       const session = agent.session
@@ -1306,6 +1313,12 @@ export class MemoriesRuntime {
         note('nothing-new')
         continue
       }
+      if (limit > 0 && mined >= limit) {
+        counts.skipped += 1
+        note('pass-cap')
+        break
+      }
+      mined += 1
       try {
         const outcome = await this.mine(agent, { ignoreIdleWindow: true })
         // A pass that ran but stored nothing was deferred, not mined: the reason
@@ -1337,6 +1350,16 @@ export class MemoriesRuntime {
     } catch {
       return []
     }
+  }
+
+  /**
+   * When a session was last seen working, for the "newest first" ordering.
+   *
+   * The state database is the authority (every status transition writes it);
+   * a session the store has never seen falls back to when it was created.
+   */
+  private activityOf(agent: Agent): number {
+    return this.state.getSession(agent.session.id)?.activityAt ?? agent.session.header.createdAt ?? 0
   }
 
   /** When the pass last reported itself at info level. */

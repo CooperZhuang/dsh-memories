@@ -325,6 +325,56 @@ test('a session the registry knows but this process never settled is still mined
   t.after(() => rm(dir, { recursive: true, force: true }))
 })
 
+test('one pass mines at most maxSessionsPerPass sessions, newest first', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-cap-'))
+  const lines: string[] = []
+  /** A session stub under its own id, so the pass has two candidates to choose from. */
+  const sessionWithId = (id: string, text: string): Session => {
+    const session = stubSession(process.cwd(), [{ seq: 1, role: 'user', text }])
+    ;(session as unknown as { id: string }).id = id
+    ;(session.header as unknown as { id: string }).id = id
+    return session
+  }
+  const older = sessionWithId('older-session', 'The older session said something worth remembering.')
+  const newer = sessionWithId('newer-session', 'The newer session said something worth remembering.')
+  const agents = [older, newer].map((session) => ({
+    id: session.id,
+    session,
+    status: 'idle',
+    runMaintenance: (job: (signal: AbortSignal) => Promise<unknown>) => job(new AbortController().signal),
+  })) as unknown as Agent[]
+  const reply = '{"memories":[{"scope":"project","title":"A fact","body":"A fact.","tags":["x"]}]}'
+  const ctx = {
+    get: (name: string) => {
+      if (name === 'llm') return fakeLlm(reply)
+      if (name === 'agents') return { roots: () => agents }
+      return undefined
+    },
+    logger: {
+      info: (format: string, ...args: unknown[]) => lines.push(`${format} ${args.join(' ')}`),
+      warn: (format: string, ...args: unknown[]) => lines.push(`${format} ${args.join(' ')}`),
+      debug: (format: string, ...args: unknown[]) => lines.push(`${format} ${args.join(' ')}`),
+    },
+  } as never
+  const runtime = new MemoriesRuntime(ctx, {
+    memoriesDir: dir,
+    autoExtract: true,
+    extractTimeoutMs: 5_000,
+    maxSessionsPerPass: 1,
+  })
+  t.after(() => runtime.dispose())
+  runtime.recordActivity(older, Date.now() - 60_000)
+  runtime.recordActivity(newer, Date.now())
+
+  await runtime.runPeriodicPass()
+
+  assert.ok((runtime.state.getSession('newer-session')?.at ?? 0) > 0, 'the newest session is mined first')
+  assert.equal(runtime.state.getSession('older-session')?.at, 0, 'the cap stops the pass after one model call')
+  const pass = lines.find((line) => line.startsWith('dsh-memories: extract pass:'))
+  assert.match(pass ?? '', /pass-cap 1/u, 'a session held back by the cap is named as such, not as nothing-new')
+  t.after(() => rm(dir, { recursive: true, force: true }))
+})
+
 test('a failing extraction call leaves the store and watermark untouched', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-extract-fail-'))
       const session = stubSession(process.cwd(), [{ seq: 1, role: 'user', text: 'something memorable' }])
