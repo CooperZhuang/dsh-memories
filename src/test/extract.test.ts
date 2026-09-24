@@ -429,8 +429,10 @@ test('a capped extraction is a reported outcome, not an error the command layer 
   const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-cap-outcome-'))
   const lines: string[] = []
   const session = stubSession(process.cwd(), [{ seq: 1, role: 'user', text: 'Something worth remembering.' }])
+  let calls = 0
   const capped = {
     stream: () => (async function* chunks() {
+      calls += 1
       yield textChunk('{"summary":"Cut off before the first memory.')
       yield { type: 'finish', reason: { kind: 'max-tokens' } } as unknown as StreamChunk
     })(),
@@ -460,12 +462,15 @@ test('a capped extraction is a reported outcome, not an error the command layer 
   // This is the exact path `/memories mine` drives. It used to throw, and the
   // command layer reports a handler error verbatim to the user.
   assert.deepEqual(await runtime.runExtraction(agent), { stored: 0, reason: 'max-tokens' })
-  assert.equal(runtime.state.getSession('extract-session')?.lastSeq, 1, 'the watermark still advances')
+  // A capped reply is retryable. Consuming its window here would make every
+  // later periodic pass say `nothing-new` and permanently lose the transcript.
+  assert.equal(runtime.state.getSession('extract-session')?.lastSeq, undefined, 'the watermark stays put after a capped reply')
   assert.ok(lines.some((line) => line.includes('raise extractMaxOutputTokens')), 'the cap is reported at info, with the knob to raise')
   // The line also names the route: the ceiling alone does not explain a reply
   // that produced nothing, and the inherited reasoning level is the usual cause.
   assert.ok(lines.some((line) => line.includes('fake-provider/fake-model')), 'the capped line names the route it ran on')
   assert.equal(await runtime.mineNow(agent), 0, 'the forced path returns a count instead of throwing')
+  assert.equal(calls, 2, 'a capped window is retried instead of being hidden behind the watermark')
   t.after(() => rm(dir, { recursive: true, force: true }))
 })
 

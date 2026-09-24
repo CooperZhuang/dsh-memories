@@ -1760,13 +1760,22 @@ export class MemoriesRuntime {
             outcome.dropped, this.settings.extractMaxMemories)
         }
       }
-      this.state.putSession(key, {
-        lastSeq: window.lastSeq,
-        at: Date.now(),
-        ...root === undefined ? {} : { root },
-        activityAt: Date.now(),
-        ...outcome.kind === 'memories' ? { contributed: true } : {},
-      })
+      // Only a completed extraction may consume the transcript window. A capped
+      // or incomplete reply is retryable: advancing here would turn a provider
+      // failure into `nothing-new` on every later periodic pass and lose the
+      // unmined conversation permanently. An explicit empty reply is complete
+      // and may advance because the model answered that there was no memory.
+      const advancesWatermark = outcome.kind === 'memories'
+        || outcome.kind === 'none' && outcome.reason === 'empty-reply'
+      if (advancesWatermark) {
+        this.state.putSession(key, {
+          lastSeq: window.lastSeq,
+          at: Date.now(),
+          ...root === undefined ? {} : { root },
+          activityAt: Date.now(),
+          ...outcome.kind === 'memories' ? { contributed: true } : {},
+        })
+      }
       return { stored: outcome.kind === 'memories' ? outcome.drafts.length : 0, ...refusal === undefined ? {} : { reason: refusal } }
     } finally {
       clearTimeout(hold)
