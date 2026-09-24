@@ -145,6 +145,16 @@ test('the injected summary never exceeds its configured byte budget', async (t) 
   const summary = await runtime.summary(agent.session)
   assert.ok(summary !== undefined)
   assert.ok(Buffer.byteLength(summary, 'utf8') <= 700)
+  const injected = await runtime.injectionFor(agent)
+  assert.ok(injected !== undefined)
+  const rows = runtime.state.retentionRows().filter((row) => row.scope === 'global')
+  const entries = await runtime.store.list('global', undefined, { fresh: true })
+  const listed = entries.filter((entry) => summary.includes(`- ${entry.title} [`))
+  assert.ok(listed.length < entries.length, 'the byte budget hides some selected memories')
+  for (const entry of entries) {
+    const surfaced = rows.find((row) => row.id === entry.id)?.surfacedAt ?? 0
+    assert.equal(surfaced > 0, listed.some((shown) => shown.id === entry.id), `${entry.title} is credited only if shown`)
+  }
   t.after(() => rm(dir, { recursive: true, force: true }))
 })
 

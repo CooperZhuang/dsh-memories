@@ -40,7 +40,7 @@ import { StateStore, importLegacyState, statePath } from './state.js'
 import { browseMemories, explainEntry, searchMemories } from './search.js'
 import type { MatchEvidence, ScopeEntries } from './search.js'
 import { isSubstantiveTurn } from './query.js'
-import { MEMORY_OPEN, rankForSummary, renderEntry, renderHit, renderMemorySummary, renderRecall, renderScopeListing, selectForSummary } from './render.js'
+import { MEMORY_OPEN, rankForSummary, renderEntry, renderHit, renderMemorySummaryResult, renderRecall, renderScopeListing, selectForSummary } from './render.js'
 import type { SummaryScope } from './render.js'
 import { findProjectRoot, isWithin } from './workspace.js'
 import { citationRoots, citationWarning, ignoredUnder, missingCitations } from './citations.js'
@@ -591,14 +591,14 @@ export class MemoriesRuntime {
     // a few paths per session is affordable, and a warning on a bullet nobody
     // sees is worth nothing.
     const flags = await this.citationFlags(session, selected.flat()).catch(() => new Map<string, string>())
-    const text = renderMemorySummary(scopes, {
+    const result = renderMemorySummaryResult(scopes, {
       maxBytes: this.settings.maxSummaryBytes,
       maxEntriesPerScope: this.settings.maxSummaryEntries,
       ...note === undefined ? {} : { note },
       ...flags.size === 0 ? {} : { flags },
     })
-    if (text === undefined) return undefined
-    return { text, surfaced: selected.flat() }
+    if (result === undefined) return undefined
+    return { text: result.text, surfaced: result.listed }
   }
 
   /**
@@ -823,10 +823,8 @@ export class MemoriesRuntime {
     // Report what the block actually SHOWS, not how many entries were offered:
     // the two differ by design (the byte budget drops the tail), and a log that
     // counts the selection makes a working budget look like a broken one.
-    const listed = summary.text.split('\n')
-      .filter((line) => line.startsWith('- ') && !line.startsWith('- …')).length
-    this.log.info('dsh-memories: injected the summary into session %s (%d bytes, %d entries listed of %d selected)',
-      session.id, Buffer.byteLength(summary.text, 'utf8'), listed, summary.surfaced.length)
+    this.log.info('dsh-memories: injected the summary into session %s (%d bytes, %d entries listed)',
+      session.id, Buffer.byteLength(summary.text, 'utf8'), summary.surfaced.length)
     return createUserMessage({
       content: [{ type: 'text', text: summary.text }],
       source: { kind: MEMORY_SOURCE_KIND, form: 'recall' },
