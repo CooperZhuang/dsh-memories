@@ -166,7 +166,9 @@ test('collectWindow honours the message and character caps from the newest end',
 test('the extraction JSON schema is closed and requires the documented fields', () => {
   assert.equal(EXTRACT_JSON_SCHEMA.additionalProperties, false)
   // The summary is required too: it becomes the evidence note behind the drafts.
-  assert.deepEqual([...EXTRACT_JSON_SCHEMA.required], ['summary', 'memories'])
+  // `memories` is declared first because a capped reply is only salvageable if
+  // the array was written before the prose (see EXTRACT_SYSTEM).
+  assert.deepEqual([...EXTRACT_JSON_SCHEMA.required], ['memories', 'summary'])
   // `appliesTo` is required because it is the field that lets a paraphrased turn
   // find the memory again; half the store was unsearchable without it.
   assert.deepEqual([...EXTRACT_JSON_SCHEMA.properties.memories.items.required], ['scope', 'title', 'body', 'appliesTo'])
@@ -263,7 +265,7 @@ test('a capped reply with nothing usable reports the cap instead of throwing', a
     timeoutMs: 1_000,
     signal: new AbortController().signal,
   })
-  assert.deepEqual(outcome, { kind: 'none', reason: 'max-tokens' })
+  assert.deepEqual(outcome, { kind: 'none', reason: 'max-tokens', route: { provider: 'fake-provider', model: 'fake-model' } })
 
   // Any other non-stop finish is reported the same way: a background pass must
   // not turn a provider-side stop into an exception the user sees.
@@ -281,7 +283,7 @@ test('a capped reply with nothing usable reports the cap instead of throwing', a
     maxMemories: 1,
     timeoutMs: 1_000,
     signal: new AbortController().signal,
-  }), { kind: 'none', reason: 'incomplete' })
+  }), { kind: 'none', reason: 'incomplete', route: { provider: 'fake-provider', model: 'fake-model' } })
 })
 
 test('runExtraction stores drafts, advances the watermark, and never mines twice', async (t) => {
@@ -460,8 +462,62 @@ test('a capped extraction is a reported outcome, not an error the command layer 
   assert.deepEqual(await runtime.runExtraction(agent), { stored: 0, reason: 'max-tokens' })
   assert.equal(runtime.state.getSession('extract-session')?.lastSeq, 1, 'the watermark still advances')
   assert.ok(lines.some((line) => line.includes('raise extractMaxOutputTokens')), 'the cap is reported at info, with the knob to raise')
+  // The line also names the route: the ceiling alone does not explain a reply
+  // that produced nothing, and the inherited reasoning level is the usual cause.
+  assert.ok(lines.some((line) => line.includes('fake-provider/fake-model')), 'the capped line names the route it ran on')
   assert.equal(await runtime.mineNow(agent), 0, 'the forced path returns a count instead of throwing')
   t.after(() => rm(dir, { recursive: true, force: true }))
+})
+
+test('a reply capped mid-array keeps the memories that were already complete', async () => {
+  const session = stubSession(process.cwd(), [{ seq: 1, role: 'user', text: 'Something worth remembering.' }])
+  // The reply order the contract asks for: `memories` first, `summary` last. A
+  // cap that bites mid-array therefore leaves complete objects behind, which is
+  // the shape `repairTruncatedJson` closes. With the summary written first, the
+  // same truncation kept nothing — that is the case the test above pins.
+  const capped = {
+    stream: () => (async function* chunks() {
+      yield textChunk('{"memories":[{"scope":"project","kind":"fact","title":"First fact","body":"Finished before the cap.","appliesTo":"任何时候"},{"scope":"project","kind":"fact","title":"Second fact","body":"cut off he')
+      yield { type: 'finish', reason: { kind: 'max-tokens' } } as unknown as StreamChunk
+    })(),
+  }
+  const outcome = await runExtraction(capped as never, {
+    session,
+    window: collectWindow(session, 0, 10, 10_000),
+    projectLabel: 'project:work',
+    maxOutputTokens: 128,
+    maxMemories: 5,
+    timeoutMs: 5_000,
+    signal: new AbortController().signal,
+  })
+  assert.equal(outcome.kind, 'memories')
+  assert.equal(outcome.kind === 'memories' ? outcome.truncated : undefined, true, 'the caller can tell it was salvaged')
+  assert.deepEqual(outcome.kind === 'memories' ? outcome.drafts.map((draft) => draft.title) : [], ['First fact'])
+})
+
+test('the resolved route carries the reasoning level that spends the cap', async () => {
+  const session = stubSession('C:\\work', [{ seq: 1, role: 'user', text: 'Remember this.' }])
+  ;(session as unknown as { requestHeader: () => unknown }).requestHeader = () => ({
+    config: { provider: 'deepseek-official', model: 'deepseek-flash', reasoningEffort: 'high' },
+  })
+  const lined = {
+    stream: () => (async function* chunks() {
+      yield textChunk('{"memories":[{"scope":"project","kind":"fact","title":"T","body":"B","appliesTo":"A"}],"summary":"s')
+      yield { type: 'finish', reason: { kind: 'max-tokens' } } as unknown as StreamChunk
+    })(),
+  }
+  const outcome = await runExtraction(lined as never, {
+    session,
+    window: collectWindow(session, 0, 10, 10_000),
+    projectLabel: 'project:work',
+    maxOutputTokens: 128,
+    maxMemories: 5,
+    timeoutMs: 5_000,
+    signal: new AbortController().signal,
+  })
+  assert.equal(outcome.kind, 'memories')
+  assert.equal(outcome.kind === 'memories' ? outcome.route.model : '', 'deepseek-flash')
+  assert.equal(outcome.kind === 'memories' ? outcome.route.reasoningEffort : undefined, 'high', 'the level travels with the route')
 })
 
 test('a peak window refuses every session without spending the per-pass budget', async (t) => {

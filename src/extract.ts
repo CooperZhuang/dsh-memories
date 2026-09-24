@@ -27,7 +27,22 @@ export interface ExtractWindow {
   readonly messages: number
 }
 
-/** The system instruction for the extraction call. */
+/**
+ * The system instruction for the extraction call.
+ *
+ * The reply's key order is load-bearing, not cosmetic. `maxOutputTokens` is a
+ * ceiling on the *whole* completion, reasoning included, and the reply's only
+ * recoverable part is the sequence of COMPLETE memory objects: when the ceiling
+ * bites mid-reply, `repairTruncatedJson` can close the array after the last
+ * finished object, but it can never resurrect one that was not written yet.
+ * With `summary` first, a model that spends the budget on the summary paragraph
+ * loses every memory at once — measured on this store, 2026-09-23/24, five
+ * extraction calls came back capped with nothing usable (`[5766 in / 4096 out]`
+ * … `[24490 in / 4096 out]`, `raise extractMaxOutputTokens`), four of them on
+ * `deepseek-flash` at `reasoningEffort: high` and one on `gpt-6-astra`, where
+ * the thinking tokens alone can consume the cap. Memories first makes the same
+ * truncation keep everything that finished.
+ */
 export const EXTRACT_SYSTEM = [
   'You maintain long-term memory for a coding assistant.',
   'Read the supplied conversation transcript and extract only durable, reusable facts that would help in a FUTURE session.',
@@ -55,18 +70,24 @@ export const EXTRACT_SYSTEM = [
   '- "fact": durable background that is none of the above.',
   'Always provide "appliesTo": a short phrase in the user\'s words saying when this memory matters ("准备推送代码之前"). It is the field that lets a paraphrased turn find the memory, and it is required.',
   'Prefer few high-value memories over many trivial ones. Return at most the requested number.',
-  'Also write "summary": one paragraph (2-4 sentences) saying what this session was about — the task, the decisions, and anything that would help someone judge the memories above later. It is stored as the evidence behind them.',
-  'Reply with JSON only, no prose and no code fence: {"summary":string,"memories":[{"scope":"global"|"project","kind":string,"title":string,"body":string,"tags":string[],"appliesTo":string}]}',
-  'When nothing is worth remembering, reply exactly {"summary":"","memories":[]}.'
+  'Reply with JSON only, no prose and no code fence: {"memories":[{"scope":"global"|"project","kind":string,"title":string,"body":string,"tags":string[],"appliesTo":string}],"summary":string}',
+  'Write the "memories" array first and the "summary" paragraph last: the reply is capped, and a summary written first can spend the whole budget before the first memory is complete.',
+  'Write "summary" as one paragraph (2-4 sentences) saying what this session was about — the task, the decisions, and anything that would help someone judge the memories above later. It is stored as the evidence behind them.',
+  'When nothing is worth remembering, reply exactly {"memories":[],"summary":""}.'
 ].join('\n')
 
-/** JSON output contract for one extraction call. */
+/**
+ * JSON output contract for one extraction call.
+ *
+ * `memories` is declared (and required) before `summary` on purpose: property
+ * declaration order guides generation, and the array is the part a truncated
+ * reply can still salvage. See {@link EXTRACT_SYSTEM}.
+ */
 export const EXTRACT_JSON_SCHEMA = {
   type: 'object',
   additionalProperties: false,
-  required: ['summary', 'memories'],
+  required: ['memories', 'summary'],
   properties: {
-    summary: { type: 'string' },
     memories: {
       type: 'array',
       items: {
@@ -86,6 +107,7 @@ export const EXTRACT_JSON_SCHEMA = {
         },
       },
     },
+    summary: { type: 'string' },
   },
 } as const
 
@@ -170,16 +192,30 @@ export function collectWindow(
   return { text: kept.join('\n\n'), lastSeq, messages: kept.length }
 }
 
-/** Resolve the provider/model route for an extraction call. */
+/**
+ * Resolve the provider/model route for an extraction call.
+ *
+ * The session's own route is inherited deliberately — a background call should
+ * not silently run on a model nobody chose — but the reasoning level comes with
+ * it, and that level is what the output cap has to pay for: a thinking model
+ * bills its reasoning against `maxOutputTokens` before the first visible token.
+ * Carrying the level out with the route is what lets the caller's log line name
+ * the reason a capped call produced nothing, instead of only naming the knob.
+ */
 function resolveRoute(
   session: Session,
   provider: string | undefined,
   model: string | undefined,
   fallback: { provider?: string; model?: string },
-): { provider: string; model: string } | undefined {
+): ExtractionRoute | undefined {
   if (provider !== undefined && model !== undefined) return { provider, model }
   const header = session.requestHeader()
-  if (header !== undefined) return { provider: header.config.provider, model: header.config.model }
+  if (header !== undefined) {
+    const config = header.config as { provider: string; model: string; reasoningEffort?: string }
+    return config.reasoningEffort === undefined
+      ? { provider: config.provider, model: config.model }
+      : { provider: config.provider, model: config.model, reasoningEffort: config.reasoningEffort }
+  }
   if (fallback.provider !== undefined && fallback.model !== undefined) {
     return { provider: fallback.provider, model: fallback.model }
   }
@@ -300,6 +336,19 @@ export interface ExtractionUsage {
   readonly outputTokens: number
 }
 
+/**
+ * The provider/model an extraction call actually ran on.
+ *
+ * `reasoningEffort` is present only when the inherited session route declared
+ * one, and it is the field that explains a capped call: a thinking model spends
+ * the output ceiling on reasoning before it writes any JSON.
+ */
+export interface ExtractionRoute {
+  readonly provider: string
+  readonly model: string
+  readonly reasoningEffort?: string
+}
+
 /** Outcome of one extraction call. */
 export type ExtractionOutcome =
   | {
@@ -309,7 +358,7 @@ export type ExtractionOutcome =
     readonly summary: string
     /** Usable drafts the reply offered beyond `maxMemories`, reported to the caller. */
     readonly dropped: number
-    readonly route: { provider: string; model: string }
+    readonly route: ExtractionRoute
     /**
      * Whether the reply was cut short by the output cap and salvaged.
      *
@@ -337,6 +386,14 @@ export type ExtractionOutcome =
      * one that tells a reader which configuration knob to raise.
      */
     readonly reason: 'empty-window' | 'no-route' | 'empty-reply' | 'max-tokens' | 'incomplete'
+    /**
+     * The route the call ran on, when one was resolved.
+     *
+     * Absent for `empty-window` and `no-route`, which fail before a route
+     * exists. Present otherwise so the caller can name the model — and its
+     * reasoning level — in the line that reports the cap.
+     */
+    readonly route?: ExtractionRoute
     readonly usage?: ExtractionUsage
   }
 
@@ -402,8 +459,8 @@ export async function runExtraction(llm: LlmRuntime, request: ExtractionRequest)
     // handler error verbatim) and made a background pass look broken — measured
     // 2026-09-23, the first `/memories mine` in the field died this way.
     //
-    // The extractor is asked for one object with a `summary` and a `memories`
-    // array, so a truncated reply is normally an unterminated array of COMPLETE
+    // The extractor is asked for one object whose `memories` array comes first,
+    // so a truncated reply is normally an unterminated array of COMPLETE
     // objects: keep what parsed, and only when nothing did does the caller hear
     // about the cap.
     const complete = parseExtraction(text, request.maxMemories, request.session.id)
@@ -421,17 +478,17 @@ export async function runExtraction(llm: LlmRuntime, request: ExtractionRequest)
         ...usage === undefined ? {} : { usage },
       }
     }
-    return { kind: 'none', reason: finish === 'max-tokens' ? 'max-tokens' : 'incomplete', ...usage === undefined ? {} : { usage } }
+    return { kind: 'none', reason: finish === 'max-tokens' ? 'max-tokens' : 'incomplete', route, ...usage === undefined ? {} : { usage } }
   }
   const parsed = parseExtraction(text, request.maxMemories, request.session.id)
-  if (parsed.drafts.length === 0) return { kind: 'none', reason: 'empty-reply', ...usage === undefined ? {} : { usage } }
+  if (parsed.drafts.length === 0) return { kind: 'none', reason: 'empty-reply', route, ...usage === undefined ? {} : { usage } }
   return { kind: 'memories', drafts: parsed.drafts, summary: parsed.summary, dropped: parsed.dropped, route, ...usage === undefined ? {} : { usage } }
 }
 
 /**
  * Close a JSON reply the output cap cut in half.
  *
- * The reply is one object holding a `summary` and a `memories` array, so a
+ * The reply is one object whose `memories` array is written first, so a
  * truncated reply is an unterminated array whose earlier elements are complete.
  * Candidate cut points are tried from the end backwards — the first one that
  * parses wins — which keeps every memory that was fully written. A reply cut

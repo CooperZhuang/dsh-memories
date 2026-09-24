@@ -47,6 +47,7 @@ import { citationRoots, citationWarning, ignoredUnder, missingCitations } from '
 import { planRetention, retentionKey } from './retention.js'
 import { MemoryLog, createFileSink, createLogExporter, pluginLogger } from './log.js'
 import { collectWindow, runExtraction } from './extract.js'
+import type { ExtractionRoute } from './extract.js'
 import { backgroundDelayMs, extractionDelayMs, formatDelay, parsePeakHours, peakDelayMs } from './schedule.js'
 import { applyPlan, classifyPlan, clearPendingPlan, denyToolsFor, mergePendingPlan, proposalIsFresh, readPendingPlan, runConsolidation, selectForConsolidation, writePendingPlan } from './consolidate.js'
 import type { ConsolidationDispute } from './consolidate.js'
@@ -72,6 +73,24 @@ const EXIT_FLUSH_TIMEOUT_MS = 8_000
  * for the rest of the process's life.
  */
 const PASS_REPORT_INTERVAL_MS = 3_600_000
+
+/**
+ * Name the route an extraction call ran on, for a log line.
+ *
+ * The reasoning level is part of the name when the session declared one: it is
+ * the field that explains a call which hit the output cap without writing
+ * anything, because a thinking model spends that ceiling before its first
+ * visible token.
+ *
+ * @param route - the resolved route, when the call got that far.
+ * @returns `provider/model`, with `(reasoning <level>)` appended when known.
+ */
+function describeExtractionRoute(route: ExtractionRoute | undefined): string {
+  if (route === undefined) return 'an unresolved route'
+  return route.reasoningEffort === undefined
+    ? `${route.provider}/${route.model}`
+    : `${route.provider}/${route.model} (reasoning ${route.reasoningEffort})`
+}
 
 /** State key holding the last periodic sweep, so it survives a restart. */
 const SWEEP_META_KEY = 'sweep-at'
@@ -1702,8 +1721,14 @@ export class MemoriesRuntime {
           // At info, not decision: this one is actionable. The extraction reply was
           // cut off before it produced anything usable, which is exactly the state
           // that says `extractMaxOutputTokens` is too small for this transcript.
-          this.log.info('dsh-memories: session %s hit the %d-token extraction cap before writing anything usable; raise extractMaxOutputTokens%s',
-            key, this.settings.extractMaxOutputTokens, spend)
+          //
+          // The route is named with it because the knob is not always the whole
+          // story: the call inherits the session's reasoning level, and a thinking
+          // model bills its reasoning against the same ceiling, so "on
+          // deepseek-flash (reasoning high)" is the difference between raising a
+          // number and putting the extractor on a route that fits the job.
+          this.log.info('dsh-memories: session %s hit the %d-token extraction cap on %s before writing anything usable; raise extractMaxOutputTokens%s',
+            key, this.settings.extractMaxOutputTokens, describeExtractionRoute(outcome.route), spend)
         } else {
           this.log.decision('dsh-memories: session %s produced no memories (%s)%s', key, outcome.reason, spend)
         }

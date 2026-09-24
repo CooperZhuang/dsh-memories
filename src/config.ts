@@ -187,14 +187,23 @@ export const DEFAULT_EXTRACT_INTERVAL_MINUTES = 30
 /**
  * Default output-token cap for one extraction call.
  *
- * Raised from 2048 on 2026-09-23: asked for up to five memories with tags, keys,
- * `appliesTo` and a summary paragraph in Chinese, a rich reply runs past 2048
- * tokens, and the first real `/memories mine` in the field came back cut in half
- * (`max-tokens`). The cap is a ceiling rather than a spend, so the larger value
- * costs nothing on replies that finish early; a reply that still hits it is
- * salvaged and reported (see `extract.ts`).
+ * Raised from 2048 to 4096 on 2026-09-23: asked for up to five memories with
+ * tags, keys, `appliesTo` and a summary paragraph in Chinese, a rich reply runs
+ * past 2048 tokens, and the first real `/memories mine` in the field came back
+ * cut in half (`max-tokens`).
+ *
+ * Raised again to 8192 on 2026-09-24, because the measured cause was not reply
+ * length. A background extraction call inherits the session's route, reasoning
+ * level included, and a thinking model bills its reasoning against this same
+ * ceiling — so the cap can be spent before the first visible token. The store's
+ * own log recorded five calls that came back pinned to the cap with nothing
+ * usable (`[5766 in / 4096 out]` … `[24490 in / 4096 out]`), four of them on
+ * `deepseek-flash` at `reasoningEffort: high` and one on `gpt-6-astra`; raising
+ * the ceiling without the `memories`-first reply order would only have moved the
+ * cliff. The cap is still a ceiling rather than a spend, so replies that finish
+ * early cost exactly as much as before.
  */
-export const DEFAULT_EXTRACT_MAX_OUTPUT_TOKENS = 4096
+export const DEFAULT_EXTRACT_MAX_OUTPUT_TOKENS = 8192
 
 /** Default timeout for one extraction call. */
 export const DEFAULT_EXTRACT_TIMEOUT_MS = 120_000
