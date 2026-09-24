@@ -48,7 +48,7 @@ import { planRetention, retentionKey } from './retention.js'
 import { MemoryLog, createFileSink, createLogExporter, pluginLogger } from './log.js'
 import { collectWindow, runExtraction } from './extract.js'
 import type { ExtractionRoute } from './extract.js'
-import { backgroundDelayMs, extractionDelayMs, formatDelay, parsePeakHours, peakDelayMs } from './schedule.js'
+import { backgroundDelayMs, cappedBackoffMs, extractionDelayMs, formatDelay, parsePeakHours, peakDelayMs } from './schedule.js'
 import { applyPlan, classifyPlan, clearPendingPlan, denyToolsFor, mergePendingPlan, proposalIsFresh, readPendingPlan, runConsolidation, selectForConsolidation, writePendingPlan } from './consolidate.js'
 import type { ConsolidationDispute } from './consolidate.js'
 import { discardDraft, listDrafts, promote, writeDraft } from './skills.js'
@@ -201,7 +201,7 @@ interface AgentRegistryLike {
 }
 
 /** Why one session was not mined, for the pass line. */
-type MineSkip = 'off' | 'peak' | 'not-idle' | 'quiet' | 'claim' | 'no-llm' | 'no-route' | 'empty' | 'max-tokens'
+type MineSkip = 'off' | 'peak' | 'not-idle' | 'quiet' | 'claim' | 'no-llm' | 'no-route' | 'empty' | 'max-tokens' | 'capped'
 
 /** One scope's loaded state. */
 interface ScopeState {
@@ -255,6 +255,18 @@ export class MemoriesRuntime {
   private readonly helpedIds = new WeakMap<Session, Set<string>>()
   private readonly idleTimers = new WeakMap<Agent, NodeJS.Timeout>()
   private readonly extracting = new Set<string>()
+  /**
+   * Sessions whose last extraction reply hit the output cap, and when they may
+   * be tried again.
+   *
+   * A capped window is deliberately left unmined so nothing is lost, which is
+   * exactly why the retry needs a gate: the cap that cut the reply is a property
+   * of the transcript rather than a hiccup, so retrying on the pass cadence would
+   * repeat the same full-price call forever. Entries carry the ceiling and route
+   * they blamed, so changing either clears the verdict on the spot instead of
+   * making a user who just raised the knob wait out a cooldown.
+   */
+  private readonly capped = new Map<string, { hits: number; until: number; cause: string }>()
   private readonly lifecycle = new AbortController()
   /** The plugin's own logger: the host logger, plus the decision facade. */
   private readonly log: MemoryLog
@@ -1348,6 +1360,17 @@ export class MemoriesRuntime {
         note('nothing-new')
         continue
       }
+      // Checked before the per-pass budget for the same reason as the peak gate:
+      // a session cooling down after a capped reply would otherwise eat a slot
+      // this pass, and the slot is a model call someone else could have spent.
+      const cooling = this.cappedWaitMs(session.id)
+      if (cooling > 0) {
+        counts.skipped += 1
+        note('capped')
+        this.log.decision('dsh-memories: not mining session %s yet, its last extraction reply was capped and the next attempt is in %s',
+          session.id, formatDelay(cooling))
+        continue
+      }
       // A refusal that costs nothing must not consume the per-pass budget.
       // Checked before the cap so a peak window reports `peak N` instead of
       // `peak N-1, pass-cap 1` — the cap is about model calls, and a peak hour
@@ -1522,6 +1545,15 @@ export class MemoriesRuntime {
         return { stored: 0, reason: 'quiet' }
       }
     }
+    // A capped window is still pending, and retrying it on the pass cadence would
+    // repeat the same call that just failed the same way. `/memories mine` does
+    // not come through here: the user asked, so the wait does not apply.
+    const cooling = this.cappedWaitMs(agent.session.id)
+    if (cooling > 0) {
+      this.log.decision('dsh-memories: not mining session %s yet, its last extraction reply was capped and the next attempt is in %s',
+        agent.session.id, formatDelay(cooling))
+      return { stored: 0, reason: 'capped' }
+    }
     try {
       return await agent.runMaintenance(async (signal) => this.runExtraction(agent, signal, true))
     } catch (error) {
@@ -1592,6 +1624,52 @@ export class MemoriesRuntime {
       }
     }
     return stored
+  }
+
+  /**
+   * What a capped reply blamed: the ceiling and the route the log points at.
+   *
+   * Stored with the cooldown so that changing either one — the fix the log line
+   * asks for — retires the verdict immediately. Without it a user who raises
+   * `extractMaxOutputTokens` and watches the next pass report `capped` has been
+   * told the knob did nothing.
+   */
+  private cappedCause(): string {
+    return `${this.settings.extractMaxOutputTokens}|${this.settings.extractProvider}|${this.settings.extractModel}`
+  }
+
+  /**
+   * How long before this session may be fed to the extractor again, or `0` now.
+   *
+   * @param key - session id.
+   * @returns milliseconds left of the cooldown.
+   */
+  private cappedWaitMs(key: string): number {
+    const record = this.capped.get(key)
+    if (record === undefined) return 0
+    if (record.cause !== this.cappedCause()) {
+      this.capped.delete(key)
+      return 0
+    }
+    const left = record.until - Date.now()
+    // An elapsed cooldown is not a licence to forget the history: the record's
+    // `hits` is what makes the next cap wait longer, so deleting it here would
+    // pin every session to the ladder's first rung forever.
+    if (left <= 0) return 0
+    return left
+  }
+
+  /**
+   * Record a capped reply and return the wait before the next attempt.
+   *
+   * @param key - session id.
+   * @returns milliseconds of cooldown now in force.
+   */
+  private noteCapped(key: string): number {
+    const hits = (this.capped.get(key)?.hits ?? 0) + 1
+    const wait = cappedBackoffMs(hits, this.settings.extractIntervalMinutes * 60_000)
+    this.capped.set(key, { hits, until: Date.now() + wait, cause: this.cappedCause() })
+    return wait
   }
 
   /**
@@ -1766,6 +1844,7 @@ export class MemoriesRuntime {
       const advancesWatermark = outcome.kind === 'memories'
         || outcome.kind === 'none' && outcome.reason === 'empty-reply'
       if (advancesWatermark) {
+        this.capped.delete(key)
         this.state.putSession(key, {
           lastSeq: window.lastSeq,
           at: Date.now(),
@@ -1773,6 +1852,15 @@ export class MemoriesRuntime {
           activityAt: Date.now(),
           ...outcome.kind === 'memories' ? { contributed: true } : {},
         })
+      } else if (outcome.kind === 'none' && outcome.reason === 'max-tokens') {
+        // Keeping the window is the point; this is what keeps it affordable. A
+        // ceiling too small for the transcript fails identically every time, and
+        // the pass cadence would pay for that forever, so consecutive caps back
+        // off. `incomplete` is not treated this way: it is a stream that did not
+        // finish, which the next pass has a real chance of getting through.
+        const wait = this.noteCapped(key)
+        this.log.decision('dsh-memories: session %s has hit the extraction cap %d time(s) in a row; the window stays unmined and the next attempt is in %s',
+          key, this.capped.get(key)?.hits ?? 1, formatDelay(wait))
       }
       return { stored: outcome.kind === 'memories' ? outcome.drafts.length : 0, ...refusal === undefined ? {} : { reason: refusal } }
     } finally {

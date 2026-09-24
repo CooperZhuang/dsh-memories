@@ -12,7 +12,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { normalizeSettings } from '../config.js'
-import { backgroundDelayMs, extractionDelayMs, formatDelay, parsePeakHours, peakDelayMs, withinWindow } from '../schedule.js'
+import { backgroundDelayMs, cappedBackoffMs, extractionDelayMs, formatDelay, parsePeakHours, peakDelayMs, withinWindow } from '../schedule.js'
 
 /** The DeepSeek rule this feature was written for: weekday mornings and afternoons. */
 const DEEPSEEK_PEAK = 'Mon-Fri 09:00-12:00, Mon-Fri 14:00-18:00'
@@ -95,6 +95,20 @@ test('formatDelay reads the way a person would say it', () => {
   assert.equal(formatDelay(1_800_000), '30m')
   assert.equal(formatDelay(6 * 3_600_000), '6h')
   assert.equal(formatDelay(6.5 * 3_600_000), '6h30m')
+})
+
+test('a capped reply backs off geometrically, and changing the knob ends the wait', () => {
+  // The window is retried rather than consumed, so the wait is what keeps a
+  // ceiling that is simply too small from costing a full-price call every pass.
+  assert.equal(cappedBackoffMs(1, 30 * 60_000), 30 * 60_000, 'the first retry is the normal cadence')
+  assert.equal(cappedBackoffMs(2, 30 * 60_000), 3_600_000)
+  assert.equal(cappedBackoffMs(3, 30 * 60_000), 2 * 3_600_000)
+  assert.equal(cappedBackoffMs(4, 30 * 60_000), 4 * 3_600_000)
+  assert.equal(cappedBackoffMs(5, 30 * 60_000), 6 * 3_600_000)
+  assert.equal(cappedBackoffMs(40, 30 * 60_000), 6 * 3_600_000, 'the ladder has a ceiling, not an ever-growing wait')
+  assert.equal(cappedBackoffMs(1, 12 * 3_600_000), 12 * 3_600_000, 'a slower configured cadence is not undercut by the first rung')
+  assert.equal(cappedBackoffMs(1, 0), 30 * 60_000, 'periodic checks off leaves the ladder alone')
+  assert.equal(cappedBackoffMs(0, 30 * 60_000), 30 * 60_000, 'a count that never got recorded still cools down')
 })
 
 test('the hour knobs keep fractions instead of truncating them to zero', () => {

@@ -16,6 +16,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 import { MemoriesRuntime } from '../index.js'
 import { EXTRACT_JSON_SCHEMA, collectWindow, parseExtraction, redactSecrets, runExtraction } from '../extract.js'
+import { normalizeSettings } from '../config.js'
 import { peakDelayMs } from '../schedule.js'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Session } from '@deepseek-ai/dsh-session'
@@ -46,12 +47,16 @@ function fakeLlm(reply: string, seen: { system?: string | undefined; user?: stri
 }
 
 /** A session stand-in with a controllable surface. */
-function stubSession(cwd: string, events: { seq: number; role: 'user' | 'assistant'; text: string; source?: 'user' | 'plugin' }[]): Session {
+function stubSession(
+  cwd: string,
+  events: { seq: number; role: 'user' | 'assistant'; text: string; source?: 'user' | 'plugin' }[],
+  id = 'extract-session',
+): Session {
   const nodes = events.map((event) => event.seq)
   const bySeq = new Map(events.map((event) => [event.seq, event]))
   return {
-    id: 'extract-session',
-    header: { version: 0, id: 'extract-session', createdAt: 0, cwd, isSeeded: false },
+    id,
+    header: { version: 0, id, createdAt: 0, cwd, isSeeded: false },
     surface: { nodes },
     eventAt: (seq: number) => {
       const event = bySeq.get(seq)
@@ -79,6 +84,21 @@ function stubSession(cwd: string, events: { seq: number; role: 'user' | 'assista
       nodes.push(event.seq)
     },
   } as unknown as Session
+}
+
+/**
+ * Grow a stub session mid-test, the way a conversation does.
+ *
+ * The real `Session.append` demands surface placement metadata that a synthetic
+ * event has no source for, so this reaches the stub's own appender — the one
+ * boundary the test itself built.
+ *
+ * @param session - the stub to grow.
+ * @param event - the message to add at the tail.
+ */
+function grow(session: Session, event: { seq: number; role: 'user' | 'assistant'; text: string }): void {
+  const stub = session as unknown as { append: (event: { seq: number; role: 'user' | 'assistant'; text: string }) => void }
+  stub.append(event)
 }
 
 /** A context whose only service is the fake LLM. */
@@ -379,12 +399,7 @@ test('one pass mines at most maxSessionsPerPass sessions, newest first', async (
   const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-cap-'))
   const lines: string[] = []
   /** A session stub under its own id, so the pass has two candidates to choose from. */
-  const sessionWithId = (id: string, text: string): Session => {
-    const session = stubSession(process.cwd(), [{ seq: 1, role: 'user', text }])
-    ;(session as unknown as { id: string }).id = id
-    ;(session.header as unknown as { id: string }).id = id
-    return session
-  }
+  const sessionWithId = (id: string, text: string): Session => stubSession(process.cwd(), [{ seq: 1, role: 'user', text }], id)
   const older = sessionWithId('older-session', 'The older session said something worth remembering.')
   const newer = sessionWithId('newer-session', 'The newer session said something worth remembering.')
   const agents = [older, newer].map((session) => ({
@@ -474,6 +489,107 @@ test('a capped extraction is a reported outcome, not an error the command layer 
   t.after(() => rm(dir, { recursive: true, force: true }))
 })
 
+test('a capped window cools down, and retries the moment the cap it blamed changes', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-cap-cooldown-'))
+  const lines: string[] = []
+  const cooling = stubSession(process.cwd(), [{ seq: 1, role: 'user', text: 'A cooling marker worth remembering.' }], 'cooling-session')
+  const fresh = stubSession(process.cwd(), [{ seq: 1, role: 'user', text: 'A fresh marker worth remembering.' }], 'fresh-session')
+  const agentFor = (session: Session): Agent => ({
+    id: session.id,
+    session,
+    status: 'idle',
+    runMaintenance: (job: (signal: AbortSignal) => Promise<unknown>) => job(new AbortController().signal),
+  }) as unknown as Agent
+  const coolingAgent = agentFor(cooling)
+  const freshAgent = agentFor(fresh)
+  /** Which session each call was spent on, in order. The transcripts name it. */
+  const asked: string[] = []
+  let capTheCoolingOne = true
+  const llm = {
+    stream: (options: { messages: { content: { type: string; text?: string }[] }[] }) => {
+      const transcript = options.messages
+        .map((message) => message.content.filter((block) => block.type === 'text').map((block) => block.text ?? '').join(''))
+        .join('\n')
+      // The cooling session is mined more than once, and a later window no longer
+      // holds the first message — so the fresh session is the one identified by
+      // its text, and everything else is the session under test.
+      const fromFresh = transcript.includes('A fresh marker')
+      asked.push(fromFresh ? 'fresh' : 'cooling')
+      const capped = capTheCoolingOne && !fromFresh
+      return (async function* chunks() {
+        if (capped) {
+          yield textChunk('{"summary":"Cut off before the first memory.')
+          yield { type: 'finish', reason: { kind: 'max-tokens' } } as unknown as StreamChunk
+          return
+        }
+        yield textChunk('{"memories":[{"scope":"project","title":"A fact","body":"A fact.","tags":["x"]}]}')
+        yield stopChunk()
+      })()
+    },
+  }
+  const ctx = {
+    get: (name: string) => {
+      if (name === 'llm') return llm
+      if (name === 'agents') return { roots: () => [coolingAgent, freshAgent] }
+      return undefined
+    },
+    logger: {
+      info: (format: string, ...args: unknown[]) => lines.push(`${format} ${args.join(' ')}`),
+      warn: (format: string, ...args: unknown[]) => lines.push(`${format} ${args.join(' ')}`),
+      debug: (format: string, ...args: unknown[]) => lines.push(`${format} ${args.join(' ')}`),
+    },
+  } as never
+  // The tunables are read live, so this test can change the ceiling the way the
+  // settings page does — no restart, which is the point of the cause field.
+  const settings = normalizeSettings({
+    autoExtract: true,
+    extractMaxOutputTokens: 128,
+    extractTimeoutMs: 5_000,
+    maxSessionsPerPass: 1,
+  })
+  const runtime = new MemoriesRuntime(ctx, { memoriesDir: dir, autoExtract: true }, () => settings)
+  t.after(() => runtime.dispose())
+  // The cooling session is the newer one, so it is the pass's first candidate.
+  runtime.recordActivity(fresh, Date.now() - 60_000)
+  runtime.recordActivity(cooling, Date.now())
+
+  await runtime.runPeriodicPass()
+  assert.deepEqual(asked, ['cooling'], 'the first pass spends the call on the newest session')
+  assert.equal(runtime.state.getSession('cooling-session')?.at ?? 0, 0, 'a capped reply writes no watermark')
+  assert.ok(lines.some((line) => line.includes('the window stays unmined and the next attempt is in')),
+    'the cooldown is announced, with the wait')
+
+  // The per-pass budget is one call, and the capped session is still the first
+  // candidate: if its cooldown did not resolve before the budget, this pass
+  // would spend its only call on the request that just failed and stop.
+  await runtime.runPeriodicPass()
+  assert.deepEqual(asked, ['cooling', 'fresh'], 'the cooled-down session steps aside instead of eating the pass')
+  const cooled = lines.filter((line) => line.startsWith('dsh-memories: extract pass:')).at(-1) ?? ''
+  assert.match(cooled, /capped 1/u, 'the skip is named in the pass line, not silent')
+  assert.doesNotMatch(cooled, /pass-cap/u, 'a skip that costs no model call leaves the budget alone')
+  assert.equal(runtime.state.getSession('cooling-session')?.at ?? 0, 0, 'and the capped window is still unmined')
+
+  // `/memories mine` is a person asking for the call, so the wait does not apply.
+  assert.equal(await runtime.mineNow(coolingAgent), 0, 'the forced path still runs while the window cools down')
+  assert.deepEqual(asked, ['cooling', 'fresh', 'cooling'], 'the caller decided to spend it, so it was spent')
+
+  // Raising the ceiling is the fix the log line asks for; it must end the
+  // cooldown immediately rather than leave the user waiting out 4 hours.
+  capTheCoolingOne = false
+  settings.extractMaxOutputTokens = 8_192
+  await runtime.runPeriodicPass()
+  assert.deepEqual(asked.at(-1), 'cooling', 'a changed cap retires the cooldown')
+  assert.equal(runtime.state.getSession('cooling-session')?.lastSeq, 1, 'and the retried window is mined for real')
+
+  // A completed extraction clears it for good: the next window is mined at the
+  // normal cadence, not held behind the cooldown this session had earned.
+  grow(cooling, { seq: 2, role: 'user', text: 'More worth remembering.' })
+  await runtime.runPeriodicPass()
+  assert.deepEqual(asked.at(-1), 'cooling', 'the state does not outlive the extraction that resolved it')
+  assert.equal(runtime.state.getSession('cooling-session')?.lastSeq, 2, 'and it mines the new window, not a stale one')
+  t.after(() => rm(dir, { recursive: true, force: true }))
+})
+
 test('a reply capped mid-array keeps the memories that were already complete', async () => {
   const session = stubSession(process.cwd(), [{ seq: 1, role: 'user', text: 'Something worth remembering.' }])
   // The reply order the contract asks for: `memories` first, `summary` last. A
@@ -528,12 +644,7 @@ test('the resolved route carries the reasoning level that spends the cap', async
 test('a peak window refuses every session without spending the per-pass budget', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-peak-cap-'))
   const lines: string[] = []
-  const sessionWithId = (id: string): Session => {
-    const session = stubSession(process.cwd(), [{ seq: 1, role: 'user', text: 'Something worth remembering.' }])
-    ;(session as unknown as { id: string }).id = id
-    ;(session.header as unknown as { id: string }).id = id
-    return session
-  }
+  const sessionWithId = (id: string): Session => stubSession(process.cwd(), [{ seq: 1, role: 'user', text: 'Something worth remembering.' }], id)
   const sessions = [sessionWithId('peak-a'), sessionWithId('peak-b')]
   const agents = sessions.map((session) => ({
     id: session.id,
@@ -866,8 +977,7 @@ test('the exit flush still mines what arrived after a periodic pass', async (t) 
   assert.equal(runtime.state.getSession('extract-session')?.lastSeq, 1)
   // The turn continues after the periodic pass, and then the process exits: the
   // flush must look at the content, not at "have we mined this session already".
-  ;(session as unknown as { append: (event: { seq: number; role: 'user'; text: string }) => void })
-    .append({ seq: 2, role: 'user', text: 'Also run tsc before publishing.' })
+  grow(session, { seq: 2, role: 'user', text: 'Also run tsc before publishing.' })
   assert.equal(await runtime.flushExit(5_000), 1, 'new material is not skipped by a per-process flag')
   assert.equal(runtime.state.getSession('extract-session')?.lastSeq, 2)
   t.after(() => rm(dir, { recursive: true, force: true }))

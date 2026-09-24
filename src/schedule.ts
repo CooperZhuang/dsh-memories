@@ -229,3 +229,34 @@ export function formatDelay(ms: number): string {
   const rest = minutes % 60
   return rest === 0 ? `${Math.floor(minutes / 60)}h` : `${Math.floor(minutes / 60)}h${rest}m`
 }
+
+/**
+ * Waits between retries of a session whose extraction reply hit the output cap.
+ *
+ * A capped reply is not a completed extraction, so its window is left unmined
+ * and the next attempt reads it again — that is the whole point, and it is also
+ * the cost: the cause is usually deterministic (the transcript is bigger than
+ * `extractMaxOutputTokens` can describe, or the inherited reasoning level bills
+ * its thinking against the same ceiling), so a retry on the pass cadence would
+ * repeat a full-price call every `extractIntervalMinutes` and never succeed.
+ * Consecutive caps therefore back off geometrically to one attempt per six
+ * hours: a ceiling that is simply too small costs a handful of calls a day, and
+ * a transient cap is still retried within the hour.
+ */
+const CAPPED_BACKOFF_LADDER = [30 * 60_000, 3_600_000, 2 * 3_600_000, 4 * 3_600_000, 6 * 3_600_000]
+
+/**
+ * How long to wait before retrying a window whose reply hit the output cap.
+ *
+ * @param hits - consecutive capped replies for this session, counting this one.
+ * @param intervalMs - the configured pass interval. The wait is never shorter
+ *   than it, so the ladder's first rung cannot undercut a slower cadence the
+ *   user chose deliberately; `0` (periodic checks off) leaves the ladder alone.
+ * @returns milliseconds to wait before the next attempt.
+ */
+export function cappedBackoffMs(hits: number, intervalMs: number): number {
+  const last = CAPPED_BACKOFF_LADDER.length - 1
+  const index = Math.min(Math.max(Math.trunc(hits), 1), last + 1) - 1
+  const rung = CAPPED_BACKOFF_LADDER[index] ?? CAPPED_BACKOFF_LADDER[last] ?? 0
+  return Math.max(intervalMs > 0 ? intervalMs : 0, rung)
+}
