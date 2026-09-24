@@ -188,6 +188,29 @@ dsh plugin --profile web add github:you/dsh-memories
 「活的」——Loader 把它当引用交给插件、设置域把它投影成表单，界面上的写入就地更新那个
 引用（并广播 `loader/volatile-update`），不需要重启或重挂。
 
+### 改什么各自要不要重启（2026-09-23 实测澄清）
+
+判据是「改动落在哪半边」，不是「是否改了文件」：
+
+| 改什么 | 免重启 | 机制 |
+| --- | --- | --- |
+| 可调项（26 个 `volatile` 字段，**含手改本行 YAML**） | ✅ | web profile 的 base bundle 默认带 `hmr` 行（`@deepseek-ai/dsh-hmr`，`disabled: !!js "!ctx.get('profileContext')"`、`root: []`）——`root` 为空时**只监听配置**：profile 与 home 的 patch 文件被精确监听（`awaitWriteFinish` 2s + `debounce` 100ms）→ `reconcileProfilePatches` → Loader 对「只变了 volatile」的行**就地提交**。所以手改 `cordis.patch.yml` 与在设置页保存等价，都不需要重启 |
+| 设置页里保存 | ✅ | `dsh-config-editor` 先按磁盘 patch 同步活树、再原子写文件、再 reconcile（失败回滚），走的是同一条路 |
+| 浏览器半边（`lib/client.js`） | ✅ | `dsh-client-hmr` 轮询各客户端 bundle 的 rev，刷新页面即换新 |
+| **宿主半边代码（`lib/*.js`）** | ❌ 默认 | `hmr` 的 `root: []` 不监听模块，Node 的 ESM 缓存也不会重导入 `apply()` 拿到的模块 |
+| 部署层字段（`memoriesDir`、`projectRootMarkers`…） | ⚠️ 不重启进程，但会**重挂该行** | 非 volatile 变化不满足就地提交条件，该 entry 被重建（插件实例重建：内存定时器与水位线丢失，`~/.dsh/memories` 不受影响） |
+
+想连宿主代码也不重启：`dsh-hmr` 自带完整的模块级 HMR（清 ESM `loadCache` + CJS `require.cache`、按依赖图判定、换 generation 且失败回滚），只是默认关着模块监听。给本插件打开时注意两点——它按 **realpath** 拼模块路径（本插件是指向 `C:\path\to\dsh-memories` 的 symlink，所以真实路径不在 `node_modules` 里，正好躲开默认 `ignored` 的 `**/node_modules`），且 watch root 相对 `ctx.baseUrl` 解析，因此要显式给根：
+
+```yaml
+- id: hmr
+  config:
+    base: C:/path/to
+    root: [dsh-memories/lib]
+```
+
+代价：该改动会**重建插件实例**（等同一次「进程内重启」），且 `dsh-hmr` 把 CLI worker 的依赖树当 externals，动到那里会走 `loader.exit()` 整树重载。日常「改代码 → `npm run build` → 重启 dsh web」几秒钟就完事，HMR 只在需要「当前会话不中断」时才值得开。
+
 | 键 | 默认 | 说明 |
 | --- | --- | --- |
 | `maxSummaryBytes` | `4096` | 注入摘要字节预算；`0` 关闭注入 |
