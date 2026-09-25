@@ -6,17 +6,26 @@
  * `factory(require)`, and mounts the exported plugin (`apply` + `inject`) into
  * the browser Cordis tree.
  *
- * It contributes one surface, the **Memories page** (`settings.section`): it
- * lists, searches, adds, and deletes memories through the Remote namespace the
- * host registers, and it embeds the tunables card at its foot — the entry's own
- * live form, not a second card in the host-plugin configuration list, so
- * everything about this plugin lives on its own page.
+ * It contributes two surfaces, both fed by the same pieces:
+ *
+ *   - the **Memories page** (`settings.section`): it lists, searches, adds, and
+ *     deletes memories through the Remote namespace the host registers, and it
+ *     embeds the tunables card at its foot;
+ *   - the **configuration card** (`plugins.bundle.config`, keyed by the package
+ *     name), since 2026-09-25: the same card, rendered on this bundle's own page
+ *     on the Plugins page, between the description and the rows — where the
+ *     official plugins put their configuration. The card is reused verbatim;
+ *     only its registration is new.
+ *
+ * Both edit the entry's own live form, so the two editors can never disagree.
+ * The page keeps its menu: it is a feature surface, not a configuration menu.
  *
  * Written as plain CJS with `createElement` instead of JSX so the package needs
  * no bundler: the bundle only requires modules the browser already provides
  * (`react`) and reaches every service through Cordis. The parts live in
- * `client/parts/`; `scripts/build-client.mjs` concatenates them in order and
- * injects the host's own wire table.
+ * `client/parts/`; `scripts/build-client.mjs` concatenates them in order,
+ * defines `PACKAGE` (the package name, from `package.json`) and injects the
+ * host's own wire table.
  */
 
 /** Copy for the active locale. */
@@ -66,6 +75,23 @@ function createPlugin(require) {
       label: () => sectionCopy(ctx).label,
       inject: () => ({ api, scope, useSnapshot, copy: sectionCopy(ctx) }),
     }, Section))
+    // The tunables card, mounted a second time on the Plugins page: slot
+    // `plugins.bundle.config`, key = the package name, rendered on this bundle's
+    // own page between its description and its rows. That slot hands **no**
+    // `form` in (unlike `plugins.row.config`), so the registration's inject face
+    // supplies the same shared props the page's own 配置 tab supplies — the same
+    // `scope` and `useSnapshot`, so both editors read one form and write through
+    // one path. The copy is resolved inside the face, like the page's, so a
+    // locale switch is picked up. `PACKAGE` is defined by
+    // `scripts/build-client.mjs`, which also uses it as the bundle id.
+    ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register({
+      name: 'plugins.bundle.config',
+      key: PACKAGE,
+      inject: () => {
+        const copy = sectionCopy(ctx)
+        return { scope, useSnapshot, title: copy.tunables, intro: false, lang: copy.lang }
+      },
+    }, Card))
   }
 
   return { apply, inject: ['slots', 'configForms'] }

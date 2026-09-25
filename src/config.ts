@@ -23,9 +23,9 @@ import { logPath, toLogLevel } from './log.js'
 
 /**
  * Profile entry id owning this plugin, and therefore the key its tunables are
- * addressed by: the Memories page asks for its form as
- * `ctx.configForms.get('memories')`, and a composition row in
- * `cordis.patch.yml` overrides it under the same id.
+ * addressed by: the Memories page and the Plugins-page configuration card both
+ * ask for this form as `ctx.configForms.get('memories')`, and a composition row
+ * in `cordis.patch.yml` overrides it under the same id.
  */
 export const ENTRY_ID = 'memories'
 

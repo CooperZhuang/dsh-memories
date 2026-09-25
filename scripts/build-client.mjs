@@ -24,6 +24,11 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const partsDir = join(root, 'client', 'parts')
 const target = join(root, 'lib', 'client.js')
 
+// The package name is the bundle id AND the `plugins.bundle.config` key the
+// browser half registers its configuration card under (the Plugins page keys
+// that slot by package name). Both read it from here, so they cannot drift.
+const { name: packageName } = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
+
 const parts = readdirSync(partsDir).filter((name) => name.endsWith('.js')).sort()
   .map((name) => ({ name, body: readFileSync(join(partsDir, name), 'utf8') }))
 parts.push({ name: 'index.js', body: readFileSync(join(root, 'client', 'index.js'), 'utf8') })
@@ -31,12 +36,13 @@ parts.push({ name: 'index.js', body: readFileSync(join(root, 'client', 'index.js
 const indent = (text) => text.split('\n').map((line) => (line.length > 0 ? `    ${line}` : line)).join('\n')
 const banner = (name) => `    // ---- client/${name} ----`
 const body = [
+  `    const PACKAGE = ${JSON.stringify(packageName)};`,
   `    const REMOTE_INVOCATION_DATA = ${JSON.stringify(REMOTE_INVOCATION_DATA)};`,
   ...parts.map((part) => `${banner(part.name)}\n${indent(part.body)}`),
 ].join('\n')
 
 const bundle = `window.__ModuleLoader__.load({
-  id: "dsh-memories",
+  id: ${JSON.stringify(packageName)},
   factory: (require) => {
     var module = { exports: {} };
     var exports = module.exports;
