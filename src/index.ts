@@ -21,7 +21,7 @@
  *
  * @module dsh-memories
  */
-import { createUserMessage, isQuotaExceededError, QUOTA_EXCEEDED_CODE } from '@deepseek-ai/dsh-llm'
+import { ACCOUNT_QUOTA_EXCEEDED_CODE, createUserMessage, isQuotaExceededError, QUOTA_EXCEEDED_CODE } from '@deepseek-ai/dsh-llm'
 import { homedir } from 'node:os'
 import { resolve } from 'node:path'
 import type { LlmRuntime, UserMessage } from '@deepseek-ai/dsh-llm'
@@ -881,7 +881,9 @@ export class MemoriesRuntime {
     try {
       for (const message of session.deriveMessages()) {
         if (message.role !== 'user') continue
-        if (message.source.kind === 'plugin') continue
+        // 0.2.0 起 MessageSource 只剩 'user' | 'model' | 'tool' | 'system-prompt'，
+        // 不再有 'plugin'（dsh-llm/lib/types/message.d.ts:19/23/28/103）。原先那句
+        // `source.kind === 'plugin'` 已成为不可能的窄化，TS2367 报错，故删除。
         const blocks = message.content as readonly { type: string; text?: string }[]
         const text = blocks
           .filter((block) => block.type === 'text' && typeof block.text === 'string')
@@ -1124,7 +1126,11 @@ export class MemoriesRuntime {
     if (!this.settings.pauseOnQuotaError) return
     const code = (error as { code?: unknown } | null | undefined)?.code
     const message = error instanceof Error ? error.message : String(error)
-    if (code !== 'RATE_LIMIT' && code !== QUOTA_EXCEEDED_CODE && !isQuotaExceededError(message)) return
+    // 0.2.0 起 dsh-llm 把配额错误拆成两个码：QUOTA_EXCEEDED_CODE="QUOTA"（网关侧）与
+    // ACCOUNT_QUOTA_EXCEEDED_CODE="ACCOUNT_QUOTA"（账号额度用尽）。只比对前者会让「账号额度
+    // 用尽」不再触发暂停与冷却（2026-09-29 对照 0.2.0-rc.1 的 dsh-llm/lib/index.js:138/140 定位）。
+    // 本包 peer 已收紧到 ^0.2.0-rc.1，两个常量都保证存在。
+    if (code !== 'RATE_LIMIT' && code !== QUOTA_EXCEEDED_CODE && code !== ACCOUNT_QUOTA_EXCEEDED_CODE && !isQuotaExceededError(message)) return
     const base = this.settings.quotaCooldownMinutes * 60_000
     const max = Math.max(base, this.settings.quotaCooldownMaxMinutes * 60_000)
     const state = this.state.noteLimitFailure(message.slice(0, 200), base, max)
@@ -2805,11 +2811,19 @@ export function apply(ctx: Context, config: MemoriesConfig = {}): void {
     void runtime.flushExit().catch(() => undefined)
   })
 
-  ctx.on('agent/session-start', ({ agent, source }: { agent: Agent; source: SessionStartSource }) => {
+  // 0.1.7-rc.1 起宿主把 `agent/session-start` 改名为 `agent/created`（公告见 v0.1.7-rc.1
+  // release notes）。payload 形状不变，仍是 `{ agent, source }`，`source` 取值同为
+  // 'startup' | 'resume' | 'clear' | 'compact'（0.2.0-rc.1 dsh-agent/lib/types/runtime-types.d.ts:105/229）。
+  // 旧名在 0.1.7-alpha.2 / 0.2.0-rc.1 里都不存在 → 原监听器是死代码，clear/compact 后
+  // 不会重置注入状态。2026-09-29 用 tsc 对照真实 0.2.0 类型（TS2345）定位。
+  ctx.on('agent/created', ({ agent, source }: { agent: Agent; source: SessionStartSource }): undefined => {
     // `clear`/`compact` replace the conversation, so the summary the model saw
     // is gone: forget it and let the next pre-step re-inject. Fresh and resumed
     // sessions need no work here — the first step of the first turn injects.
     if (source === 'clear' || source === 'compact') runtime.resetInjection(agent.session)
+    // 返回 undefined（而不是 void）：0.2.0 的 'agent/created' 监听器签名要求
+    // `Promise<undefined> | undefined`，隐式 void 会报 TS2345。
+    return undefined
   })
 
   ctx.on('agent/pre-step', async ({ agent }, next) => {

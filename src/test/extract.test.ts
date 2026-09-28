@@ -940,19 +940,22 @@ test('the periodic timer actually runs a pass', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-periodic-timer-'))
   const session = stubSession(process.cwd(), [{ seq: 1, role: 'user', text: 'We always ship with pnpm run ship.' }])
   const reply = '{"memories":[{"scope":"project","title":"Deploy with pnpm run ship","body":"Ship it.","tags":[]}]}'
-  // 0.02 minutes ≈ 1.2s: fractional intervals are kept, which is what makes this
-  // testable without waiting half an hour.
+  // 0.01 minutes = 600ms: fractional intervals are kept, which is what makes this
+  // testable without waiting half an hour. 2026-09-29 实测：原来的 0.02min(1200ms) 配
+  // 1600ms 等待，在整套 259 个测试并发跑时会偶发不触发（单独跑 3/3 稳定通过）——
+  // 属于负载敏感的 flake，不是功能回归。改成 600ms 周期 + 2400ms 等待（4 个周期），
+  // 判定逻辑不变，只把余量从 400ms 拉到约 1.8s。
   const runtime = new MemoriesRuntime(stubContext(fakeLlm(reply)), {
     memoriesDir: dir,
     autoExtract: true,
-    extractIntervalMinutes: 0.02,
+    extractIntervalMinutes: 0.01,
     extractTimeoutMs: 5_000,
   })
   t.after(() => runtime.dispose())
   runtime.scheduleExtraction(idleAgent(session))
   runtime.startPeriodicExtraction()
 
-  await new Promise((settle) => setTimeout(settle, 1_600))
+  await new Promise((settle) => setTimeout(settle, 2_400))
   assert.equal(runtime.state.getSession('extract-session')?.lastSeq, 1, 'the interval fired')
   runtime.stopPeriodicExtraction()
   t.after(() => rm(dir, { recursive: true, force: true }))
