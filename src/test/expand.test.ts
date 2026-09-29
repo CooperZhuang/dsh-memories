@@ -11,7 +11,7 @@
  */
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { EXPAND_FACTOR, EXPAND_MAX, EXPAND_WEIGHT_FULL, relatedHits, searchMemories } from '../search.js'
+import { EXPAND_FACTOR, EXPAND_MAX, relatedHits, searchMemories } from '../search.js'
 import { renderHit } from '../render.js'
 import type { MemoryEntry, MemoryKind } from '../types.js'
 import type { ScopeEntries } from '../search.js'
@@ -69,25 +69,19 @@ test('an unexpanded search returns only what matched', () => {
   assert.deepEqual(searchMemories(GROUPS, '状态库', { now: NOW, limit: 10 }).map((hit) => hit.entry.id), ['state-db'])
 })
 
-test('every related hit ranks below every direct hit, at the documented fraction', () => {
+test('every related hit ranks below every direct hit', () => {
+  // The search surface orders by relevance, so this compares *places* rather
+  // than numbers: the hop's exact value is asserted where it is computed, on
+  // `relatedHits`, whose seeds carry explicit scores.
   const hits = searchMemories(GROUPS, '状态库', { expand: true, now: NOW, limit: 10 })
   const direct = hits.filter((hit) => hit.via === undefined)
   const related = hits.filter((hit) => hit.via !== undefined)
-  assert.equal(direct.length, 1)
+  assert.deepEqual(direct.map((hit) => hit.entry.id), ['state-db'])
   assert.ok(related.length > 0)
-  const weakestDirect = Math.min(...direct.map((hit) => hit.score))
-  for (const hit of related) {
-    assert.ok(hit.score < weakestDirect, 'a hop can fill a slot, never take one')
-    assert.equal(hit.via, 'state-db', 'the seed it came from is reported')
-  }
-  // Two shared links, but not equally informative: `state.db` is on 4 of the 16
-  // entries (the seed, both neighbours and the one that shares only that key)
-  // and `sqlite` on 3. Worth (1 - 4/16) + (1 - 3/16), so the hop earns 1.5625/2
-  // of the allowance. A link on most of the scope would have been worth nothing.
-  const two = related.find((hit) => hit.entry.id === 'leases')
-  assert.ok(two !== undefined)
-  const expected = weakestDirect * EXPAND_FACTOR * (((1 - 4 / 16) + (1 - 3 / 16)) / EXPAND_WEIGHT_FULL)
-  assert.ok(Math.abs(two.score - expected) < 1e-9, `${two.score} != ${expected}`)
+  const lastDirect = hits.findLastIndex((hit) => hit.via === undefined)
+  const firstRelated = hits.findIndex((hit) => hit.via !== undefined)
+  assert.ok(firstRelated > lastDirect, `a hop came before a direct hit: ${hits.map((hit) => `${hit.entry.id}${hit.via === undefined ? '' : '*'}`).join(', ')}`)
+  for (const hit of related) assert.equal(hit.via, 'state-db', 'the seed it came from is reported')
 })
 
 test('a link on most of the scope is not an edge', () => {
@@ -162,9 +156,11 @@ test('a hop is scored from the seed that lit it up, not from the weakest seed', 
 })
 
 test('a weak direct hit is upgraded by the hop, and never marked as a hop', () => {
-  // The eval found this too: the eighth direct hit is exactly the entry a hop
-  // can lift, and "already a direct hit" must not disqualify it — but it did
-  // match the query, so it must not be labelled `via` either.
+  // The eval found this: the eighth direct hit is exactly the entry a hop can
+  // lift, and "already a direct hit" must not disqualify it — but it did match
+  // the query, so it must not be labelled `via` either. The lift is asserted on
+  // the number (`relevance`), because whether it also changes the *place*
+  // depends on who else is in the corpus.
   const keys = ['k1', 'k2', 'k3', 'k4']
   const seed = entry('seed', '状态库放在哪里', '状态库的位置记在这里。', { keys })
   const weakHit = entry('weak-hit', '另有一条', '正文里提了一句状态库。', { keys })
@@ -178,8 +174,6 @@ test('a weak direct hit is upgraded by the hop, and never marked as a hop', () =
   const before = plain.find((hit) => hit.entry.id === 'weak-hit')
   const after = expanded.find((hit) => hit.entry.id === 'weak-hit')
   assert.ok(before !== undefined && after !== undefined)
-  assert.ok(after.score > before.score, 'the hop lifted an entry the query matched only weakly')
+  assert.ok((after.relevance ?? 0) > (before.relevance ?? 0), `the hop did not lift it: ${before.relevance} -> ${after.relevance}`)
   assert.equal(after.via, undefined, 'it matched the query, so it is not a hop result')
-  const seedScore = expanded.find((hit) => hit.entry.id === 'seed')?.score ?? 0
-  assert.equal(after.score, seedScore * EXPAND_FACTOR, 'four shared links earn the full allowance')
 })

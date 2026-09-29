@@ -295,6 +295,17 @@ export interface MemoryHit {
    * does not match must never be presented as one that does.
    */
   readonly via?: string
+  /**
+   * The lexical half of the number: how well the words match, before the
+   * attention model.
+   *
+   * `score` is the other half — relevance weighted by importance and recency —
+   * and the two surfaces order by different halves on purpose: a search answers
+   * a question and ranks by this one, the injector volunteers memories nobody
+   * asked for and ranks by `score`. Set by `searchMemories`; absent on hits from
+   * `browseMemories`, where the query is empty and neither number means anything.
+   */
+  readonly relevance?: number
 }
 
 /** The source this plugin stamps on every message it injects. */

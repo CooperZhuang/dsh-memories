@@ -57,7 +57,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseEntry } from '../lib/storage.js'
-import { matchCredit, scoreEntry, searchMemories } from '../lib/search.js'
+import { matchCredit, relevanceOf, scoreEntry, searchMemories } from '../lib/search.js'
 
 /**
  * The recall gate's defaults, as `settings.yaml` ships them.
@@ -115,6 +115,35 @@ function rank(groups, query, config, limit, now) {
     }
   }
   hits.sort((left, right) => right.score - left.score
+    || right.entry.updatedAt - left.entry.updatedAt
+    || left.entry.title.localeCompare(right.entry.title))
+  return hits.slice(0, limit)
+}
+
+/**
+ * Rank by lexical relevance alone, with the usual score only as a tie-break.
+ *
+ * The extra column exists to answer one question with a number instead of an
+ * argument: when a memory the turn is *about* loses, is it losing on the words
+ * or on `importance × decay`? The two are multiplied into one number everywhere
+ * in the plugin, so a loss cannot be attributed by reading the output — and the
+ * answer decides whether the fix belongs in the scorer (risky, store-wide) or in
+ * the search surface's ordering (bounded).
+ *
+ * Cheap to compute here and nowhere else: it needs no schema, no knob, and no
+ * production behaviour change to be worth knowing.
+ */
+function rankByRelevance(groups, query, limit, now) {
+  const hits = []
+  for (const group of groups) {
+    for (const entry of group.entries) {
+      const relevance = relevanceOf(entry, query)
+      if (relevance <= 0) continue
+      hits.push({ entry, relevance, score: scoreEntry(entry, query, now) })
+    }
+  }
+  hits.sort((left, right) => right.relevance - left.relevance
+    || right.score - left.score
     || right.entry.updatedAt - left.entry.updatedAt
     || left.entry.title.localeCompare(right.entry.title))
   return hits.slice(0, limit)
@@ -178,6 +207,18 @@ for (const probe of probes) {
       : mode === 'first' ? at[0] === 1 : at.every((index) => index !== undefined)
     ranked[config.name] = { ids, at, ok }
   }
+  // Would ranking by the words alone have found it? This separates "the retriever
+  // cannot see it" from "the retriever sees it and the attention model outvotes
+  // it", which is the difference between a scoring bug and a scoring policy.
+  const byRelevance = rankByRelevance(groups, probe.query, top, now).map((hit) => hit.entry.id)
+  const relevanceAt = wanted.map((id) => {
+    const index = byRelevance.indexOf(id)
+    return index < 0 ? undefined : index + 1
+  })
+  const relevanceOk = wanted.length === 0
+    ? true
+    : mode === 'first' ? relevanceAt[0] === 1 : relevanceAt.every((index) => index !== undefined)
+  ranked.relevance = { ids: byRelevance, at: relevanceAt, ok: relevanceOk }
   // The premise of a hop probe, stated operationally: lexical retrieval alone
   // does NOT return the expected entry in the top N. Exact zero relevance would
   // be the wrong test — a memory that shares one word and lands at rank 40 is
@@ -200,12 +241,14 @@ for (const probe of probes) {
     return { id, about: credit.about, relevance: credit.relevance, terms: credit.evidence.strongTerms }
   })
   const reachable = gate.length > 0 && gate.every((item) => item.about)
-  const bucket = perShape.get(probe.shape) ?? { total: 0, lexical: 0, time: 0, full: 0, gate: 0 }
+  const bucket = perShape.get(probe.shape) ?? { total: 0, lexical: 0, time: 0, full: 0, gate: 0, relevance: 0 }
   bucket.total += 1
   if (reachable) bucket.gate = (bucket.gate ?? 0) + 1
+  if (ranked.relevance.ok) bucket.relevance = (bucket.relevance ?? 0) + 1
   for (const config of CONFIGS) if (ranked[config.name].ok) bucket[config.name] += 1
   perShape.set(probe.shape, bucket)
-  console.log(`· ${String(probe.id).padEnd(16)} ${String(probe.shape).padEnd(10)} ${marks.join('  ')}  gate:${reachable ? '✓' : '✗'}   ${JSON.stringify(probe.query)}`)
+  const relevanceMark = `  byword:${ranked.relevance.ok ? '✓' : '✗'}`
+  console.log(`· ${String(probe.id).padEnd(16)} ${String(probe.shape).padEnd(10)} ${marks.join('  ')}${relevanceMark}  gate:${reachable ? '✓' : '✗'}   ${JSON.stringify(probe.query)}`)
   if (probe.note !== undefined) console.log(`    why: ${probe.note}`)
   if (gate.length > 0) {
     console.log(`    recall gate: ${gate.map((item) => `${item.id.slice(0, 24)} about=${item.about} rel=${item.relevance.toFixed(1)} terms=${item.terms}`).join('; ')}`)
@@ -221,12 +264,13 @@ const sum = [...perShape.values()].reduce((acc, bucket) => ({
   time: acc.time + bucket.time,
   full: acc.full + bucket.full,
   gate: (acc.gate ?? 0) + (bucket.gate ?? 0),
-}), { total: 0, lexical: 0, time: 0, full: 0, gate: 0 })
+  relevance: (acc.relevance ?? 0) + (bucket.relevance ?? 0),
+}), { total: 0, lexical: 0, time: 0, full: 0, gate: 0, relevance: 0 })
 console.log('\nper shape (ok / total)')
 for (const [shape, bucket] of perShape) {
-  console.log(`  ${shape.padEnd(10)} lexical ${bucket.lexical}/${bucket.total}   time ${bucket.time}/${bucket.total}   full ${bucket.full}/${bucket.total}   gate ${bucket.gate ?? 0}/${bucket.total}`)
+  console.log(`  ${shape.padEnd(10)} lexical ${bucket.lexical}/${bucket.total}   time ${bucket.time}/${bucket.total}   full ${bucket.full}/${bucket.total}   byword ${bucket.relevance ?? 0}/${bucket.total}   gate ${bucket.gate ?? 0}/${bucket.total}`)
 }
-console.log(`  ${'ALL'.padEnd(10)} lexical ${sum.lexical}/${sum.total}   time ${sum.time}/${sum.total}   full ${sum.full}/${sum.total}   gate ${sum.gate ?? 0}/${sum.total}`)
+console.log(`  ${'ALL'.padEnd(10)} lexical ${sum.lexical}/${sum.total}   time ${sum.time}/${sum.total}   full ${sum.full}/${sum.total}   byword ${sum.relevance ?? 0}/${sum.total}   gate ${sum.gate ?? 0}/${sum.total}`)
 console.log(`\nstore: ${[...cache.entries()].map(([scope, list]) => `${scope}=${list.length}`).join('  ')}`)
 
 // How much material the hop actually has. A scope whose entries share two links

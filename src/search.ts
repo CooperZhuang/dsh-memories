@@ -600,10 +600,32 @@ export function timeBoost(entry: MemoryEntry, range: TimeRange | undefined): num
  * @returns a non-negative score; `0` means the entry does not match.
  */
 export function scoreEntry(entry: MemoryEntry, query: string, now = Date.now(), range?: TimeRange | null): number {
+  return rankEntry(entry, query, now, range).score
+}
+
+/**
+ * Both halves of one entry's number: what it matches, and what it deserves.
+ *
+ * They are multiplied together everywhere else, which makes a loss impossible to
+ * attribute by reading the output — and the two surfaces want opposite orders.
+ * Measured on the real store, ranking by `relevance` alone puts the expected
+ * entry in the top eight for **every** probe (7/7), while the multiplied score
+ * manages 5/7: 「怎么给 dsh 插件加日志才看得到」 loses to eight heavily-read
+ * explicit memories that share the word `dsh`, which 100 of the scope's 176
+ * entries carry. A caller that asked a *question* wants the first; a caller
+ * deciding what to volunteer unasked wants the second.
+ *
+ * @param entry - candidate entry.
+ * @param query - raw user/model query.
+ * @param now - clock used for the decay.
+ * @param range - the turn's time window, or `undefined` to resolve it.
+ * @returns relevance (`0` when the entry does not match) and the attention score.
+ */
+export function rankEntry(entry: MemoryEntry, query: string, now = Date.now(), range?: TimeRange | null): { relevance: number; score: number } {
   const relevance = relevanceOf(entry, query)
-  if (relevance === 0) return 0
+  if (relevance === 0) return { relevance: 0, score: 0 }
   const window = range === undefined ? parseTimeRange(query, now) : range ?? undefined
-  return relevance * importanceOf(entry) * decayOf(entry, now) * timeBoost(entry, window)
+  return { relevance, score: relevance * importanceOf(entry) * decayOf(entry, now) * timeBoost(entry, window) }
 }
 
 /**
@@ -966,7 +988,7 @@ export interface ScopeEntries {
  * @param groups - per-scope entry lists, broadest first.
  * @param query - raw query; empty returns nothing.
  * @param options - scope, tag, and limit filters.
- * @returns hits ordered by descending score.
+ * @returns hits ordered by descending relevance, the attention score breaking ties.
  */
 export function searchMemories(
   groups: readonly ScopeEntries[],
@@ -979,20 +1001,34 @@ export function searchMemories(
   const wantedKinds = options.kinds
   const now = options.now ?? Date.now()
   const window = parseTimeRange(query, now)
-  const hits: MemoryHit[] = []
+  // The search surface orders by the WORDS, not by the attention model. The
+  // caller asked a question; the entry that matches it best is the answer, and
+  // an entry that merely gets read a lot is not. Measured on the real store:
+  // ordering by relevance puts the expected entry in the top eight for 7 of 7
+  // probes, the multiplied score for 5 of 7 — the difference is entirely
+  // 「怎么给 dsh 插件加日志才看得到」 losing to eight tool-written notes that
+  // share `dsh` (100 of 176 entries) and have been read five times each.
+  //
+  // The injector keeps the opposite order on purpose: it volunteers memories
+  // nobody asked for, and there the track record is the point. Both numbers are
+  // computed here, so neither surface has to guess.
+  const hits: (MemoryHit & { readonly relevance: number })[] = []
   for (const group of groups) {
     if (wantedScopes !== undefined && !wantedScopes.includes(group.scope)) continue
     for (const entry of group.entries) {
       if (wantedKinds !== undefined && !wantedKinds.includes(entry.kind)) continue
       if (wantedTags.length > 0 && !wantedTags.every((tag) => entry.tags.includes(tag))) continue
-      const score = scoreEntry(entry, query, now, window)
-      if (score <= 0) continue
-      hits.push({ entry, score })
+      const { relevance, score } = rankEntry(entry, query, now, window)
+      if (relevance <= 0) continue
+      hits.push({ entry, score, relevance })
     }
   }
-  hits.sort((left, right) => right.score - left.score
+  const byWords = (left: MemoryHit & { readonly relevance: number }, right: MemoryHit & { readonly relevance: number }): number =>
+    right.relevance - left.relevance
+    || right.score - left.score
     || right.entry.updatedAt - left.entry.updatedAt
-    || left.entry.title.localeCompare(right.entry.title))
+    || left.entry.title.localeCompare(right.entry.title)
+  hits.sort(byWords)
   if (options.expand !== true) return hits.slice(0, limit)
   // One hop, never two: a second hop from a guess is a different guess.
   //
@@ -1003,29 +1039,48 @@ export function searchMemories(
   // could never reach the case it exists for), and excluding the top `limit`
   // (the eighth direct hit is exactly the entry a hop can lift; its rank went
   // 8 → 9, the one entry that would have benefited being the one removed).
+  //
+  // The seeds are handed over in RELEVANCE units, because that is the currency
+  // this surface ranks in: a hop scored against the seed's attention score would
+  // be sorting apples against oranges. The injector passes attention scores
+  // instead, for the same reason.
   const seeds = hits.slice(0, EXPAND_SEEDS)
-  const related = relatedHits(groups, seeds, { ...options, limit: EXPAND_MAX, exclude: new Set(seeds.map((hit) => hit.entry.id)) })
-  // An entry the query did match keeps its own score when that is the higher
+  const related = relatedHits(groups, seeds.map((hit) => ({ entry: hit.entry, score: hit.relevance })), {
+    ...options,
+    limit: EXPAND_MAX,
+    exclude: new Set(seeds.map((hit) => hit.entry.id)),
+  })
+  // An entry the query did match keeps its own relevance when that is the higher
   // one, and never carries `via`: it matched, and saying otherwise would be a
   // lie about the one thing the marker exists to state.
   const directById = new Map(hits.map((hit) => [hit.entry.id, hit]))
-  const merged: MemoryHit[] = [...hits]
+  const merged: (MemoryHit & { readonly relevance: number })[] = [...hits]
   for (const hit of related) {
     const direct = directById.get(hit.entry.id)
-    if (direct === undefined) merged.push(hit)
-    else if (hit.score > direct.score) merged.push({ entry: direct.entry, score: hit.score })
+    // A hop ranks in word units too (`hit.score`), but reports an attention
+    // score like every other hit: `score` means one thing on every row, and the
+    // row's *place* is decided by the other number.
+    const attention = hit.score * importanceOf(hit.entry) * decayOf(hit.entry, now)
+    if (direct === undefined) {
+      merged.push({
+        entry: hit.entry,
+        score: attention,
+        relevance: hit.score,
+        ...hit.via === undefined ? {} : { via: hit.via },
+      })
+    } else if (hit.score > direct.relevance) {
+      merged.push({ entry: direct.entry, score: direct.score, relevance: hit.score })
+    }
   }
   // Keep the best record per id. The direct list comes first, so keeping the
   // first occurrence would silently discard every upgrade — which is exactly
   // what the first version of this did, and what the eval caught.
-  const unique = new Map<string, MemoryHit>()
+  const unique = new Map<string, MemoryHit & { readonly relevance: number }>()
   for (const hit of merged) {
     const previous = unique.get(hit.entry.id)
-    if (previous === undefined || hit.score > previous.score) unique.set(hit.entry.id, hit)
+    if (previous === undefined || hit.relevance > previous.relevance) unique.set(hit.entry.id, hit)
   }
-  return [...unique.values()].sort((left, right) => right.score - left.score
-    || right.entry.updatedAt - left.entry.updatedAt
-    || left.entry.title.localeCompare(right.entry.title)).slice(0, limit)
+  return [...unique.values()].sort(byWords).slice(0, limit)
 }
 
 /**
