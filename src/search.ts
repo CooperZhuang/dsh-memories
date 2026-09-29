@@ -805,6 +805,30 @@ export const EXPAND_MIN_SHARED = 2
  */
 export const EXPAND_FACTOR = 0.4
 
+/**
+ * Share of a scope that may carry a link before it stops being an edge.
+ *
+ * A key or tag on more than half the entries is the scope's own name, not a
+ * relationship: in the plugin's own project scope `dsh-memories` sits on 22 of
+ * 29 entries, and `--links` measured 18 of that scope's 48 hop-able pairs
+ * sharing nothing but such links (against 0 of 785 in the global scope). Those
+ * hops fired, scored like real ones, and carried no information. Ignoring the
+ * ubiquitous links removes them without a rarity threshold that would have
+ * silently disabled the mechanism in small scopes, where every link looks
+ * common because the scope has four entries.
+ */
+export const EXPAND_GENERIC_SHARE = 0.5
+
+/**
+ * The link information that earns the full allowance.
+ *
+ * Two, because that is what two wholly specific links are worth (`1 - 1/N` each
+ * in a scope of any size). A hop backed by one rare alias and one common tag
+ * lands around half; a hop backed by two broad tags lands at a quarter and
+ * stays behind everything else.
+ */
+export const EXPAND_WEIGHT_FULL = 2
+
 /** Most related entries one search may add. */
 export const EXPAND_MAX = 3
 
@@ -840,7 +864,7 @@ function linksOf(entry: MemoryEntry): Set<string> {
  * @param groups - per-scope entry lists, broadest first.
  * @param seeds - the direct hits whose links are followed.
  * @param options - the same filters as {@link searchMemories}, plus the ids to
- *   exclude (the direct hits themselves, and anything already shown this session).
+ *   exclude (the seeds themselves: an entry is not its own neighbour).
  * @returns related hits, strongest first, with the seed each came from.
  */
 export function relatedHits(
@@ -854,6 +878,27 @@ export function relatedHits(
   const wantedTags = (options.tags ?? []).map((tag) => tag.toLowerCase())
   const wantedKinds = options.kinds
   const exclude = options.exclude ?? new Set<string>()
+  // How many entries carry each link, over exactly the entries this search can
+  // see. One pass, and it is what turns "shared two links" into "shares two
+  // links that mean something here": `dsh-memories` on 22 of 29 entries is the
+  // scope's own name, and a hop built on it carries nothing.
+  const carried = new Map<string, number>()
+  let considered = 0
+  for (const group of groups) {
+    if (wantedScopes !== undefined && !wantedScopes.includes(group.scope)) continue
+    for (const entry of group.entries) {
+      if (wantedKinds !== undefined && !wantedKinds.includes(entry.kind)) continue
+      if (wantedTags.length > 0 && !wantedTags.every((tag) => entry.tags.includes(tag))) continue
+      considered += 1
+      for (const link of linksOf(entry)) carried.set(link, (carried.get(link) ?? 0) + 1)
+    }
+  }
+  /** A ubiquitous link is not an edge; a rare one is worth nearly all of itself. */
+  const information = (link: string): number => {
+    if (considered <= 0) return 0
+    const share = (carried.get(link) ?? 0) / considered
+    return share > EXPAND_GENERIC_SHARE ? 0 : 1 - share
+  }
   const links = seeds.map((seed) => ({ id: seed.entry.id, score: seed.score, words: linksOf(seed.entry) }))
   const best = new Map<string, { entry: MemoryEntry; score: number; shared: number; via: string }>()
   for (const group of groups) {
@@ -865,23 +910,33 @@ export function relatedHits(
       const own = linksOf(entry)
       if (own.size === 0) continue
       let shared = 0
+      let weight = 0
       let via = ''
       let from = 0
       for (const seed of links) {
         let here = 0
-        for (const word of own) if (seed.words.has(word)) here += 1
-        // The strongest seed that links here is the one that lights it up. Ties
-        // keep the earlier (better-ranked) seed.
-        if (here > shared || (here === shared && here > 0 && seed.score > from)) {
+        let hereWeight = 0
+        for (const word of own) {
+          if (!seed.words.has(word)) continue
+          const value = information(word)
+          if (value <= 0) continue
+          here += 1
+          hereWeight += value
+        }
+        // The seed that lights this entry up is the one carrying the most
+        // information into it; ties keep the better-ranked seed.
+        if (hereWeight > weight || (hereWeight === weight && here > shared && here > 0)) {
           shared = here
+          weight = hereWeight
           via = seed.id
           from = seed.score
         }
       }
       if (shared < EXPAND_MIN_SHARED) continue
-      // Two shared links earn half the allowance, four or more earn all of it:
-      // a hop backed by two aliases is a hint, one backed by four is a filing.
-      const score = from * EXPAND_FACTOR * Math.min(1, shared / (EXPAND_MIN_SHARED * 2))
+      // Two fully specific links earn half the allowance, four or more earn all
+      // of it; a pair of broad tags lands at a quarter and stays behind every
+      // entry the turn actually matched.
+      const score = from * EXPAND_FACTOR * Math.min(1, weight / EXPAND_WEIGHT_FULL)
       const previous = best.get(entry.id)
       if (previous === undefined || score > previous.score) best.set(entry.id, { entry, score, shared, via })
     }

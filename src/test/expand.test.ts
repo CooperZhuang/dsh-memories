@@ -11,7 +11,7 @@
  */
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { EXPAND_FACTOR, EXPAND_MAX, relatedHits, searchMemories } from '../search.js'
+import { EXPAND_FACTOR, EXPAND_MAX, EXPAND_WEIGHT_FULL, relatedHits, searchMemories } from '../search.js'
 import { renderHit } from '../render.js'
 import type { MemoryEntry, MemoryKind } from '../types.js'
 import type { ScopeEntries } from '../search.js'
@@ -44,7 +44,17 @@ const SEED = entry('state-db', 'SQLite 状态库在哪', '状态库放在 DSH_HO
 const NEIGHBOUR = entry('leases', '任务租约与水位线', '水位线和任务租约都记在那个库里，重启后仍然有效。', { keys: ['state.db', 'sqlite'], updatedAt: NOW - 3_600_000 })
 const NEIGHBOUR_BY_TAG = entry('watermarks', '后台抽取的水位线', '每个会话一条水位线，记录抽到哪一条消息。', { tags: ['state.db', 'sqlite'] })
 const WEAK_LINK = entry('weak', '只共用一个 key 的记忆', '它只提到那个库一次。', { keys: ['state.db'] })
-const GROUPS: readonly ScopeEntries[] = [{ scope: 'global', label: 'global', entries: [SEED, NEIGHBOUR, NEIGHBOUR_BY_TAG, WEAK_LINK] }]
+/**
+ * Entries carrying links of their own and nothing else.
+ *
+ * They exist to give the corpus a realistic size. A link is only an edge when
+ * it is not on most of the scope, and a four-entry corpus makes every link look
+ * ubiquitous — which is the real behaviour, measured, not a test artefact: a
+ * link on 3 of 4 entries really does mean nothing.
+ */
+const FILLERS: readonly MemoryEntry[] = Array.from({ length: 12 }, (_, index) =>
+  entry(`filler-${index}`, `无关条目 ${index}`, '另一件事的正文。', { keys: [`unique-${index}`] }))
+const GROUPS: readonly ScopeEntries[] = [{ scope: 'global', label: 'global', entries: [SEED, NEIGHBOUR, NEIGHBOUR_BY_TAG, WEAK_LINK, ...FILLERS] }]
 
 test('a hop needs two shared links, not one', () => {
   const hits = searchMemories(GROUPS, '状态库', { expand: true, now: NOW, limit: 10 })
@@ -70,10 +80,31 @@ test('every related hit ranks below every direct hit, at the documented fraction
     assert.ok(hit.score < weakestDirect, 'a hop can fill a slot, never take one')
     assert.equal(hit.via, 'state-db', 'the seed it came from is reported')
   }
-  // Two shared links is the weakest hop: half the allowance.
+  // Two shared links, but not equally informative: `state.db` is on 4 of the 16
+  // entries (the seed, both neighbours and the one that shares only that key)
+  // and `sqlite` on 3. Worth (1 - 4/16) + (1 - 3/16), so the hop earns 1.5625/2
+  // of the allowance. A link on most of the scope would have been worth nothing.
   const two = related.find((hit) => hit.entry.id === 'leases')
   assert.ok(two !== undefined)
-  assert.ok(Math.abs(two.score - weakestDirect * EXPAND_FACTOR * 0.5) < 1e-9)
+  const expected = weakestDirect * EXPAND_FACTOR * (((1 - 4 / 16) + (1 - 3 / 16)) / EXPAND_WEIGHT_FULL)
+  assert.ok(Math.abs(two.score - expected) < 1e-9, `${two.score} != ${expected}`)
+})
+
+test('a link on most of the scope is not an edge', () => {
+  // The measured case: in the plugin's own project scope `dsh-memories` sits on
+  // 22 of 29 entries, and 18 of its 48 hop-able pairs shared nothing but such
+  // links. Here the seed and its neighbour share two links that everything else
+  // carries too, so the hop must not happen at all.
+  const everywhere = ['common-a', 'common-b']
+  const corpus: MemoryEntry[] = [
+    entry('seed', '状态库在哪', '状态库放在这里。', { keys: everywhere }),
+    entry('neighbour', '另一条', '也说到了状态库。', { keys: everywhere }),
+    ...Array.from({ length: 6 }, (_, index) => entry(`filler-${index}`, `无关 ${index}`, '无关正文。', { keys: everywhere })),
+  ]
+  const groups: readonly ScopeEntries[] = [{ scope: 'global', label: 'global', entries: corpus }]
+  const hits = searchMemories(groups, '状态库', { expand: true, now: NOW, limit: 10 })
+  assert.ok(hits.every((hit) => hit.via === undefined), 'no hop fired')
+  assert.ok(hits.some((hit) => hit.entry.id === 'neighbour'), 'the other direct match is still there')
 })
 
 test('expansion never grows the result past the limit', () => {
@@ -81,7 +112,7 @@ test('expansion never grows the result past the limit', () => {
   for (let index = 0; index < 6; index += 1) {
     crowded.push(entry(`n${index}`, `邻居 ${index}`, '同样是那个库的记录。', { keys: ['state.db', 'sqlite'] }))
   }
-  const groups: readonly ScopeEntries[] = [{ scope: 'global', label: 'global', entries: crowded }]
+  const groups: readonly ScopeEntries[] = [{ scope: 'global', label: 'global', entries: [...crowded, ...FILLERS] }]
   const hits = searchMemories(groups, '状态库', { expand: true, now: NOW, limit: 10 })
   assert.equal(hits.length, 1 + EXPAND_MAX)
 })
@@ -89,7 +120,7 @@ test('expansion never grows the result past the limit', () => {
 test('expansion respects the scope and kind filters it was given', () => {
   const projectCopy = entry('project-lease', '项目里的租约', '同样的东西，不同的作用域。', { scope: 'project', keys: ['state.db', 'sqlite'] })
   const groups: readonly ScopeEntries[] = [
-    { scope: 'global', label: 'global', entries: [SEED, NEIGHBOUR] },
+    { scope: 'global', label: 'global', entries: [SEED, NEIGHBOUR, ...FILLERS] },
     { scope: 'project', label: 'project:x', entries: [projectCopy] },
   ]
   const scoped = searchMemories(groups, '状态库', { expand: true, now: NOW, limit: 10, scopes: ['global'] })

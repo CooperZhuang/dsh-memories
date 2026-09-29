@@ -209,18 +209,24 @@ if (flags.links !== undefined) {
     const frequency = new Map()
     for (const entry of entries) for (const link of linksOf(entry)) frequency.set(link, (frequency.get(link) ?? 0) + 1)
     const generic = new Set([...frequency.entries()].filter(([, count]) => count > entries.length * 0.2).map(([link]) => link))
+    // A link on more than half the scope is the scope's own name, not an edge —
+    // the rule the hop now applies. Counting both ways shows how much of the
+    // graph was noise before it.
+    const ubiquitous = new Set([...frequency.entries()].filter(([, count]) => count > entries.length * 0.5).map(([link]) => link))
     let pairs = 0
     let genericPairs = 0
+    let firingPairs = 0
     for (let left = 0; left < entries.length; left += 1) {
       for (let right = left + 1; right < entries.length; right += 1) {
         const shared = [...linksOf(entries[left])].filter((link) => linksOf(entries[right]).has(link))
         if (shared.length < 2) continue
         pairs += 1
         if (shared.every((link) => generic.has(link))) genericPairs += 1
+        if (shared.filter((link) => !ubiquitous.has(link)).length >= 2) firingPairs += 1
       }
     }
     const worst = [...frequency.entries()].sort((left, right) => right[1] - left[1]).slice(0, 4)
-    console.log(`  ${scope}: ${entries.length} entries, ${pairs} hop-able pairs, ${genericPairs} of them on generic links only`)
+    console.log(`  ${scope}: ${entries.length} entries, ${pairs} hop-able pairs, ${genericPairs} on generic links only, ${firingPairs} still fire after the rarity rule`)
     console.log(`    most common links: ${worst.map(([link, count]) => `${link}×${count}`).join(', ')}`)
   }
 }

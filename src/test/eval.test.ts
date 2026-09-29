@@ -141,6 +141,11 @@ test('multi-hop: an entry linked to a match but sharing none of its words is sti
     linked('alice-role', 'Alice 是 Project Atlas 的技术负责人', '她带这个项目两年了。', ['alice', 'project-atlas']),
     linked('atlas-migration', 'Alice 最近在忙 Project Atlas 的迁移', '她这阵子都在弄这件事。', ['project-atlas', 'kubernetes']),
     linked('cluster-outage', 'Kubernetes 集群周二出过故障', '那次故障持续了四十分钟。', ['kubernetes', 'project-atlas']),
+    // Padding, so the three linked entries are not 100% of the scope. A link is
+    // only an edge when the scope does not mostly carry it, and `project-atlas`
+    // on 2 of 3 entries is exactly such a ubiquitous link.
+    ...Array.from({ length: 9 }, (_, index) =>
+      linked(`unrelated-${index}`, `无关条目 ${index}`, '另一件事的正文。', [`unique-${index}`])),
   ]
   const ids = rankHard(corpus, 'Alice 最近有没有受影响', 3)
   assert.ok(ids.includes('alice-role') || ids.includes('atlas-migration'), `no direct match at all: ${ids.join(', ')}`)
