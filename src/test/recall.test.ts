@@ -77,6 +77,56 @@ function blockText(message: { content: unknown } | undefined): string {
   return blocks.filter((block) => block.type === 'text').map((block) => block.text ?? '').join('')
 }
 
+/** A runtime over a temp store, with every log line captured. */
+async function loggedFixture(
+  t: { after: (fn: () => void | Promise<void>) => void },
+  settings: Partial<MemoriesConfig> = {},
+) {
+  const lines: string[] = []
+  const context = {
+    get: () => undefined,
+    logger: {
+      info: (...args: unknown[]) => void lines.push(args.map(String).join(' ')),
+      warn: () => undefined,
+      debug: () => undefined,
+    },
+  } as never
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-recall-'))
+  const runtime = new MemoriesRuntime(context, { memoriesDir: dir, autoExtract: false, ...settings })
+  t.after(() => {
+    runtime.dispose()
+    return rm(dir, { recursive: true, force: true })
+  })
+  return { runtime, lines }
+}
+
+test('a recall that fires, and a near miss that is refused, both reach the log', async (t) => {
+  // A stock `logLevel` keeps `info` and drops `debug`, and this plugin has
+  // already paid for a 32-hour background stall that was invisible for exactly
+  // that reason. A delta fires at most `recallMaxPerConversation` times, so it
+  // is never worth suppressing.
+  const { runtime, lines } = await loggedFixture(t)
+  const session = stubSession(process.cwd(), 'pnpm')
+  await runtime.write(session, { scope: 'global', title: 'Prefer pnpm', body: 'Use pnpm, not npm.', tags: [] }, 'tool')
+  await runtime.recallFor(stubAgent(session))
+  assert.ok(lines.some((line) => line.includes('recalled')), `a fired delta is logged at info, got: ${lines.join(' | ')}`)
+
+  // The refusal that hides a mis-tuned gate: the memory CLEARS the relevance
+  // floor and is still turned away by the evidence gate. Reported once per
+  // conversation so it cannot become noise on a long session.
+  const { runtime: other, lines: otherLines } = await loggedFixture(t)
+  const gated = stubSession(process.cwd(), '该插件是否有日志')
+  // Tagged with the shared word, so the turn really does clear the relevance
+  // floor: that is what makes the refusal the evidence gate's doing, and what
+  // makes it worth a line in the log.
+  await other.write(gated, { scope: 'global', title: '插件注册顺序', body: '插件在启动时注册。'.repeat(6), tags: ['插件'] }, 'tool')
+  await other.recallFor(stubAgent(gated))
+  const nearMisses = (): number => otherLines.filter((line) => line.includes('near miss worth reading')).length
+  assert.equal(nearMisses(), 1, 'the refused-but-close case is reported')
+  await other.recallFor(stubAgent(gated))
+  assert.equal(nearMisses(), 1, 'and only once per conversation')
+})
+
 test('an on-demand delta surfaces the memory the current turn matches', async (t) => {
   const { runtime } = await fixture(t)
   const session = stubSession(process.cwd(), 'pnpm')

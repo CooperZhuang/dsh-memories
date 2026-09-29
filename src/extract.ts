@@ -62,6 +62,7 @@ export const EXTRACT_SYSTEM = [
   'A fact that names a specific employer, product, customer, repository path, drive letter or internal host is NEVER global, however generally it is phrased — global memories are injected into every unrelated project.',
   '',
   'Each memory has a short imperative title (max 80 characters), a 1-3 sentence body, up to 5 lowercase keyword tags, and 1-5 search keys: the aliases and keyphrases a future session would actually type (for example "monorepo" for a pnpm-workspace fact).',
+  'Search keys are how a memory is found at all, so spend them on the words a person would use who has NOT read the memory: the other name for the same thing, the command, the file, the error text, the product\'s own term. Include the English technical term when the memory is written in Chinese and vice versa — a turn that mixes them ("这个排序改动会不会动到 system prompt") shares no characters with "前缀缓存", and the keys are the only place that gap can be closed. Retrieval is lexical: it matches characters, not meaning.',
   'Give each memory a kind, because the kinds are recalled differently:',
   '- "preference": how the user wants work done, or a correction they issued.',
   '- "failure": something that went wrong and how to avoid repeating it.',

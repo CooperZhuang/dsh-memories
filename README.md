@@ -291,7 +291,7 @@ dsh plugin --profile web add github:you/dsh-memories
 | `enableTool` | `true` | 是否注册 `memory` 工具（改完立即生效） |
 | `enableCommand` | `true` | 是否注册 `/memories` 命令（改完立即生效） |
 | `logLevel` | `info` | 插件日志文件详细程度：`off`/`error`/`warn`/`info`/`debug`；`info` = 错误+警告+每轮摘要，`debug` 再加逐条决策 |
-| `traceMaintenance` | `false` | 把归档、按需补注、复审选择等决策提升到 `info`（默认等级即可见）；关闭时它们只在 `debug` 出现 |
+| `traceMaintenance` | `false` | 把归档、复审选择等决策提升到 `info`（默认等级即可见）；关闭时它们只在 `debug` 出现。**按需补注不受它控制**——补注真的触发、以及「够到分数下限却被证据闸门挡下」这两种情况本来就固定写 `info`（每会话至多一行），理由见下 |
 
 可调项就是这个插件**自己那一行的 `Config` 字段**（标了 `.volatile()`），所以它自带 schema
 校验、revision 冲突检测，写入落在当前 profile 的 Cordis patch 里，Loader 直接把新值提交进
@@ -470,6 +470,16 @@ grep '\[warn\]' ~/.dsh/logs/dsh-memories.log   # 只看警告
 `no-llm` / `no-route` / `empty`）都在这行的尾部，所以「抽取器还活着吗、为什么什么都没做」不需要
 开 `traceMaintenance` 就能从文件里读出来。这一条是 2026-09-23 的复盘的直接产物：当时水位线 32 小时
 没动，而每一道闸门的拒绝理由都只在 `debug`，日志里查不到任何线索。
+
+**按需补注的两种结局都固定写 `info`**，不受 `traceMaintenance` 控制：
+
+- 真的触发了 → `session <id> recalled <ids> (relevance …, via …)`。补注每个会话至多
+  `recallMaxPerConversation` 条，是这条路径上**少**发生的那一半，报它不吵；而事后无法重建。
+- 没触发、但有记忆**够到了 `recallMinScore` 分数下限、却被证据闸门挡下** → 每个会话至多一行
+  `had a near miss worth reading: …`。「这一轮确实有记忆相关，却因为共享词不够而没补注」正是
+  闸门调歪的样子，而「本来就没什么可补的」在外部看起来和它一模一样。
+  2026-09-29 实测：`MIN_SHARED_RUN` 还要求 3 个连续字符时，6 句普通的中途对话**句句**触发这一行、
+  一次都没补注出来，而正确的记忆就在旁边一个共享二元组之外——只能靠离线复现才看得见。
 
 **服务在激活之后才出现也没关系**：`llm` 与 `subagents` 都是可选服务，0.1.7 允许它们由排在后面的
 行提供。插件在激活时取一次快照（为了关停途中仍能跑完最后一遍），快照为空时改为**每次调用现取**；

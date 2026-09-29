@@ -242,6 +242,11 @@ export class MemoriesRuntime {
   private readonly surfacedIds = new WeakMap<Session, Set<string>>()
   /** Injected ids this conversation has already credited as used. */
   private readonly helpedIds = new WeakMap<Session, Set<string>>()
+  /**
+   * Sessions whose "nothing was recalled, but something cleared the floor" has
+   * already been reported, so the diagnostic costs at most one line each.
+   */
+  private readonly nearMissLogged = new WeakSet<Session>()
   private readonly idleTimers = new WeakMap<Agent, NodeJS.Timeout>()
   private readonly extracting = new Set<string>()
   /**
@@ -905,6 +910,9 @@ export class MemoriesRuntime {
     this.recallCounts.delete(session)
     this.surfacedIds.delete(session)
     this.helpedIds.delete(session)
+    // A compacted conversation is a new one, and its first near miss is worth
+    // reporting again — the budget is per conversation for a reason.
+    this.nearMissLogged.delete(session)
   }
 
   /**
@@ -1001,10 +1009,23 @@ export class MemoriesRuntime {
       }
     }
     if (eligible.length === 0) {
-      this.log.decision('dsh-memories: session %s recalled nothing (closest: %s at relevance %.1f with %d strong terms; needs relevance ≥%.0f and either %d strong terms, one substantive term above %.0f, or an exact phrase)',
-        session.id, near?.id ?? 'none', near?.relevance ?? 0, near?.terms ?? 0,
+      const detail = 'closest: %s at relevance %.1f with %d strong terms; needs relevance ≥%.0f and either %d strong terms, one substantive term above %.0f, or an exact phrase'
+      const args = [near?.id ?? 'none', near?.relevance ?? 0, near?.terms ?? 0,
         this.settings.recallMinScore, this.settings.recallMinTerms,
-        this.settings.recallMinScore * QUALIFIED_SCORE_FACTOR)
+        this.settings.recallMinScore * QUALIFIED_SCORE_FACTOR] as const
+      this.log.decision(`dsh-memories: session %s recalled nothing (${detail})`, session.id, ...args)
+      // One line per conversation, and only for the case that means something:
+      // a memory that CLEARED the relevance floor and was still turned away by
+      // the evidence gate. That is the gate doing the deciding, and it is how a
+      // mis-tuned gate hides — a path that legitimately has nothing to offer
+      // looks identical from the outside. Measured here: with the shared-run rule
+      // asking for three consecutive characters, every ordinary mid-conversation
+      // turn produced one of these, and six turns in a row recalled nothing at
+      // all with the right memory sitting one shared pair away.
+      if (near !== undefined && near.relevance >= this.settings.recallMinScore && !this.nearMissLogged.has(session)) {
+        this.nearMissLogged.add(session)
+        this.log.info('dsh-memories: session %s had a near miss worth reading: %s (${detail})', session.id, ...args)
+      }
       return undefined
     }
     // Ranked by the decayed score, so recency and the entry's own track record
@@ -1023,7 +1044,13 @@ export class MemoriesRuntime {
     if (picked.length === 0) return undefined
     const text = renderRecall(picked.map((item) => item.entry), this.settings.recallMaxBytes)
     if (text === undefined) return undefined
-    this.log.decision('dsh-memories: session %s recalled %s (relevance %.1f, score %.1f, via %j)',
+    // Info, not `decision`: a delta is the rarer half of this path — at most
+    // `recallMaxPerConversation` per conversation — and the silence below is the
+    // expensive one. This plugin has already paid for a 32-hour background stall
+    // that was invisible because the only evidence sat at debug level under a
+    // stock `logLevel`; a recall that fires is cheap to report and impossible to
+    // reconstruct afterwards.
+    this.log.info('dsh-memories: session %s recalled %s (relevance %.1f, score %.1f, via %j)',
       session.id, picked.map((item) => item.entry.id).join(', '),
       picked[0]!.relevance, picked[0]!.score, (picked[0]!.best ?? '').slice(0, 80))
     this.recallCounts.set(session, used + picked.length)
