@@ -530,6 +530,29 @@ tail -f ~/.dsh/logs/dsh-memories.log           # 实时看
 grep '\[warn\]' ~/.dsh/logs/dsh-memories.log   # 只看警告
 ```
 
+**一眼摘要用 `npm run report`**（2026-09-29 新增，只读、无依赖）：把日志按行型归好类——
+警告、热重挂、注入摘要、补注触发、近失、抽取轮次与产出、检索——再读 `state.db` 给出
+条目数 / 被读过 / 从未露面 / 会话水位线，最后算一遍**可见的抽取花费**（后台调用不建会话，
+成本面板看不到它，只有这里能合计）。它顺手会报「最近一次成功抽取在 N 小时前」，
+抽取停摆不用再翻日志。
+
+```bash
+npm run report                    # 默认 ~/.dsh，每节最近 5 条
+node scripts/report.mjs --examples=20 --home=C:/path/to/.dsh
+```
+
+三条**专门用来事后确认检索效果**的行（2026-09-29 新增，都在既有的行上扩展，没有新类型）：
+
+| 行 | 新增了什么 | 能回答什么 |
+| --- | --- | --- |
+| `session … recalled …` | `, window 上周` 与 `, +2 related via <种子 id>` | 时间通道这一轮解析出了什么窗口、一跳真的补进了几条、种子是谁 |
+| `session … recalled nothing (…)` / `had a near miss …` | `; window 上周` | 「什么都没补」时，窗口有没有参与进来 |
+| `search "<query>" -> N hit(s), window …, K over a hop (top <id> relevance R score S)` | 整行都是新的 | 搜索面（此前**完全不打日志**）实际返回了什么、第一条为什么排第一——相关度与分数都在行里 |
+
+前两条是 `info` 级，默认就能看到；`search` 那条是 `decision` 级，默认 `logLevel: info` 下不写，
+把 `traceMaintenance` 打开即提升到 `info`（与其它决策行同一个开关）。**注意一个名字坑**：
+补注行末尾的 `via "…"` 是**命中的那句话**，不是一跳的种子；种子在看 `+N related via <id>`。
+
 `/memories stats` 会打印当前等级与文件路径，同时也是最快的一眼诊断：store 位置、两作用域条数、
 抽取/补注/保留配置与**有效抽取等待**、当前是否在**避峰**、`sessions: N mined / M tracked`、
 后台是否被额度暂停、

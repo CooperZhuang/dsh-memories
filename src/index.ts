@@ -404,7 +404,21 @@ export class MemoriesRuntime {
     // known about a subject, and the entries filed under the same keys are part
     // of that answer. The settings page calls `searchMemories` directly and stays
     // literal, because a person typing into a search box wants what matches.
-    return searchMemories(this.groups(states), query, { ...options, expand: true })
+    const hits = searchMemories(this.groups(states), query, { ...options, expand: true })
+    // Decision level, so a stock `logLevel` stays quiet and `traceMaintenance:
+    // true` makes this answerable: which order the model actually saw, and why
+    // the first row is first. Until 2026-09-29 this surface logged nothing at
+    // all, which meant the ordering change (search ranks by relevance) could not
+    // be confirmed from a running host.
+    const top = hits[0]
+    const hops = hits.filter((hit) => hit.via !== undefined).length
+    const window = parseTimeRange(query)
+    this.log.decision('dsh-memories: search %s -> %d hit(s)%s%s (top %s relevance %s score %s)',
+      JSON.stringify(query.slice(0, 60)), hits.length,
+      window === undefined ? '' : `, window ${window.label}`,
+      hops === 0 ? '' : `, ${hops} over a hop`,
+      top?.entry.id ?? 'none', (top?.relevance ?? 0).toFixed(1), (top?.score ?? 0).toFixed(1))
+    return hits
   }
 
   /** Browse both scopes without a query. */
@@ -1025,6 +1039,10 @@ export class MemoriesRuntime {
         + ` with ${near?.terms ?? 0} strong terms; needs relevance >=${this.settings.recallMinScore}`
         + ` and either ${this.settings.recallMinTerms} strong terms, one substantive term above`
         + ` ${this.settings.recallMinScore * QUALIFIED_SCORE_FACTOR}, or an exact phrase`
+        // The window is part of "why nothing matched": a turn that said 上周 and
+        // got nothing looks identical to one that said nothing at all, unless
+        // the line says which window it used.
+        + `${window === undefined ? '' : `; window ${window.label}`}`
       this.log.decision('dsh-memories: session %s recalled nothing (%s)', session.id, detail)
       // One line per conversation, and only for the case that means something:
       // a memory that CLEARED the relevance floor and was still turned away by
@@ -1062,6 +1080,8 @@ export class MemoriesRuntime {
         evidence: { strongTerms: 0, phrase: false },
       })
     }
+    /** Which of the candidates arrived over a hop, and from which seed, for the log line below. */
+    const relatedVia = new Map(related.map((hit) => [hit.entry.id, hit.via ?? '']))
     eligible.sort((left, right) => right.score - left.score
       || right.entry.updatedAt - left.entry.updatedAt
       || left.entry.title.localeCompare(right.entry.title))
@@ -1085,9 +1105,17 @@ export class MemoriesRuntime {
     // Rendered, not formatted: the host's formatter handles `%s`/`%d`/`%o` and
     // nothing else, so `%.1f` and `%j` used to reach the file verbatim — this
     // line had been unreadable in the field the whole time.
-    this.log.info('dsh-memories: session %s recalled %s (relevance %s, score %s, via %s)',
+    //
+    // Two additions (2026-09-29), both so that the two mechanisms added the same
+    // day can be confirmed from the log instead of inferred: which time window
+    // the turn resolved to, and how many of the recalled entries came in over a
+    // hop rather than by matching the words.
+    const hopped = picked.filter((item) => relatedVia.has(item.entry.id))
+    const extras = `${window === undefined ? '' : `, window ${window.label}`}`
+      + `${hopped.length === 0 ? '' : `, +${hopped.length} related via ${[...new Set(hopped.map((item) => relatedVia.get(item.entry.id)))].join(',')}`}`
+    this.log.info('dsh-memories: session %s recalled %s (relevance %s, score %s%s, via %s)',
       session.id, picked.map((item) => item.entry.id).join(', '),
-      picked[0]!.relevance.toFixed(1), picked[0]!.score.toFixed(1),
+      picked[0]!.relevance.toFixed(1), picked[0]!.score.toFixed(1), extras,
       JSON.stringify((picked[0]!.best ?? '').slice(0, 80)))
     this.recallCounts.set(session, used + picked.length)
     await this.markSurfaced(session, picked.map((item) => item.entry))

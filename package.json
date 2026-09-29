@@ -56,6 +56,7 @@
     "seed": "node scripts/seed.mjs",
     "eval": "node scripts/eval-extract.mjs",
     "eval:retrieval": "node scripts/eval-retrieval.mjs",
+    "report": "node scripts/report.mjs",
     "prepare": "npm run build"
   },
   "peerDependencies": {
