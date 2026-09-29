@@ -16,6 +16,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 import { MemoriesRuntime } from '../index.js'
 import { matchCredit } from '../search.js'
+import { Logger } from '@deepseek-ai/cordis'
 import { MEMORY_SOURCE_KIND } from '../types.js'
 import type { MemoriesConfig } from '../config.js'
 import type { Agent } from '@deepseek-ai/dsh-agent'
@@ -83,14 +84,21 @@ async function loggedFixture(
   settings: Partial<MemoriesConfig> = {},
 ) {
   const lines: string[] = []
+  // Rendered through the host's OWN formatter, not a hand-rolled stand-in: the
+  // point is to see the line the plugin's log file would actually contain, and a
+  // stub that skipped formatting would have hidden the very bug this covers.
   const context = {
     get: () => undefined,
     logger: {
-      info: (...args: unknown[]) => void lines.push(args.map(String).join(' ')),
-      warn: () => undefined,
-      debug: () => undefined,
+      info: (...args: unknown[]) => void lines.push(render('info', args)),
+      warn: (...args: unknown[]) => void lines.push(render('warn', args)),
+      debug: (...args: unknown[]) => void lines.push(render('debug', args)),
+      error: (...args: unknown[]) => void lines.push(render('error', args)),
     },
   } as never
+  function render(type: 'error' | 'warn' | 'info' | 'debug', args: unknown[]): string {
+    return Logger.format({} as never, { ts: Date.now(), type, name: 'dsh-memories', args } as never)
+  }
   const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-recall-'))
   const runtime = new MemoriesRuntime(context, { memoriesDir: dir, autoExtract: false, ...settings })
   t.after(() => {
@@ -110,7 +118,6 @@ test('a recall that fires, and a near miss that is refused, both reach the log',
   await runtime.write(session, { scope: 'global', title: 'Prefer pnpm', body: 'Use pnpm, not npm.', tags: [] }, 'tool')
   await runtime.recallFor(stubAgent(session))
   assert.ok(lines.some((line) => line.includes('recalled')), `a fired delta is logged at info, got: ${lines.join(' | ')}`)
-
   // The refusal that hides a mis-tuned gate: the memory CLEARS the relevance
   // floor and is still turned away by the evidence gate. Reported once per
   // conversation so it cannot become noise on a long session.
@@ -125,6 +132,15 @@ test('a recall that fires, and a near miss that is refused, both reach the log',
   assert.equal(nearMisses(), 1, 'the refused-but-close case is reported')
   await other.recallFor(stubAgent(gated))
   assert.equal(nearMisses(), 1, 'and only once per conversation')
+
+  // The host's formatter is cordis `Logger.format`, which matches only a single
+  // letter after `%` and only knows `s d i f o O c C`. So `%.1f` is not even a
+  // placeholder, and `%j` has no formatter and is emitted verbatim with its
+  // argument appended unformatted. These lines exist to be read after the fact;
+  // the `recalled` one had been unreadable in the field the whole time.
+  for (const line of [...lines, ...otherLines]) {
+    assert.doesNotMatch(line, /%[.a-zA-Z]|\$\{/u, `a log line must render its values, not its placeholders: ${line}`)
+  }
 })
 
 test('an on-demand delta surfaces the memory the current turn matches', async (t) => {

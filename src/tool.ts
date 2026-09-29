@@ -103,7 +103,7 @@ export function registerMemoryTool(ctx: Context, runtime: MemoriesRuntime): () =
       keys: {
         type: 'array',
         items: { type: 'string' },
-        description: 'write: aliases and keyphrases a future search should find this memory by (for example "monorepo" for a memory about pnpm workspaces). Cheap recall: preferred over restating the body.',
+        description: 'write: the words a future search must find this memory by — the other name for the same thing, the command, the file, the error text, the product\'s own term, and the English technical term when the memory is Chinese (and the reverse). Retrieval matches characters, not meaning, so a turn saying "system prompt" cannot reach a memory that only says "前缀缓存". Preferred over restating the body.',
       },
       kind: {
         type: 'string',

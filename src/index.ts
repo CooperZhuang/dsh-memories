@@ -1009,11 +1009,16 @@ export class MemoriesRuntime {
       }
     }
     if (eligible.length === 0) {
-      const detail = 'closest: %s at relevance %.1f with %d strong terms; needs relevance ≥%.0f and either %d strong terms, one substantive term above %.0f, or an exact phrase'
-      const args = [near?.id ?? 'none', near?.relevance ?? 0, near?.terms ?? 0,
-        this.settings.recallMinScore, this.settings.recallMinTerms,
-        this.settings.recallMinScore * QUALIFIED_SCORE_FACTOR] as const
-      this.log.decision(`dsh-memories: session %s recalled nothing (${detail})`, session.id, ...args)
+      // The detail is RENDERED, not passed as arguments: the host's formatter
+      // understands `%s`/`%d`/`%o` and nothing else, so a nested format string
+      // passed as one `%s` arrives with its own placeholders still in it. That
+      // is not cosmetic — these lines exist to be read after the fact, and a
+      // line full of `%.1f` and `${detail}` is exactly as unreadable as silence.
+      const detail = `closest ${near?.id ?? 'none'} at relevance ${(near?.relevance ?? 0).toFixed(1)}`
+        + ` with ${near?.terms ?? 0} strong terms; needs relevance >=${this.settings.recallMinScore}`
+        + ` and either ${this.settings.recallMinTerms} strong terms, one substantive term above`
+        + ` ${this.settings.recallMinScore * QUALIFIED_SCORE_FACTOR}, or an exact phrase`
+      this.log.decision('dsh-memories: session %s recalled nothing (%s)', session.id, detail)
       // One line per conversation, and only for the case that means something:
       // a memory that CLEARED the relevance floor and was still turned away by
       // the evidence gate. That is the gate doing the deciding, and it is how a
@@ -1024,7 +1029,7 @@ export class MemoriesRuntime {
       // all with the right memory sitting one shared pair away.
       if (near !== undefined && near.relevance >= this.settings.recallMinScore && !this.nearMissLogged.has(session)) {
         this.nearMissLogged.add(session)
-        this.log.info('dsh-memories: session %s had a near miss worth reading: %s (${detail})', session.id, ...args)
+        this.log.info('dsh-memories: session %s had a near miss worth reading: %s', session.id, detail)
       }
       return undefined
     }
@@ -1050,9 +1055,13 @@ export class MemoriesRuntime {
     // that was invisible because the only evidence sat at debug level under a
     // stock `logLevel`; a recall that fires is cheap to report and impossible to
     // reconstruct afterwards.
-    this.log.info('dsh-memories: session %s recalled %s (relevance %.1f, score %.1f, via %j)',
+    // Rendered, not formatted: the host's formatter handles `%s`/`%d`/`%o` and
+    // nothing else, so `%.1f` and `%j` used to reach the file verbatim — this
+    // line had been unreadable in the field the whole time.
+    this.log.info('dsh-memories: session %s recalled %s (relevance %s, score %s, via %s)',
       session.id, picked.map((item) => item.entry.id).join(', '),
-      picked[0]!.relevance, picked[0]!.score, (picked[0]!.best ?? '').slice(0, 80))
+      picked[0]!.relevance.toFixed(1), picked[0]!.score.toFixed(1),
+      JSON.stringify((picked[0]!.best ?? '').slice(0, 80)))
     this.recallCounts.set(session, used + picked.length)
     await this.markSurfaced(session, picked.map((item) => item.entry))
     return createUserMessage({
