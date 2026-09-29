@@ -37,8 +37,8 @@ import { Config as ConfigSchema, consolidationRouteOf, readTunables, resolveConf
 import type { MemoriesConfig, MemoriesSettings, ResolvedConfig } from './config.js'
 import { MemoryStore, slugify } from './storage.js'
 import { StateStore, importLegacyState, statePath } from './state.js'
-import { browseMemories, explainEntry, searchMemories } from './search.js'
-import type { MatchEvidence, ScopeEntries } from './search.js'
+import { browseMemories, matchCredit, QUALIFIED_SCORE_FACTOR, searchMemories } from './search.js'
+import type { MatchCredit, ScopeEntries } from './search.js'
 import { isSubstantiveTurn } from './query.js'
 import { MEMORY_OPEN, rankForSummary, renderEntry, renderHit, renderMemorySummaryResult, renderRecall, renderScopeListing, selectForSummary } from './render.js'
 import type { SummaryScope } from './render.js'
@@ -94,17 +94,6 @@ function describeExtractionRoute(route: ExtractionRoute | undefined): string {
 
 /** State key holding the last periodic sweep, so it survives a restart. */
 const SWEEP_META_KEY = 'sweep-at'
-
-/**
- * How far above the recall floor a single shared run must score to be enough.
- *
- * A turn that is essentially one keyword ("端口 3080") shares one run and
- * deserves its memory; a turn that merely brushes past a memory shares one run
- * among many words and does not. The score is what separates them, so the
- * requirement is a multiple of the caller's own floor rather than a second
- * absolute number to keep in sync.
- */
-const QUALIFIED_SCORE_FACTOR = 2
 
 /**
  * Model-facing label of a session that has no workspace of its own.
@@ -577,7 +566,17 @@ export class MemoriesRuntime {
     if (this.settings.maxSummaryBytes <= 0) return undefined
     if (this.settings.recallMode === 'off') return undefined
     const states = await this.allScopes(session)
-    const selected = states.map((state) => selectForSummary(state.entries, this.settings.maxSummaryEntries, {
+    // Each scope is selected against the number of bullets it can actually RENDER,
+    // not the shared per-scope maximum. The global half renders at most
+    // `globalSummaryEntries` while the reservation was computed against
+    // `maxSummaryEntries`, so with the shipped defaults three of the four global
+    // bullets went to never-listed entries and every topically relevant global
+    // memory was gone — measured on the real store, including the one at
+    // relevance 62. Selecting against the real cap is what makes
+    // `selectForSummary`'s own bound bite.
+    const capOf = (state: ScopeState): number =>
+      state.scope === 'global' ? this.settings.globalSummaryEntries : this.settings.maxSummaryEntries
+    const selected = states.map((state) => selectForSummary(state.entries, capOf(state), {
       freshSlots: this.settings.summaryFreshSlots,
       // The opening turn is the only topic signal available this early, and it
       // is what keeps a globally scoped memory that shares nothing with this
@@ -940,10 +939,10 @@ export class MemoriesRuntime {
     for (const state of states) {
       for (const entry of state.entries) {
         if (!pending.includes(entry.id)) continue
-        const why = explainEntry(entry, query)
-        const distinctive = why.relevance >= this.settings.recallMinScore * QUALIFIED_SCORE_FACTOR
-        const strong = why.evidence.phrase || why.evidence.strongTerms >= this.settings.recallMinTerms
-        if (!distinctive || !strong) continue
+        // The same gate the recall path uses, so an injected memory is only
+        // credited as "used" under the evidence a recall would have demanded.
+        const why = matchCredit(entry, query, this.settings.recallMinScore, this.settings.recallMinTerms)
+        if (!why.about) continue
         credited.add(entry.id)
         this.log.decision('dsh-memories: injected memory %s was used by the conversation (relevance %d)', entry.id, why.relevance)
         await this.touchEntry(entry, state.scope === 'project' ? root : undefined)
@@ -981,32 +980,16 @@ export class MemoriesRuntime {
     if (query === undefined || !isSubstantiveTurn(query)) return undefined
     const seen = this.seenIds(session)
     const states = await this.allScopes(session)
-    const eligible: { entry: MemoryEntry; relevance: number; score: number; best: string; evidence: MatchEvidence }[] = []
+    const eligible: (MatchCredit & { entry: MemoryEntry })[] = []
     let near: { id: string; relevance: number; terms: number } | undefined
     for (const state of states) {
       for (const entry of state.entries) {
         if (seen.has(entry.id)) continue
-        const why = explainEntry(entry, query)
-        // Two gates, and they answer different questions.
-        //
-        // The FLOOR is the caller's knob: the relevance a memory has to reach at
-        // all.
-        //
-        // CREDIT is the structural gate, and a score threshold cannot replace it
-        // for Chinese. Measured on a real 54-memory store, "该插件是否有日志"
-        // shares the isolated bigram 插件 with a memory about an unrelated
-        // cost-meter bug and scores 12 — above any floor low enough to admit a
-        // paraphrase. Credit therefore asks for substantive terms: a Latin word of
-        // three characters or more, or a CJK pair inside a shared run of three or
-        // more, which is the only Chinese term a merely common pair cannot fake.
-        // A whole-query hit stands alone, one such term is enough when the score is
-        // decisive (a one-keyword turn like "端口 3080"), and otherwise two are
-        // required.
-        const distinctive = why.relevance >= this.settings.recallMinScore * QUALIFIED_SCORE_FACTOR
-        const credited = why.evidence.phrase
-          || why.evidence.strongTerms >= this.settings.recallMinTerms
-          || (why.evidence.strongTerms >= 1 && distinctive)
-        if (why.relevance < this.settings.recallMinScore || !credited) {
+        // One gate, two questions — see `matchCredit`. The floor is the caller's
+        // knob; the credit rule is structural and is what keeps a Chinese turn
+        // from recalling every memory that shares a common word like 插件 or 日志.
+        const why = matchCredit(entry, query, this.settings.recallMinScore, this.settings.recallMinTerms)
+        if (!why.about) {
           // Remember the closest miss, so "why was nothing recalled?" has an
           // answer in the log instead of being a silence.
           if (why.relevance > 0 && (near === undefined || why.relevance > near.relevance)) {
@@ -1029,7 +1012,7 @@ export class MemoriesRuntime {
     eligible.sort((left, right) => right.score - left.score
       || right.entry.updatedAt - left.entry.updatedAt
       || left.entry.title.localeCompare(right.entry.title))
-    const picked: { entry: MemoryEntry; relevance: number; score: number; best: string; evidence: MatchEvidence }[] = []
+    const picked: (MatchCredit & { entry: MemoryEntry })[] = []
     for (const candidate of eligible) {
       if (picked.length >= remaining) break
       // `renderRecall` is the budget's authority: if one more entry would not fit,

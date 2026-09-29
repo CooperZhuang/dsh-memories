@@ -15,6 +15,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { MemoriesRuntime } from '../index.js'
+import { matchCredit } from '../search.js'
 import { MEMORY_SOURCE_KIND } from '../types.js'
 import type { MemoriesConfig } from '../config.js'
 import type { Agent } from '@deepseek-ai/dsh-agent'
@@ -176,6 +177,25 @@ test('a Chinese turn reaches a memory it shares a phrase with', async (t) => {
   assert.match(textOf(delta), /件的日志该去哪里看/u)
 })
 
+test('a Chinese turn reaches a memory it names in two non-adjacent pairs', async (t) => {
+  const { runtime } = await fixture(t)
+  // The turn and the title are unmistakably about the same thing and share NO
+  // three-character run: the pairs 改动 and 提交 sit in different places in each.
+  // Requiring a shared phrase meant this never surfaced — measured on the real
+  // store, six ordinary mid-conversation turns recalled nothing for exactly this
+  // reason, with the right memory sitting one shared pair away.
+  const session = stubSession(process.cwd(), '帮我把这次改动提交一下')
+  await runtime.write(session, {
+    scope: 'global',
+    title: '把混装的工作区改动拆成两笔提交',
+    body: '同一文件里混装了两批无关改动时，按 hunk 重建文件，把每批改动拆成独立的提交，分阶段跑测试。',
+    tags: [],
+  }, 'tool')
+  const delta = await runtime.recallFor(stubAgent(session))
+  assert.ok(delta !== undefined, 'two shared topic pairs are enough, adjacent or not')
+  assert.match(textOf(delta), /把混装的工作区改动拆成两笔提交/u)
+})
+
 test('a Chinese turn that only shares common pairs recalls nothing', async (t) => {
   const { runtime } = await fixture(t)
   const session = stubSession(process.cwd(), '该插件是否有日志')
@@ -190,6 +210,13 @@ test('a Chinese turn that only shares common pairs recalls nothing', async (t) =
   }, 'tool')
   assert.equal(await runtime.recallFor(stubAgent(session)), undefined,
     'the same characters are not the same phrase')
+  // One pair is one term, and recall needs two. The body also says 日志, but a
+  // body word is not evidence: a long memory mentions many things.
+  const counted = matchCredit(
+    (await runtime.search(session, '该插件是否有日志', { limit: 1 }))[0]!.entry,
+    '该插件是否有日志', 9, 2,
+  )
+  assert.equal(counted.evidence.strongTerms, 1, 'exactly one pair is credited, and it is not enough')
 })
 
 test('appliesTo is what makes a memory reachable when the title shares no noun', async (t) => {

@@ -240,6 +240,51 @@ test('the global half is bounded in bytes, not only in entries', async (t) => {
   assert.match(summary, /This repo is special/u, 'and the project half is still there')
 })
 
+test('a never-surfaced backlog cannot swallow the shared global half', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-freshhalf-'))
+  const workspace = await mkdtemp(join(tmpdir(), 'dsh-memories-ws-'))
+  // The shipped ratio: the reservation asks for 3, the global half renders 4.
+  const runtime = new MemoriesRuntime(stubContext, {
+    memoriesDir: dir, autoExtract: false, globalSummaryEntries: 4, summaryFreshSlots: 3,
+  })
+  t.after(() => runtime.dispose())
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  t.after(() => rm(workspace, { recursive: true, force: true }))
+  const agent = stubAgent(stubSession(workspace))
+
+  // Well-established global memories that have actually been read, so they win
+  // the ranking on merit. Without that history every entry ties on weight and
+  // the newest simply sorts first — which would make any fresh bullet below
+  // evidence of the ranking rather than of the reservation.
+  const established: string[] = []
+  for (let index = 0; index < 12; index += 1) {
+    const written = await runtime.write(agent.session, {
+      scope: 'global', title: `Established rule ${index}`, body: 'Applies everywhere.', tags: [],
+    }, 'auto')
+    established.push(written.entry.id)
+  }
+  for (const id of established) {
+    for (let read = 0; read < 3; read += 1) await runtime.read(agent.session, 'global', id)
+  }
+  // Then a backlog: three brand-new global memories, none of them about anything.
+  // Every new memory arrives never-surfaced, so this is what a busy week looks like.
+  for (const title of ['Newest note A', 'Newest note B', 'Newest note C']) {
+    await runtime.write(agent.session, { scope: 'global', title, body: 'Never surfaced yet.', tags: [] }, 'auto')
+  }
+
+  const summary = await runtime.summary(agent.session)
+  assert.ok(summary !== undefined)
+  const [globalPart] = summary.split('\n## Project')
+  const freshShown = (globalPart ?? '').split('\n').filter((line) => /^- (?:📌 )?Newest note/u.test(line)).length
+  const bullets = (globalPart ?? '').split('\n').filter((line) => line.startsWith('- ') && !line.startsWith('- …')).length
+  assert.equal(bullets, 4, 'the global half still fills its own cap')
+  // Sized against `maxSummaryEntries` this was 3 of 4, and every topically
+  // relevant global memory was gone — the half every session shares, spent on
+  // whatever happened to be written recently.
+  assert.ok(freshShown <= 1, `the reservation takes at most a third of the section, not ${freshShown} of 4`)
+  assert.match(globalPart ?? '', /Established rule/u, 'and the ranking still fills the rest')
+})
+
 test('a global draft that names a known workspace is filed with that workspace', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-memories-scopeguard-'))
   const workspace = await mkdtemp(join(tmpdir(), 'dsh-memories-ws-'))

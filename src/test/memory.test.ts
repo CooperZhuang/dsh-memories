@@ -10,7 +10,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 import { createVolatile, updateVolatile } from '@deepseek-ai/cosmokit'
 import { MemoryStore, formatEntry, parseEntry, projectSlug, slugify } from '../storage.js'
-import { browseMemories, scoreEntry, searchMemories } from '../search.js'
+import { browseMemories, matchCredit, relevanceOfOne, scoreEntry, searchMemories } from '../search.js'
 import { rankForSummary, renderMemorySummary, selectForSummary } from '../render.js'
 import { DEFAULT_MAX_SUMMARY_BYTES, consolidationRouteOf, normalizeSettings, readTunables, resolveConfig } from '../config.js'
 import { name } from '../index.js'
@@ -334,6 +334,141 @@ test('the per-scope cap evicts the least recently updated entries', async () => 
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
+})
+
+test('a memory the turn is about outranks one that is merely well read', () => {
+  const now = 1_000_000_000_000
+  // The incumbent has everything the weight rewards and nothing the turn names.
+  const incumbent = entry({
+    id: 'incumbent', scope: 'global', title: 'Sidebar adapter', body: 'unrelated to the question',
+    updatedAt: now, lastUsedAt: now, uses: 30,
+  })
+  // The turn names this one twice over, and it has never been read.
+  const named = entry({
+    id: 'named', scope: 'global', title: '注入摘要的排序公式', body: '注入摘要按相关性分层排序',
+    keys: ['排序', '注入'], updatedAt: now - 400 * 86_400_000, source: 'auto', uses: 0,
+  })
+  const query = '注入摘要的排序是怎么算的'
+  const blind = rankForSummary([incumbent, named], now)
+  assert.equal(blind[0]?.id, 'incumbent', 'without a topic signal the ranking is history, as before')
+
+  const topical = rankForSummary([incumbent, named], now, query)
+  assert.equal(topical[0]?.id, 'named', 'a named memory outranks thirty reads')
+  assert.equal(topical.indexOf(incumbent), 1, 'and history still orders everything below the tier')
+})
+
+test('inside the topical tier the better match comes first, not the better read', () => {
+  const now = 1_000_000_000_000
+  // Both are about the turn, so the tier cannot separate them — and a saturating
+  // multiplier could not either, which is how a relevance-62 memory stayed
+  // unlisted while relevance-30 ones were shown.
+  const stronger = entry({
+    id: 'stronger', scope: 'global', title: '注入摘要是按相关性分层排序的', body: '相关性 注入 排序 分层',
+    keys: ['注入', '排序', '分层', '相关性'], updatedAt: now - 400 * 86_400_000, uses: 0,
+  })
+  const weaker = entry({
+    id: 'weaker', scope: 'global', title: '重启 dsh web 的 restart 端点', body: '注入 排序 之外的话题',
+    keys: ['注入', '排序'], updatedAt: now, lastUsedAt: now, uses: 30,
+  })
+  const ranked = rankForSummary([weaker, stronger], now, '注入摘要的排序是怎么算的')
+  const relevance = (id: string): number => relevanceOfOne(
+    ranked.find((value) => value.id === id)!, '注入摘要的排序是怎么算的')
+  assert.ok(relevance('stronger') > relevance('weaker'), 'the fixture really does separate the two')
+  assert.equal(ranked[0]?.id, 'stronger', 'and the stronger match is listed first despite never being read')
+})
+
+test('the topical tier is not reachable on one shared word', () => {
+  const now = 1_000_000_000_000
+  // One strong term, and a score high enough to clear the recall escape hatch's
+  // 2× floor. A Latin word is used because a single CJK bigram cannot reach that
+  // score on its own — which is itself why the escape hatch is safe for recall.
+  const brush = entry({
+    id: 'brush', scope: 'global', title: 'Telemetry counters', body: 'telemetry counters are reset per session, telemetry again',
+    keys: ['telemetry'], updatedAt: now, lastUsedAt: now, uses: 20,
+  })
+  const query = 'telemetry 的计数口径是什么'
+  const recall = matchCredit(brush, query, 9, 2, { now })
+  assert.equal(recall.evidence.strongTerms, 1, 'the fixture really does rest on a single strong term')
+  assert.ok(recall.relevance >= 18, 'and on a decisive score, so the escape hatch applies')
+  assert.equal(recall.about, true, 'recall still credits a single decisive term — that is its job')
+  assert.equal(matchCredit(brush, query, 9, 2, { now, singleTerm: false }).about, false,
+    'the summary tier demands the full term count')
+})
+
+test('the byte budget admits by rank, so a relevant fact is not cut for an irrelevant preference', () => {
+  // The renderer receives entries in the order `selectForSummary` protected them,
+  // which is rank order — so these two `fact`s come first even though their kind
+  // renders last.
+  //
+  // Admitting kind by kind instead (preferences laid out first, budget dropped
+  // from the end of each group) made the byte budget a statement about `kind`
+  // rather than about relevance. At this budget the old code listed BOTH
+  // preferences and dropped BOTH facts, and on the real store it cut a memory at
+  // relevance 52 while keeping one at 20.
+  const scopes = [{
+    label: 'global',
+    heading: 'Global memories',
+    total: 4,
+    maxEntries: 4,
+    maxBytes: 340,
+    entries: [
+      entry({ id: 'f1', scope: 'global', kind: 'fact', title: '注入排序按相关性分层', body: '注入摘要是按相关性分层的，不按历史。' }),
+      entry({ id: 'f2', scope: 'global', kind: 'fact', title: '字节预算从尾部丢弃', body: '预算按字节预留，中文条目约三字节一字符。' }),
+      entry({ id: 'p1', scope: 'global', kind: 'preference', title: '偏好 p1', body: '与本轮无关的一条偏好。'.repeat(6) }),
+      entry({ id: 'p2', scope: 'global', kind: 'preference', title: '偏好 p2', body: '与本轮无关的一条偏好。'.repeat(6) }),
+    ],
+  }]
+  const text = renderMemorySummary(scopes, { maxBytes: 4_096, maxEntriesPerScope: 12 })
+  assert.ok(text !== undefined)
+  assert.match(text, /注入排序按相关性分层/u, 'the top-ranked entry is listed')
+  assert.match(text, /字节预算从尾部丢弃/u, 'and so is the one behind it')
+  assert.doesNotMatch(text, /偏好 p1/u, 'the budget went to rank, not to the kind that renders first')
+  assert.doesNotMatch(text, /偏好 p2/u)
+})
+
+test('matchCredit reports the evidence behind a refusal as well as a credit', () => {
+  const now = 1_000_000_000_000
+  const onTopic = entry({
+    id: 'on', scope: 'global', title: '前缀缓存只能追加', body: '不要改写已有消息',
+    keys: ['前缀缓存', '追加'], updatedAt: now,
+  })
+  const offTopic = entry({
+    id: 'off', scope: 'global', title: 'Sidebar adapter', body: 'nothing to do with caches',
+    updatedAt: now,
+  })
+  const query = '改注入预算会不会破坏前缀缓存'
+  const yes = matchCredit(onTopic, query, 9, 2, { now })
+  assert.equal(yes.about, true)
+  assert.ok(yes.evidence.strongTerms >= 2, 'and it can say why')
+  assert.ok(yes.best.length > 0, 'the sentence that matched is reported for the log')
+  assert.ok(yes.score >= yes.relevance, 'the decayed score is at least the raw relevance')
+
+  const no = matchCredit(offTopic, query, 9, 2, { now })
+  assert.equal(no.about, false)
+  assert.equal(no.credited, false)
+  assert.equal(no.relevance, 0, 'and an unrelated entry says so plainly')
+})
+
+test('the never-surfaced reservation is bounded by the slots the scope really renders', () => {
+  const now = 1_000_000_000_000
+  const backlog = Array.from({ length: 8 }, (_, index) => entry({
+    id: `fresh-${index}`, scope: 'global', title: `Fresh ${index}`, body: 'never surfaced',
+    updatedAt: now - index, lastSurfacedAt: 0, source: 'auto',
+  }))
+  const established = Array.from({ length: 20 }, (_, index) => entry({
+    id: `old-${index}`, scope: 'global', title: `Old ${index}`, body: 'already listed',
+    updatedAt: now, lastUsedAt: now, lastSurfacedAt: now, uses: 6,
+  }))
+  const count = (list: readonly MemoryEntry[]): number => list.filter((value) => value.lastSurfacedAt <= 0).length
+
+  // A 12-slot scope at the shipped default of 3 is unchanged.
+  assert.equal(count(selectForSummary([...established, ...backlog], 12, { freshSlots: 3, now })), 3)
+  // A 4-slot scope is where the untruncated reservation took over: it is the
+  // global half, and every session in every workspace pays for it.
+  assert.equal(count(selectForSummary([...established, ...backlog], 4, { freshSlots: 3, now })), 1)
+  // One slot has no room to give, and two take one.
+  assert.equal(count(selectForSummary([...established, ...backlog], 1, { freshSlots: 3, now })), 0)
+  assert.equal(count(selectForSummary([...established, ...backlog], 2, { freshSlots: 3, now })), 1)
 })
 
 test('the summary groups a scope by kind, actionable kinds first', () => {

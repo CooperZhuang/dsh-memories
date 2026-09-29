@@ -8,8 +8,8 @@
  * @module dsh-memories/render
  */
 import { MEMORY_KIND_HEADINGS, MEMORY_KINDS } from './types.js'
-import type { MemoryEntry, MemoryHit } from './types.js'
-import { decayOf, importanceOf, recencyOf, relevanceOf } from './search.js'
+import type { MemoryEntry, MemoryHit, MemoryKind } from './types.js'
+import { decayOf, importanceOf, matchCredit, recencyOf, relevanceOf } from './search.js'
 import type { ScopeEntries } from './search.js'
 import type { SessionNote } from './storage.js'
 
@@ -67,18 +67,21 @@ function bullet(entry: MemoryEntry, maxChars: number, flag?: string): string {
  * listing cannot renew its own claim to the next listing. Ranking decides the
  * order; {@link selectForSummary} decides who gets in.
  *
- * When a `query` is supplied (the conversation's opening turn), a memory the
- * conversation actually names is lifted above the entries that merely have
- * history. Without it the summary is topic-blind and a broad scope spends every
- * session on whatever it read most in the past — measured, the injected global
- * half was the same six unrelated plugin notes in every workspace.
+ * When a `query` is supplied (the conversation's opening turn), the ranking is
+ * **tiered** rather than merely weighted. A memory the conversation actually
+ * names is ranked above every memory it does not; inside the tier the match
+ * itself decides, and the entry's own track record only breaks ties. Below the
+ * tier nothing changes and the weight orders as it always did.
  *
- * The lift is gated rather than gradual, and large rather than gentle. Gentle
- * does not work: at +60% a memory matching the opening turn still lost to an
- * entry whose only advantage was five recorded reads (2.0 × 1.6 = 3.2 against
- * 2.0 × 1.75 = 3.5), which is how a "prompt cache" query failed to surface the
- * prompt-cache rule. Below {@link TOPIC_LIFT_MIN_SCORE} nothing is lifted, so an
- * incidental shared word cannot displace a memory that keeps earning its place.
+ * It has to be a tier, not a multiplier, and it has to keep ordering inside the
+ * tier. The weight's own range is `importanceOf` (up to
+ * {@link AUTO_IMPORTANCE_CEILING} × {@link EXPLICIT_SOURCE_BONUS} = 3.5) times
+ * `decayOf` (0.25–1), so a bounded lift cannot outrank an entry that has simply
+ * been read a lot. Worse, a lift saturates: once two entries both pass the same
+ * relevance threshold they carry the same multiplier, and the order silently
+ * reverts to history. Measured on the real store, a query about how the summary
+ * is ranked left memories at relevance 62 and 51 unlisted while the global half
+ * showed entries at relevance 0 and 4.
  *
  * @param entries - entries to order.
  * @param now - clock.
@@ -87,27 +90,87 @@ function bullet(entry: MemoryEntry, maxChars: number, flag?: string): string {
  */
 export function rankForSummary(entries: readonly MemoryEntry[], now = Date.now(), query?: string): MemoryEntry[] {
   const needle = query?.trim() ?? ''
-  /** How much a topical hit may lift an entry; see {@link TOPIC_LIFT}. */
-  const lift = (entry: MemoryEntry): number => {
-    if (needle.length === 0) return 1
-    const relevance = relevanceOf(entry, needle)
-    if (relevance < TOPIC_LIFT_MIN_SCORE) return 1
-    return 1 + TOPIC_LIFT * Math.min(1, relevance / TOPIC_LIFT_FULL_SCORE)
+  // Scored once per entry, because both the tier and the within-tier order need
+  // the same number and the scorer is the expensive part.
+  const verdicts = new Map<string, { about: boolean; relevance: number }>()
+  for (const entry of entries) {
+    if (needle.length === 0) {
+      verdicts.set(entry.id, { about: false, relevance: 0 })
+      continue
+    }
+    const credit = matchCredit(entry, needle, TOPIC_TIER_MIN_SCORE, TOPIC_TIER_MIN_TERMS, { singleTerm: false, now })
+    verdicts.set(entry.id, { about: credit.about, relevance: credit.relevance })
   }
-  const weight = (entry: MemoryEntry): number => importanceOf(entry) * decayOf(entry, now) * lift(entry)
-  return [...entries].sort((left, right) => weight(right) - weight(left)
-    || right.updatedAt - left.updatedAt
-    || left.title.localeCompare(right.title))
+  const weight = (entry: MemoryEntry): number => importanceOf(entry) * decayOf(entry, now)
+  return [...entries].sort((left, right) => {
+    const a = verdicts.get(left.id)
+    const b = verdicts.get(right.id)
+    const tier = Number(b?.about ?? false) - Number(a?.about ?? false)
+    if (tier !== 0) return tier
+    // Inside the topical tier the match itself decides, and the entry's own track
+    // record only breaks ties. A bounded multiplier could not do this: it
+    // saturates, so every entry past the same relevance got the same boost and
+    // the order silently reverted to history — which is what left a relevance-62
+    // memory unlisted while relevance-30 ones were shown.
+    const match = (b?.relevance ?? 0) - (a?.relevance ?? 0)
+    if (match !== 0) return match
+    return weight(right) - weight(left)
+      || right.updatedAt - left.updatedAt
+      || left.title.localeCompare(right.title)
+  })
 }
 
-/** Most a topical hit may multiply an entry's summary weight. */
-export const TOPIC_LIFT = 1.5
+/**
+ * Relevance floor for the summary's topical tier.
+ *
+ * Below this an entry is not "about" the conversation whatever else it shares
+ * with it. Set at the same order as the recall gate on purpose: the two decide
+ * the same question — is this turn about that memory — and they should not
+ * disagree about where the line is.
+ */
+export const TOPIC_TIER_MIN_SCORE = 9
 
-/** Relevance at which the topical lift is fully earned; see {@link TOPIC_LIFT}. */
-export const TOPIC_LIFT_FULL_SCORE = 20
+/**
+ * Strong-field terms the topical tier requires.
+ *
+ * The tier is what lets an entry outrank a well-read unrelated one, so it must
+ * not be reachable on a single common word. This is the same default the recall
+ * path uses, and for the same reason: 「该插件是否有日志」 shares an isolated 插件
+ * with memories about plugin registration order and cost meters.
+ *
+ * The tier applies the rule strictly — no "one strong term plus a decisive
+ * score" escape hatch, which recall allows so a one-keyword turn like 「端口
+ * 3080」 still finds its memory. A summary slot is not a lookup: the escape
+ * hatch admitted twelve memories at one shared term each on the real store,
+ * which made the tier stop discriminating at all.
+ */
+export const TOPIC_TIER_MIN_TERMS = 2
 
-/** Relevance below which a match earns no lift at all; see {@link TOPIC_LIFT}. */
-export const TOPIC_LIFT_MIN_SCORE = 10
+/**
+ * Share of a scope's slots the never-surfaced reservation may take, rounded
+ * down, with a floor of one while the scope has room to spare.
+ *
+ * The reservation exists so a saturated scope eventually shows something new.
+ * It is a maintenance slot, not a ranking, and it is paid for out of the same
+ * budget as everything else — so it has to be bounded by the scope's real size
+ * or it simply becomes the scope.
+ *
+ * A third is what leaves the shipped defaults behaving: the project half
+ * renders up to 12 and the default asks for 3, unchanged. The global half
+ * renders up to 4, and there the untruncated 3 left ONE slot for the ranking —
+ * measured on the real store, three never-listed global memories took three of
+ * the four shared bullets and every topically relevant global memory was gone,
+ * including the one at relevance 62. The global half is the one every session
+ * in every workspace pays for, so spending three quarters of it on whatever
+ * happened to be written recently is the worst trade in the block.
+ *
+ * @param perScope - the slots this scope can actually render.
+ * @returns the most slots the reservation may take.
+ */
+export function maxFreshSlots(perScope: number): number {
+  if (perScope <= 1) return 0
+  return Math.max(1, Math.floor(perScope / 3))
+}
 
 /**
  * Choose which entries one scope may list in the injected summary.
@@ -130,7 +193,11 @@ export const TOPIC_LIFT_MIN_SCORE = 10
  *
  * `freshSlots` entries are reserved at most, and never all of them: the ranking
  * still decides whether a scope lists anything at all, and a slot it does not
- * use falls back to the ranking.
+ * use falls back to the ranking. The reservation is additionally capped at
+ * {@link maxFreshSlots} of the scope's own slots, and the caller is expected to
+ * pass the number of bullets that scope can really render rather than a shared
+ * maximum — a reservation sized against a cap the scope never reaches is a
+ * reservation that silently takes the whole section.
  *
  * The returned order is PROTECTION order, reserved entries first, not rank order.
  * The renderer drops entries from the end of this array when the byte budget is
@@ -152,7 +219,7 @@ export function selectForSummary(
   if (perScope <= 0) return []
   const ranked = rankForSummary(entries, now, options.query)
   if (ranked.length <= perScope) return ranked
-  const reserve = Math.max(0, Math.min(options.freshSlots ?? 0, perScope - 1))
+  const reserve = Math.max(0, Math.min(options.freshSlots ?? 0, perScope - 1, maxFreshSlots(perScope)))
   const chosen: MemoryEntry[] = []
   const chosenIds = new Set<string>()
   // Pins first: a person asked for these by name, so which of them appears is not
@@ -175,7 +242,7 @@ export function selectForSummary(
     if (needle.length > 0) {
       for (const entry of entries) {
         const score = relevanceOf(entry, needle)
-        if (score >= TOPIC_LIFT_MIN_SCORE) relevance.set(entry.id, score)
+        if (score >= TOPIC_TIER_MIN_SCORE) relevance.set(entry.id, score)
       }
     }
     const unseen = entries
@@ -307,47 +374,52 @@ export function renderMemorySummaryResult(
     const budget = scope.maxBytes ?? Number.POSITIVE_INFINITY
     const lines = [`## ${scope.heading} (${scope.total})`]
     let used = bytes(lines[0] ?? '')
-    const shown: MemoryEntry[] = []
-    // Pinned entries come first, before the kind grouping. The selection puts
-    // them first, but grouping by kind would re-order them back to the end of
-    // their kind — and the byte budget drops from the end, so a pinned overview
-    // (kind `fact`) was exactly the bullet that got cut. A pin is a promise that
-    // the entry is listed whenever it fits, so it cannot be the first casualty.
-    const pinned = listed.filter((entry) => entry.pinned === true)
-    for (const entry of pinned) {
+    // Admission is decided in RANK order and only then grouped by kind.
+    //
+    // Deciding it in kind order — which is what this used to do, kind by kind,
+    // dropping from the end of each group — made the byte budget a statement
+    // about `kind` rather than about relevance: a highly relevant `fact` or
+    // `procedure` was the first casualty, because those groups render last.
+    // Measured on a real store, a memory at relevance 52 was cut while one at
+    // 20 was kept, purely because of where its kind sits in {@link MEMORY_KINDS}.
+    //
+    // So: walk the ranked list once, spend the budget on the best entries that
+    // fit, and let the kind headings describe the survivors afterwards. The
+    // grouping is presentation; it must not decide who gets read.
+    //
+    // Pinned entries come first. The selection already puts them first, and a
+    // pin is a promise that the entry is listed whenever it fits, so it cannot
+    // be the first casualty of byte pressure.
+    const admitted: MemoryEntry[] = []
+    const kindsUsed = new Set<MemoryKind>()
+    for (const entry of listed) {
       const line = bullet(entry, maxChars, options.flags?.get(entry.id))
-      const cost = bytes(line) + 1
-      if (shown.length > 0 && used + cost > budget) break
-      lines.push(line)
+      // The first entry of each kind pays for that kind's heading. A pinned entry
+      // is exempt: it is listed outside the grouping, so it carries no heading.
+      const heading = entry.pinned === true ? 0 : (kindsUsed.has(entry.kind) ? 0 : bytes(`### ${MEMORY_KIND_HEADINGS[entry.kind]}`) + 1)
+      const cost = bytes(line) + 1 + heading
+      // Only the section's very first bullet bypasses the budget, so a scope with
+      // something to say never renders as an empty heading. Every later bullet —
+      // including the first of each kind — is subject to it, or a scope with four
+      // kinds would always cost four bullets.
+      if (admitted.length > 0 && used + cost > budget) break
+      if (entry.pinned !== true) kindsUsed.add(entry.kind)
       used += cost
-      shown.push(entry)
+      admitted.push(entry)
     }
-    // Within a scope, group by kind so the actionable memories (a preference
-    // to follow, a failure to avoid) are not buried among background facts.
+    // Render the survivors, pinned first and then grouped by kind so the
+    // actionable memories (a preference to follow, a failure to avoid) are not
+    // buried among background facts.
+    const pinned = admitted.filter((entry) => entry.pinned === true)
+    lines.push(...pinned.map((entry) => bullet(entry, maxChars, options.flags?.get(entry.id))))
     for (const kind of MEMORY_KINDS) {
-      const group = listed.filter((entry) => entry.kind === kind && entry.pinned !== true)
+      const group = admitted.filter((entry) => entry.kind === kind && entry.pinned !== true)
       if (group.length === 0) continue
-      const heading = `### ${MEMORY_KIND_HEADINGS[kind]}`
-      const kept: MemoryEntry[] = []
-      for (const entry of group) {
-        const line = bullet(entry, maxChars, options.flags?.get(entry.id))
-        const cost = bytes(line) + 1 + (kept.length === 0 ? bytes(heading) + 1 : 0)
-        // Only the section's very first bullet bypasses the budget, so a scope
-        // with something to say never renders as an empty heading. Every later
-        // bullet — including the first of each kind group — is subject to it,
-        // or a scope with four kinds would always cost four bullets.
-        if (shown.length + kept.length > 0 && used + cost > budget) break
-        kept.push(entry)
-        used += cost
-      }
-      if (kept.length > 0) {
-        lines.push(heading, ...kept.map((entry) => bullet(entry, maxChars, options.flags?.get(entry.id))))
-        shown.push(...kept)
-      }
+      lines.push(`### ${MEMORY_KIND_HEADINGS[kind]}`, ...group.map((entry) => bullet(entry, maxChars, options.flags?.get(entry.id))))
     }
-    const omitted = scope.total - shown.length
+    const omitted = scope.total - admitted.length
     if (omitted > 0) lines.push(`- … ${omitted} more not shown`)
-    return { text: lines.join('\n'), listed: shown }
+    return { text: lines.join('\n'), listed: admitted }
   }
   /**
    * Preview lengths a capped scope may trade down through.

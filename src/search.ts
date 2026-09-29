@@ -24,8 +24,29 @@ const CJK = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/u
 const CJK_CHAR = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/gu
 /** A maximal run of CJK characters. */
 const CJK_RUN = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+/gu
-/** Shortest shared CJK run that counts as strong evidence. */
-const MIN_SHARED_RUN = 3
+/**
+ * Shortest shared CJK run that counts as strong evidence.
+ *
+ * Two, and this is the single most consequential constant in the file. At three,
+ * a Chinese query only matched a memory when the two shared the same *phrase* —
+ * the right idea and the wrong threshold. Natural turns and titles restate the
+ * same topic in different words, so 「帮我把这次改动提交一下」 shares no
+ * three-character run with 「把混装的工作区改动拆成两笔提交」 even though both are
+ * unmistakably about committing changes. Measured on the real store, six
+ * realistic mid-conversation turns recalled nothing at all, and every one had a
+ * memory sitting right there: 「抽取任务好像没在跑」 against 「后台抽取 2026-09-22
+ * 起停摆」 is the clearest — one shared pair, 抽取, and no shared phrase.
+ *
+ * At two, each shared pair counts as its own unit of evidence and the
+ * *structural* gate does the work instead: recall requires two of them
+ * ({@link DEFAULT_RECALL_MIN_TERMS}), so an isolated common pair still cannot
+ * carry a match. That is the case three was introduced for — 「该插件是否有日志」
+ * shares 插件, and only 插件, with a memory about plugin registration order — and
+ * it stays rejected, because it is one term rather than two. Three was buying a
+ * proxy for "more than one"; two counts that directly, and it counts pairs that
+ * are not adjacent to each other.
+ */
+const MIN_SHARED_RUN = 2
 /** Lowercase Latin, digits, and underscore — the "word" case. */
 const WORD = /[a-z0-9_]+/gu
 
@@ -559,6 +580,107 @@ export function explainEntry(entry: MemoryEntry, query: string, now = Date.now()
     score: match.relevance * importanceOf(entry) * decayOf(entry, now),
     best: match.best,
     evidence: match.evidence,
+  }
+}
+
+/**
+ * How much clearer than the floor a single strong term has to be on its own.
+ *
+ * One substantive term is half the evidence two are, so it only counts when the
+ * score it produced is decisive rather than marginal. Without this the structural
+ * gate would admit a memory that shares one distinctive word with the turn.
+ */
+export const QUALIFIED_SCORE_FACTOR = 2
+
+/** One entry's verdict on whether a turn is actually about it. */
+export interface MatchCredit {
+  /** True when the entry is about the turn, not merely adjacent to it. */
+  readonly about: boolean
+  /** True when the score is decisive enough to carry a single strong term. */
+  readonly distinctive: boolean
+  /** True when the evidence gate is satisfied on its own terms. */
+  readonly credited: boolean
+  /** Lexical relevance, before importance and decay. */
+  readonly relevance: number
+  /** Relevance weighted by importance and recency, for ordering candidates. */
+  readonly score: number
+  /** The sentence that produced the score. */
+  readonly best: string
+  /** The structural evidence behind the score. */
+  readonly evidence: MatchEvidence
+}
+
+/** How strictly {@link matchCredit} applies its structural gate. */
+export interface CreditOptions {
+  /**
+   * Whether ONE strong term plus a decisive score is enough on its own.
+   *
+   * Right for a recall delta, wrong for the summary's topical tier. The recall
+   * path exists to answer "does this turn touch something already known", and a
+   * one-keyword turn ("端口 3080") is exactly what it must catch. The summary
+   * instead decides who outranks a well-read memory, so it demands the full
+   * term count: with the escape hatch on, measured on the real store, a query
+   * about how the summary is ranked put twelve memories in the topical tier on
+   * one shared term each, and the tier stopped discriminating — the ranking
+   * reverted to history with a gate in front of it.
+   */
+  readonly singleTerm?: boolean
+  /** Clock used for the decayed score. */
+  readonly now?: number
+}
+
+/**
+ * Whether one entry is genuinely about one turn — the single decision behind
+ * both the injected summary's topical tier and the on-demand recall gate.
+ *
+ * Two gates that answer different questions, and neither replaces the other:
+ *
+ * - **FLOOR** (`minScore`) is the caller's strictness knob: the relevance an
+ *   entry has to reach at all.
+ * - **CREDIT** is structural, and a score threshold cannot replace it for
+ *   Chinese. Measured on a real 54-memory store, 「该插件是否有日志」 shares the
+ *   isolated bigram 插件 with a memory about an unrelated cost-meter bug and
+ *   scores 12 — above any floor low enough to admit a paraphrase. Credit asks
+ *   instead for substantive terms: a Latin word of three characters or more, or
+ *   a CJK pair inside a shared run of three or more, which is the only Chinese
+ *   term a merely common pair cannot fake.
+ *
+ * A whole-query hit stands alone; otherwise `minTerms` are required, with one
+ * allowed when the score is {@link QUALIFIED_SCORE_FACTOR} times the floor and
+ * {@link CreditOptions.singleTerm} leaves that escape hatch open.
+ *
+ * This lives here, once, because the summary and the recall path used to spell
+ * the rule out separately and the two copies had already drifted apart.
+ *
+ * @param entry - candidate entry.
+ * @param query - the raw turn or search text.
+ * @param minScore - the relevance floor.
+ * @param minTerms - strong terms required when the score is not decisive.
+ * @param options - gate strictness and clock.
+ * @returns the verdict with the evidence behind it.
+ */
+export function matchCredit(
+  entry: MemoryEntry,
+  query: string,
+  minScore: number,
+  minTerms: number,
+  options: CreditOptions = {},
+): MatchCredit {
+  const now = options.now ?? Date.now()
+  const singleTerm = options.singleTerm ?? true
+  const match = bestMatch(entry, query)
+  const distinctive = match.relevance >= minScore * QUALIFIED_SCORE_FACTOR
+  const credited = match.evidence.phrase
+    || match.evidence.strongTerms >= minTerms
+    || (singleTerm && match.evidence.strongTerms >= 1 && distinctive)
+  return {
+    about: match.relevance >= minScore && credited,
+    distinctive,
+    credited,
+    relevance: match.relevance,
+    best: match.best,
+    evidence: match.evidence,
+    score: match.relevance * importanceOf(entry) * decayOf(entry, now),
   }
 }
 
