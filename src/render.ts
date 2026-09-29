@@ -203,7 +203,9 @@ export function maxFreshSlots(perScope: number): number {
  * The renderer drops entries from the end of this array when the byte budget is
  * tight — on a real store it renders about six per scope, not the twelve it was
  * offered — so a reserved entry that sorted last would be the first casualty of
- * exactly the pressure it exists to survive.
+ * exactly the pressure it exists to survive. That is also why the topical floor
+ * comes first: whatever the byte budget keeps is the head of this array, so an
+ * order that leads with pins and reservations hands the budget to them.
  *
  * @param entries - every entry in one scope.
  * @param perScope - how many the summary may list.
@@ -222,6 +224,32 @@ export function selectForSummary(
   const reserve = Math.max(0, Math.min(options.freshSlots ?? 0, perScope - 1, maxFreshSlots(perScope)))
   const chosen: MemoryEntry[] = []
   const chosenIds = new Set<string>()
+  // The topical floor comes before everything, including pins.
+  //
+  // A pin is a promise that the entry is listed whenever it fits, and the fresh
+  // reservation exists so a saturated scope shows something new — but neither
+  // promise is a licence to evict a memory the conversation is demonstrably
+  // ABOUT. Pins win their own lane and are never dropped, yet with five pins and
+  // a three-slot reservation in a twelve-slot scope they took eight slots, and
+  // the renderer's byte budget then cut the section to about six: the ranked
+  // list contributed one, and measured on a real store the entry at relevance
+  // 116 — by far the best match for the turn, top of 150 — never appeared at all.
+  //
+  // So when there is a topic signal, the head of the ranking is protected before
+  // the pins are counted. Without a query nothing changes, and a pin still
+  // outranks everything below the tier.
+  const needle = options.query?.trim() ?? ''
+  const floor = needle.length === 0 ? 0 : Math.max(1, Math.floor(perScope / 3))
+  if (floor > 0) {
+    for (const entry of ranked) {
+      if (chosen.length >= floor) break
+      // Pins keep their own lane; this floor is for the topic, not for them.
+      if (entry.pinned === true) continue
+      if (!matchCredit(entry, needle, TOPIC_TIER_MIN_SCORE, TOPIC_TIER_MIN_TERMS, { singleTerm: false, now }).about) break
+      chosen.push(entry)
+      chosenIds.add(entry.id)
+    }
+  }
   // Pins first: a person asked for these by name, so which of them appears is not
   // the ranking's call. They compete only with each other, so a scope cannot be
   // flooded by pinning everything.

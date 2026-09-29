@@ -471,6 +471,48 @@ test('the never-surfaced reservation is bounded by the slots the scope really re
   assert.equal(count(selectForSummary([...established, ...backlog], 2, { freshSlots: 3, now })), 1)
 })
 
+test('a saturated scope of pins still shows what the turn is about', () => {
+  const now = 1_000_000_000_000
+  // Five pins in a twelve-slot scope, plus a three-slot reservation: eight
+  // slots spoken for before the ranking is consulted. The renderer then cuts the
+  // section to about six by bytes, so whatever leads the protection order is
+  // what survives — and pins leading means the ranking contributes one bullet.
+  // Measured on the real store: the entry at relevance 116, top of 150 for that
+  // turn, never appeared at all.
+  const pins = Array.from({ length: 5 }, (_, index) => entry({
+    id: `pin-${index}`, scope: 'project', kind: 'fact', title: `部署事实 ${index}`,
+    body: '与本轮完全无关的一条部署事实。', pinned: true, updatedAt: now - index,
+  }))
+  const fresh = Array.from({ length: 3 }, (_, index) => entry({
+    id: `fresh-${index}`, scope: 'project', kind: 'fact', title: `新写入 ${index}`,
+    body: '刚写下、从未露面的新条目。', updatedAt: now - index, lastSurfacedAt: 0, source: 'auto',
+  }))
+  const about = entry({
+    id: 'about', scope: 'project', kind: 'knowledge', title: '异常与通知文案是写死的中文',
+    body: '异常中心 通知中心 的文案无法跟随语言切换。',
+    keys: ['异常中心', '通知中心', '文案', '语言切换'], updatedAt: now - 400 * 86_400_000, uses: 0,
+  })
+  const filler = Array.from({ length: 20 }, (_, index) => entry({
+    id: `old-${index}`, scope: 'project', kind: 'fact', title: `旧条目 ${index}`,
+    body: '历史条目。', updatedAt: now, lastUsedAt: now, lastSurfacedAt: now, uses: 6,
+  }))
+  const query = '评估异常中心、通知中心文案时'
+  const selected = selectForSummary([...pins, ...fresh, ...filler, about], 12, { freshSlots: 3, now, query })
+
+  assert.equal(selected[0]?.id, 'about', 'the topical floor leads, ahead of the pins')
+  // The promises still hold: no pin is evicted, and the reservation still runs.
+  assert.equal(selected.filter((value) => value.pinned === true).length, 5, 'every pin is still selected')
+  assert.ok(selected.some((value) => value.id === 'fresh-0'), 'and the fresh reservation still gets a slot')
+
+  // And the consequence that matters: the byte budget keeps the head of this
+  // array, so the memory the turn is about is actually rendered.
+  const text = renderMemorySummary([{
+    label: 'project', heading: 'Project memories', total: 25, entries: selected,
+  }], { maxBytes: 1_500, maxEntriesPerScope: 12 })
+  assert.ok(text !== undefined)
+  assert.match(text, /异常与通知文案是写死的中文/u, 'the best match survives a section full of pins')
+})
+
 test('the summary groups a scope by kind, actionable kinds first', () => {
   const scopes = [{
     label: 'global',
