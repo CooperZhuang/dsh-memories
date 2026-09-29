@@ -57,7 +57,22 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseEntry } from '../lib/storage.js'
-import { scoreEntry, searchMemories } from '../lib/search.js'
+import { matchCredit, scoreEntry, searchMemories } from '../lib/search.js'
+
+/**
+ * The recall gate's defaults, as `settings.yaml` ships them.
+ *
+ * The plugin makes two different promises and a probe should measure both.
+ * `searchMemories` promises a *ranking* — the model asked for it, so the answer
+ * should be near the top. `matchCredit` promises *reachability* — the injector
+ * runs it over the whole store on every step, and when it says yes the memory
+ * enters the conversation unasked. A memory can fail the first and pass the
+ * second, and the real store has one: 「怎么给 dsh 插件加日志才看得到」 ranks
+ * outside the top eight behind heavily-read explicit memories, while the gate
+ * admits it outright on five strong terms.
+ */
+const RECALL_MIN_SCORE = 9
+const RECALL_MIN_TERMS = 2
 
 /** Where the memory store lives. */
 function storeRoot() {
@@ -177,25 +192,41 @@ for (const probe of probes) {
     marks.push(`${config.name}:${ranked[config.name].ok ? '✓' : '✗'}`)
     detail.push(`    ${config.name.padEnd(8)} rank=${JSON.stringify(ranked[config.name].at)} top=${JSON.stringify(ranked[config.name].ids)}`)
   }
-  const bucket = perShape.get(probe.shape) ?? { total: 0, lexical: 0, time: 0, full: 0 }
+  // The other promise: would the injector's gate admit it, whatever its rank?
+  const gate = wanted.map((id) => {
+    const entry = entries.find((candidate) => candidate.id === id)
+    if (entry === undefined) return { id, about: false, relevance: 0, terms: 0 }
+    const credit = matchCredit(entry, probe.query, RECALL_MIN_SCORE, RECALL_MIN_TERMS, { now })
+    return { id, about: credit.about, relevance: credit.relevance, terms: credit.evidence.strongTerms }
+  })
+  const reachable = gate.length > 0 && gate.every((item) => item.about)
+  const bucket = perShape.get(probe.shape) ?? { total: 0, lexical: 0, time: 0, full: 0, gate: 0 }
   bucket.total += 1
+  if (reachable) bucket.gate = (bucket.gate ?? 0) + 1
   for (const config of CONFIGS) if (ranked[config.name].ok) bucket[config.name] += 1
   perShape.set(probe.shape, bucket)
-  console.log(`· ${String(probe.id).padEnd(16)} ${String(probe.shape).padEnd(10)} ${marks.join('  ')}   ${JSON.stringify(probe.query)}`)
+  console.log(`· ${String(probe.id).padEnd(16)} ${String(probe.shape).padEnd(10)} ${marks.join('  ')}  gate:${reachable ? '✓' : '✗'}   ${JSON.stringify(probe.query)}`)
   if (probe.note !== undefined) console.log(`    why: ${probe.note}`)
+  if (gate.length > 0) {
+    console.log(`    recall gate: ${gate.map((item) => `${item.id.slice(0, 24)} about=${item.about} rel=${item.relevance.toFixed(1)} terms=${item.terms}`).join('; ')}`)
+  }
   if (premise === false) console.log('    ⚠ premise broken: lexical retrieval already returns an expected id, so this probe does not test the hop')
   if (premise === true) console.log(`    premise holds: lexical retrieval does not return it in the top ${top}`)
   if (flags.verbose !== undefined) console.log(detail.join('\n'))
 }
 
 const sum = [...perShape.values()].reduce((acc, bucket) => ({
-  total: acc.total + bucket.total, lexical: acc.lexical + bucket.lexical, time: acc.time + bucket.time, full: acc.full + bucket.full,
-}), { total: 0, lexical: 0, time: 0, full: 0 })
+  total: acc.total + bucket.total,
+  lexical: acc.lexical + bucket.lexical,
+  time: acc.time + bucket.time,
+  full: acc.full + bucket.full,
+  gate: (acc.gate ?? 0) + (bucket.gate ?? 0),
+}), { total: 0, lexical: 0, time: 0, full: 0, gate: 0 })
 console.log('\nper shape (ok / total)')
 for (const [shape, bucket] of perShape) {
-  console.log(`  ${shape.padEnd(10)} lexical ${bucket.lexical}/${bucket.total}   time ${bucket.time}/${bucket.total}   full ${bucket.full}/${bucket.total}`)
+  console.log(`  ${shape.padEnd(10)} lexical ${bucket.lexical}/${bucket.total}   time ${bucket.time}/${bucket.total}   full ${bucket.full}/${bucket.total}   gate ${bucket.gate ?? 0}/${bucket.total}`)
 }
-console.log(`  ${'ALL'.padEnd(10)} lexical ${sum.lexical}/${sum.total}   time ${sum.time}/${sum.total}   full ${sum.full}/${sum.total}`)
+console.log(`  ${'ALL'.padEnd(10)} lexical ${sum.lexical}/${sum.total}   time ${sum.time}/${sum.total}   full ${sum.full}/${sum.total}   gate ${sum.gate ?? 0}/${sum.total}`)
 console.log(`\nstore: ${[...cache.entries()].map(([scope, list]) => `${scope}=${list.length}`).join('  ')}`)
 
 // How much material the hop actually has. A scope whose entries share two links
