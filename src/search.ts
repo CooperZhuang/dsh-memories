@@ -789,13 +789,19 @@ export const EXPAND_SEEDS = 3
 export const EXPAND_MIN_SHARED = 2
 
 /**
- * A related entry's score, as a fraction of the weakest direct hit's.
+ * A related entry's score, as a fraction of the seed it was reached from.
  *
- * Below 1 by construction, which is the whole safety property: a hop can only
- * fill slots that lexical matching did not use, never displace a match. Measured
- * on the real store, 581 of 613 entries carry `keys` and the longest link sets
- * are the plugin's own notes, so an expansion that could outrank a real match
- * would flood every session with them.
+ * Spreading activation, in one line: a neighbour inherits a fixed fraction of
+ * the activation of the node that lit it up. It was first written as a fraction
+ * of the WEAKEST direct hit, so that a hop could never displace a real match —
+ * which sounds safe and is useless. The real-store eval showed why: a query can
+ * match forty entries on one shared word each, and every one of them outranks a
+ * hop that is pegged to the weakest of the top three. 「注入相关性的排查一共分了
+ * 几轮」 left all four rounds out of the top five in every configuration.
+ *
+ * Tying the score to its own seed keeps the useful part of the old property —
+ * a hop never outranks the node it came from — while letting a neighbour of the
+ * *best* match beat entries that merely share a common word with the turn.
  */
 export const EXPAND_FACTOR = 0.4
 
@@ -849,9 +855,6 @@ export function relatedHits(
   const wantedKinds = options.kinds
   const exclude = options.exclude ?? new Set<string>()
   const links = seeds.map((seed) => ({ id: seed.entry.id, score: seed.score, words: linksOf(seed.entry) }))
-  // The weakest direct hit sets the ceiling, so every related entry ranks below
-  // every entry the turn actually matched.
-  const base = Math.min(...seeds.map((seed) => seed.score))
   const best = new Map<string, { entry: MemoryEntry; score: number; shared: number; via: string }>()
   for (const group of groups) {
     if (wantedScopes !== undefined && !wantedScopes.includes(group.scope)) continue
@@ -863,18 +866,22 @@ export function relatedHits(
       if (own.size === 0) continue
       let shared = 0
       let via = ''
+      let from = 0
       for (const seed of links) {
         let here = 0
         for (const word of own) if (seed.words.has(word)) here += 1
-        if (here > shared) {
+        // The strongest seed that links here is the one that lights it up. Ties
+        // keep the earlier (better-ranked) seed.
+        if (here > shared || (here === shared && here > 0 && seed.score > from)) {
           shared = here
           via = seed.id
+          from = seed.score
         }
       }
       if (shared < EXPAND_MIN_SHARED) continue
       // Two shared links earn half the allowance, four or more earn all of it:
       // a hop backed by two aliases is a hint, one backed by four is a filing.
-      const score = base * EXPAND_FACTOR * Math.min(1, shared / (EXPAND_MIN_SHARED * 2))
+      const score = from * EXPAND_FACTOR * Math.min(1, shared / (EXPAND_MIN_SHARED * 2))
       const previous = best.get(entry.id)
       if (previous === undefined || score > previous.score) best.set(entry.id, { entry, score, shared, via })
     }
@@ -932,12 +939,36 @@ export function searchMemories(
     || right.entry.updatedAt - left.entry.updatedAt
     || left.entry.title.localeCompare(right.entry.title))
   if (options.expand !== true) return hits.slice(0, limit)
-  // One hop, never two: a second hop from a guess is a different guess. The
-  // related scores are all below the weakest direct hit, so merging and
-  // re-slicing can only decide who fills the leftover slots.
+  // One hop, never two: a second hop from a guess is a different guess.
+  //
+  // Only the seeds are excluded, and for one reason: an entry cannot be its own
+  // neighbour. Two narrower-looking rules were tried first and both were wrong
+  // on the real store — excluding every entry with any lexical score at all
+  // (a memory that shares one word scores 2 and lands at rank 40, so the hop
+  // could never reach the case it exists for), and excluding the top `limit`
+  // (the eighth direct hit is exactly the entry a hop can lift; its rank went
+  // 8 → 9, the one entry that would have benefited being the one removed).
   const seeds = hits.slice(0, EXPAND_SEEDS)
-  const related = relatedHits(groups, seeds, { ...options, limit: EXPAND_MAX, exclude: new Set(hits.map((hit) => hit.entry.id)) })
-  return [...hits, ...related].sort((left, right) => right.score - left.score
+  const related = relatedHits(groups, seeds, { ...options, limit: EXPAND_MAX, exclude: new Set(seeds.map((hit) => hit.entry.id)) })
+  // An entry the query did match keeps its own score when that is the higher
+  // one, and never carries `via`: it matched, and saying otherwise would be a
+  // lie about the one thing the marker exists to state.
+  const directById = new Map(hits.map((hit) => [hit.entry.id, hit]))
+  const merged: MemoryHit[] = [...hits]
+  for (const hit of related) {
+    const direct = directById.get(hit.entry.id)
+    if (direct === undefined) merged.push(hit)
+    else if (hit.score > direct.score) merged.push({ entry: direct.entry, score: hit.score })
+  }
+  // Keep the best record per id. The direct list comes first, so keeping the
+  // first occurrence would silently discard every upgrade — which is exactly
+  // what the first version of this did, and what the eval caught.
+  const unique = new Map<string, MemoryHit>()
+  for (const hit of merged) {
+    const previous = unique.get(hit.entry.id)
+    if (previous === undefined || hit.score > previous.score) unique.set(hit.entry.id, hit)
+  }
+  return [...unique.values()].sort((left, right) => right.score - left.score
     || right.entry.updatedAt - left.entry.updatedAt
     || left.entry.title.localeCompare(right.entry.title)).slice(0, limit)
 }

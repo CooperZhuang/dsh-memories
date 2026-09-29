@@ -1,0 +1,22 @@
+{
+  "_comment": "检索离线评测的探针模板。真正的探针要按你自己的库标注（id 指向真实记忆），所以放在 eval/retrieval.local.json 里、不入库。这个模板用 expect: [] 表示「只看结果、不做断言」，拿它先看清自己库里的排序长什么样：node scripts/eval-retrieval.mjs --probes=eval/retrieval.example.json --top=8 --verbose",
+  "probes": [
+    {
+      "id": "explore-1",
+      "shape": "explore",
+      "scope": "global",
+      "query": "把这里换成你真实会问的一句话",
+      "expect": [],
+      "note": "expect 为空 = 观察模式：打印三列各自的 top N，不判定通过与否"
+    },
+    {
+      "id": "explore-2",
+      "shape": "explore",
+      "scope": "project:<slug>",
+      "scopes": ["global", "project:<slug>"],
+      "query": "也可以一次跨两个作用域，用 scopes 数组代替 scope",
+      "expect": [],
+      "note": "mode: first 要求期望条目排第 1；mode: include 只要求出现在前 N"
+    }
+  ]
+}

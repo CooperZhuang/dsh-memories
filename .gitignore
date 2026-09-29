@@ -20,3 +20,7 @@ Thumbs.db
 # Scratch overlays used while testing background passes; the settings they
 # carry are documented in README.md instead.
 scripts/*.patch.yml
+
+# Hand-labelled retrieval probes: they quote real memory ids and this repository
+# is public. The template (eval/retrieval.example.json) is committed instead.
+eval/*.local.json

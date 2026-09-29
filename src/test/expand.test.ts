@@ -113,3 +113,42 @@ test('a related hit is marked in the rendering', () => {
   assert.ok(!direct.includes('via='))
   assert.ok(hop.includes('via=state-db'), hop)
 })
+
+test('a hop is scored from the seed that lit it up, not from the weakest seed', () => {
+  // The real-store eval forced this: pegging every hop to the weakest of the top
+  // three put the best match's neighbours below entries that shared one word
+  // with the turn. Activation spreads from the node that fired.
+  const strong = entry('strong', '强命中', '正文。', { keys: ['k1', 'k2'] })
+  const weak = entry('weak-seed', '弱命中', '正文。', { keys: ['k3', 'k4'] })
+  const nearStrong = entry('near-strong', '强种子的邻居', '正文。', { keys: ['k1', 'k2'] })
+  const nearWeak = entry('near-weak', '弱种子的邻居', '正文。', { keys: ['k3', 'k4'] })
+  const groups: readonly ScopeEntries[] = [{ scope: 'global', label: 'global', entries: [nearStrong, nearWeak] }]
+  const related = relatedHits(groups, [{ entry: strong, score: 100 }, { entry: weak, score: 20 }], {})
+  assert.deepEqual(related.map((hit) => [hit.entry.id, hit.score, hit.via]), [
+    ['near-strong', 100 * EXPAND_FACTOR * 0.5, 'strong'],
+    ['near-weak', 20 * EXPAND_FACTOR * 0.5, 'weak-seed'],
+  ])
+})
+
+test('a weak direct hit is upgraded by the hop, and never marked as a hop', () => {
+  // The eval found this too: the eighth direct hit is exactly the entry a hop
+  // can lift, and "already a direct hit" must not disqualify it — but it did
+  // match the query, so it must not be labelled `via` either.
+  const keys = ['k1', 'k2', 'k3', 'k4']
+  const seed = entry('seed', '状态库放在哪里', '状态库的位置记在这里。', { keys })
+  const weakHit = entry('weak-hit', '另有一条', '正文里提了一句状态库。', { keys })
+  // Three entries that outrank the weak hit, so it is not itself one of the
+  // seeds: a seed is excluded from the hop, and with a two-entry corpus the
+  // thing under test would have been its own seed.
+  const fillers = [1, 2, 3].map((index) => entry(`filler-${index}`, `状态库相关 ${index}`, '无关正文。'))
+  const groups: readonly ScopeEntries[] = [{ scope: 'global', label: 'global', entries: [seed, weakHit, ...fillers] }]
+  const plain = searchMemories(groups, '状态库', { now: NOW, limit: 5 })
+  const expanded = searchMemories(groups, '状态库', { now: NOW, limit: 5, expand: true })
+  const before = plain.find((hit) => hit.entry.id === 'weak-hit')
+  const after = expanded.find((hit) => hit.entry.id === 'weak-hit')
+  assert.ok(before !== undefined && after !== undefined)
+  assert.ok(after.score > before.score, 'the hop lifted an entry the query matched only weakly')
+  assert.equal(after.via, undefined, 'it matched the query, so it is not a hop result')
+  const seedScore = expanded.find((hit) => hit.entry.id === 'seed')?.score ?? 0
+  assert.equal(after.score, seedScore * EXPAND_FACTOR, 'four shared links earn the full allowance')
+})
