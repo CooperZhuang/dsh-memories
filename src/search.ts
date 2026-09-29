@@ -17,6 +17,7 @@
  */
 import type { MemoryEntry, MemoryHit, MemoryKind, MemoryScope } from './types.js'
 import { queryMessages } from './query.js'
+import { parseTimeRange, within, type TimeRange } from './time.js'
 
 /** A CJK ideograph, including the extension blocks in common use. */
 const CJK = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/u
@@ -540,20 +541,69 @@ export function importanceOf(entry: MemoryEntry): number {
 }
 
 /**
- * Score one entry against a query: relevance × importance × recency decay.
+ * How much a turn's time window lifts an entry whose *measurement* falls in it.
+ *
+ * A `snapshot` carries `asOf` — the day the number was read — and that is the
+ * one timestamp in the store that answers a date question exactly. The lift is
+ * roughly a body hit's worth: enough to reorder memories that all match the
+ * words of the turn, never enough to outrank a memory that matches them better.
+ * It multiplies relevance rather than joining it, so a time match alone can
+ * never recall an entry — the lexical gate still runs first.
+ */
+export const TIME_MEASURED_BOOST = 1.5
+
+/**
+ * How much the window lifts an entry that was *learned* inside it.
+ *
+ * Weaker than {@link TIME_MEASURED_BOOST} on purpose: `createdAt` is when the
+ * memory was written, which for a conversation-derived memory is a good proxy
+ * for when the thing happened, but for a hand-written rule it is just when
+ * somebody typed it. Measured on the real store, 306 of 613 entries carry a
+ * session pointer, so the proxy holds for the extracted half and is a
+ * tie-breaker for the rest.
+ */
+export const TIME_CREATED_BOOST = 1.15
+
+/**
+ * The multiplier a turn's time window applies to one entry.
+ *
+ * `undefined` (no time expression, or an entry with no timestamps) returns 1, so
+ * turns that name no date are scored exactly as before. An entry is never
+ * *penalised* for falling outside the window: a durable fact learned in March
+ * can still be the answer to a question about last week, and punishing it would
+ * hide the answer more often than it would sharpen the list.
+ *
+ * @param entry - candidate entry.
+ * @param range - the turn's window, when it named one.
+ * @returns a multiplier of at least 1.
+ */
+export function timeBoost(entry: MemoryEntry, range: TimeRange | undefined): number {
+  if (range === undefined) return 1
+  if (within(entry.asOf, range)) return TIME_MEASURED_BOOST
+  if (within(entry.createdAt, range)) return TIME_CREATED_BOOST
+  return 1
+}
+
+/**
+ * Score one entry against a query: relevance × importance × recency decay × time.
  *
  * One formula for every ordering in the plugin — tool search, the injected
  * summary, and the on-demand recall threshold — so "worth recalling" means the
  * same thing everywhere and a knob tuned in one place holds in the others.
+ *
  * @param entry - candidate entry.
  * @param query - raw user/model query.
  * @param now - clock used for the decay.
+ * @param range - the turn's time window, or `undefined` to resolve it from the
+ *   query. Callers that score many entries for one turn should parse once with
+ *   {@link parseTimeRange} and pass it in.
  * @returns a non-negative score; `0` means the entry does not match.
  */
-export function scoreEntry(entry: MemoryEntry, query: string, now = Date.now()): number {
+export function scoreEntry(entry: MemoryEntry, query: string, now = Date.now(), range?: TimeRange | null): number {
   const relevance = relevanceOf(entry, query)
   if (relevance === 0) return 0
-  return relevance * importanceOf(entry) * decayOf(entry, now)
+  const window = range === undefined ? parseTimeRange(query, now) : range ?? undefined
+  return relevance * importanceOf(entry) * decayOf(entry, now) * timeBoost(entry, window)
 }
 
 /**
@@ -566,18 +616,20 @@ export function scoreEntry(entry: MemoryEntry, query: string, now = Date.now()):
  * @param entry - candidate entry.
  * @param query - raw turn or search text.
  * @param now - clock used for the decay.
+ * @param range - the turn's time window, or `undefined` to resolve it.
  * @returns relevance, the decayed score, the matching sentence, and evidence.
  */
-export function explainEntry(entry: MemoryEntry, query: string, now = Date.now()): {
+export function explainEntry(entry: MemoryEntry, query: string, now = Date.now(), range?: TimeRange | null): {
   relevance: number
   score: number
   best: string
   evidence: MatchEvidence
 } {
   const match = bestMatch(entry, query)
+  const window = range === undefined ? parseTimeRange(query, now) : range ?? undefined
   return {
     relevance: match.relevance,
-    score: match.relevance * importanceOf(entry) * decayOf(entry, now),
+    score: match.relevance * importanceOf(entry) * decayOf(entry, now) * timeBoost(entry, window),
     best: match.best,
     evidence: match.evidence,
   }
@@ -627,6 +679,15 @@ export interface CreditOptions {
   readonly singleTerm?: boolean
   /** Clock used for the decayed score. */
   readonly now?: number
+  /**
+   * The turn's time window, or `null` for "none".
+   *
+   * Omitted, the window is resolved from the query — right for a one-off call,
+   * wrong for a loop over the whole store, where the same regex sweep would run
+   * once per entry on every step. The recall path parses once per turn and
+   * passes the result here.
+   */
+  readonly range?: TimeRange | null
 }
 
 /**
@@ -668,6 +729,7 @@ export function matchCredit(
 ): MatchCredit {
   const now = options.now ?? Date.now()
   const singleTerm = options.singleTerm ?? true
+  const window = options.range === undefined ? parseTimeRange(query, now) : options.range ?? undefined
   const match = bestMatch(entry, query)
   const distinctive = match.relevance >= minScore * QUALIFIED_SCORE_FACTOR
   const credited = match.evidence.phrase
@@ -680,7 +742,7 @@ export function matchCredit(
     relevance: match.relevance,
     best: match.best,
     evidence: match.evidence,
-    score: match.relevance * importanceOf(entry) * decayOf(entry, now),
+    score: match.relevance * importanceOf(entry) * decayOf(entry, now) * timeBoost(entry, window),
   }
 }
 
@@ -696,7 +758,136 @@ export interface SearchOptions {
   readonly limit?: number
   /** Clock used for the recency tie-break; injected for deterministic tests. */
   readonly now?: number
+  /**
+   * Follow the top hits one hop along shared keys and tags, and let what they
+   * link to fill the slots the direct matches left empty.
+   *
+   * Off by default because a caller that wants "what matches these words" — the
+   * settings page's search box is exactly that — should get what it asked for.
+   * The model-facing search turns it on: it is asking "what do we know about
+   * this", and the answer includes the entries filed under the same aliases.
+   */
+  readonly expand?: boolean
 }
+
+/**
+ * Most direct hits used as seeds for the one-hop expansion.
+ *
+ * Three, because a hop from a weak match is a guess about a guess: the seeds are
+ * the entries the turn actually matched, and only their own links are followed.
+ */
+export const EXPAND_SEEDS = 3
+
+/**
+ * Keys or tags two entries must share before either can pull the other in.
+ *
+ * Two, for the same reason the recall gate asks for two substantive terms: one
+ * shared tag is the memory equivalent of a common word. `sqlite` alone links
+ * every database note in the store; `sqlite` plus `state.db` is a claim that the
+ * two entries are about the same thing.
+ */
+export const EXPAND_MIN_SHARED = 2
+
+/**
+ * A related entry's score, as a fraction of the weakest direct hit's.
+ *
+ * Below 1 by construction, which is the whole safety property: a hop can only
+ * fill slots that lexical matching did not use, never displace a match. Measured
+ * on the real store, 581 of 613 entries carry `keys` and the longest link sets
+ * are the plugin's own notes, so an expansion that could outrank a real match
+ * would flood every session with them.
+ */
+export const EXPAND_FACTOR = 0.4
+
+/** Most related entries one search may add. */
+export const EXPAND_MAX = 3
+
+/**
+ * The words an entry is filed under: its keys and its tags.
+ *
+ * Only these two fields, deliberately. The body mentions many things, and a hop
+ * through a body word would link entries that merely share vocabulary; `keys`
+ * exists to hold the *other names* for a memory, which is exactly the edge a
+ * graph walk should follow.
+ *
+ * @param entry - candidate entry.
+ * @returns lowercased, non-empty link words.
+ */
+function linksOf(entry: MemoryEntry): Set<string> {
+  const links = new Set<string>()
+  for (const value of [...entry.keys, ...entry.tags]) {
+    const link = value.trim().toLowerCase()
+    if (link.length > 0) links.add(link)
+  }
+  return links
+}
+
+/**
+ * Entries reachable from the direct hits by following shared keys/tags.
+ *
+ * The deterministic stand-in for the graph channel in a memory architecture like
+ * Hindsight's: instead of embedding entities, it uses the aliases a memory is
+ * already filed under as edges. 「你了解我的账户吗」 matches one fragment about
+ * the account; the other three carry the same `keys`, and this is what surfaces
+ * them together — without a model call and without an index.
+ *
+ * @param groups - per-scope entry lists, broadest first.
+ * @param seeds - the direct hits whose links are followed.
+ * @param options - the same filters as {@link searchMemories}, plus the ids to
+ *   exclude (the direct hits themselves, and anything already shown this session).
+ * @returns related hits, strongest first, with the seed each came from.
+ */
+export function relatedHits(
+  groups: readonly ScopeEntries[],
+  seeds: readonly MemoryHit[],
+  options: SearchOptions & { readonly exclude?: ReadonlySet<string> } = {},
+): MemoryHit[] {
+  const limit = options.limit ?? EXPAND_MAX
+  if (seeds.length === 0 || limit <= 0) return []
+  const wantedScopes = options.scopes
+  const wantedTags = (options.tags ?? []).map((tag) => tag.toLowerCase())
+  const wantedKinds = options.kinds
+  const exclude = options.exclude ?? new Set<string>()
+  const links = seeds.map((seed) => ({ id: seed.entry.id, score: seed.score, words: linksOf(seed.entry) }))
+  // The weakest direct hit sets the ceiling, so every related entry ranks below
+  // every entry the turn actually matched.
+  const base = Math.min(...seeds.map((seed) => seed.score))
+  const best = new Map<string, { entry: MemoryEntry; score: number; shared: number; via: string }>()
+  for (const group of groups) {
+    if (wantedScopes !== undefined && !wantedScopes.includes(group.scope)) continue
+    for (const entry of group.entries) {
+      if (exclude.has(entry.id)) continue
+      if (wantedKinds !== undefined && !wantedKinds.includes(entry.kind)) continue
+      if (wantedTags.length > 0 && !wantedTags.every((tag) => entry.tags.includes(tag))) continue
+      const own = linksOf(entry)
+      if (own.size === 0) continue
+      let shared = 0
+      let via = ''
+      for (const seed of links) {
+        let here = 0
+        for (const word of own) if (seed.words.has(word)) here += 1
+        if (here > shared) {
+          shared = here
+          via = seed.id
+        }
+      }
+      if (shared < EXPAND_MIN_SHARED) continue
+      // Two shared links earn half the allowance, four or more earn all of it:
+      // a hop backed by two aliases is a hint, one backed by four is a filing.
+      const score = base * EXPAND_FACTOR * Math.min(1, shared / (EXPAND_MIN_SHARED * 2))
+      const previous = best.get(entry.id)
+      if (previous === undefined || score > previous.score) best.set(entry.id, { entry, score, shared, via })
+    }
+  }
+  return [...best.values()]
+    .sort((left, right) => right.score - left.score
+      || right.shared - left.shared
+      || right.entry.updatedAt - left.entry.updatedAt
+      || left.entry.title.localeCompare(right.entry.title))
+    .slice(0, limit)
+    .map((hit) => ({ entry: hit.entry, score: hit.score, via: hit.via }))
+}
+
 
 /** One scope's entries plus the label to report them under. */
 export interface ScopeEntries {
@@ -725,13 +916,14 @@ export function searchMemories(
   const wantedTags = (options.tags ?? []).map((tag) => tag.toLowerCase())
   const wantedKinds = options.kinds
   const now = options.now ?? Date.now()
+  const window = parseTimeRange(query, now)
   const hits: MemoryHit[] = []
   for (const group of groups) {
     if (wantedScopes !== undefined && !wantedScopes.includes(group.scope)) continue
     for (const entry of group.entries) {
       if (wantedKinds !== undefined && !wantedKinds.includes(entry.kind)) continue
       if (wantedTags.length > 0 && !wantedTags.every((tag) => entry.tags.includes(tag))) continue
-      const score = scoreEntry(entry, query, now)
+      const score = scoreEntry(entry, query, now, window)
       if (score <= 0) continue
       hits.push({ entry, score })
     }
@@ -739,7 +931,15 @@ export function searchMemories(
   hits.sort((left, right) => right.score - left.score
     || right.entry.updatedAt - left.entry.updatedAt
     || left.entry.title.localeCompare(right.entry.title))
-  return hits.slice(0, limit)
+  if (options.expand !== true) return hits.slice(0, limit)
+  // One hop, never two: a second hop from a guess is a different guess. The
+  // related scores are all below the weakest direct hit, so merging and
+  // re-slicing can only decide who fills the leftover slots.
+  const seeds = hits.slice(0, EXPAND_SEEDS)
+  const related = relatedHits(groups, seeds, { ...options, limit: EXPAND_MAX, exclude: new Set(hits.map((hit) => hit.entry.id)) })
+  return [...hits, ...related].sort((left, right) => right.score - left.score
+    || right.entry.updatedAt - left.entry.updatedAt
+    || left.entry.title.localeCompare(right.entry.title)).slice(0, limit)
 }
 
 /**

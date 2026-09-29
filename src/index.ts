@@ -37,8 +37,9 @@ import { Config as ConfigSchema, consolidationRouteOf, readTunables, resolveConf
 import type { MemoriesConfig, MemoriesSettings, ResolvedConfig } from './config.js'
 import { MemoryStore, slugify } from './storage.js'
 import { StateStore, importLegacyState, statePath } from './state.js'
-import { browseMemories, matchCredit, QUALIFIED_SCORE_FACTOR, searchMemories } from './search.js'
+import { browseMemories, EXPAND_SEEDS, matchCredit, QUALIFIED_SCORE_FACTOR, relatedHits, searchMemories } from './search.js'
 import type { MatchCredit, ScopeEntries } from './search.js'
+import { parseTimeRange } from './time.js'
 import { isSubstantiveTurn } from './query.js'
 import { MEMORY_OPEN, rankForSummary, renderEntry, renderHit, renderMemorySummaryResult, renderRecall, renderScopeListing, selectForSummary } from './render.js'
 import type { SummaryScope } from './render.js'
@@ -399,7 +400,11 @@ export class MemoriesRuntime {
   /** Search both scopes. */
   async search(session: Session, query: string, options: { scopes?: readonly MemoryScope[]; tags?: readonly string[]; kinds?: readonly MemoryKind[]; limit?: number }) {
     const states = await this.allScopes(session)
-    return searchMemories(this.groups(states), query, options)
+    // Expansion is on for the model-facing search only: it is asking what is
+    // known about a subject, and the entries filed under the same keys are part
+    // of that answer. The settings page calls `searchMemories` directly and stays
+    // literal, because a person typing into a search box wants what matches.
+    return searchMemories(this.groups(states), query, { ...options, expand: true })
   }
 
   /** Browse both scopes without a query. */
@@ -988,6 +993,8 @@ export class MemoriesRuntime {
     if (query === undefined || !isSubstantiveTurn(query)) return undefined
     const seen = this.seenIds(session)
     const states = await this.allScopes(session)
+    // Resolved once for the turn: this loop scores every entry in the store.
+    const window = parseTimeRange(query)
     const eligible: (MatchCredit & { entry: MemoryEntry })[] = []
     let near: { id: string; relevance: number; terms: number } | undefined
     for (const state of states) {
@@ -996,7 +1003,7 @@ export class MemoriesRuntime {
         // One gate, two questions — see `matchCredit`. The floor is the caller's
         // knob; the credit rule is structural and is what keeps a Chinese turn
         // from recalling every memory that shares a common word like 插件 or 日志.
-        const why = matchCredit(entry, query, this.settings.recallMinScore, this.settings.recallMinTerms)
+        const why = matchCredit(entry, query, this.settings.recallMinScore, this.settings.recallMinTerms, { range: window ?? null })
         if (!why.about) {
           // Remember the closest miss, so "why was nothing recalled?" has an
           // answer in the log instead of being a silence.
@@ -1034,7 +1041,27 @@ export class MemoriesRuntime {
       return undefined
     }
     // Ranked by the decayed score, so recency and the entry's own track record
-    // break ties between equally relevant memories.
+    // break ties between equally relevant memories. The one-hop neighbours go in
+    // before the sort and carry a score below every credited entry, so they can
+    // only fill slots the lexical path left empty — the case this exists for is
+    // a turn that names one fragment of something the store filed in several.
+    const related = relatedHits(
+      this.groups(states),
+      eligible.slice(0, EXPAND_SEEDS).map((item) => ({ entry: item.entry, score: item.score })),
+      { exclude: new Set([...seen, ...eligible.map((item) => item.entry.id)]), limit: remaining },
+    )
+    for (const hit of related) {
+      eligible.push({
+        entry: hit.entry,
+        about: true,
+        distinctive: false,
+        credited: false,
+        relevance: 0,
+        score: hit.score,
+        best: '',
+        evidence: { strongTerms: 0, phrase: false },
+      })
+    }
     eligible.sort((left, right) => right.score - left.score
       || right.entry.updatedAt - left.entry.updatedAt
       || left.entry.title.localeCompare(right.entry.title))

@@ -36,6 +36,7 @@ export const CONSOLIDATE_SYSTEM = [
   '- Prefer fewer, sharper memories. Never invent facts that are not in the input.',
   '- Keep scope honest: a fact that is only true in one workspace stays "project"; a durable user preference or general tooling fact is "global". A fact that names a specific employer, product, customer, repository path, drive letter or internal host is NEVER global.',
   '- Keep the kind honest: "preference" for how the user wants work done, "failure" for something that went wrong, "procedure" for an ordered recipe, "knowledge" for a non-obvious technique, "fact" for background.',
+  '- When you MERGE memories into one, list every id you folded in under "derivedFrom" (the ids you are retiring because their content now lives in the merged memory). A plain rewrite of one memory, or a brand-new memory, gets an empty list. This is the only record of what a merge replaced: the sources are archived, and without the list a future reader cannot check the merged claim against what it replaced.',
   '- Do not record secrets, credentials, transient task state, or restatements of code.',
   '- Write every title, body and appliesTo in Simplified Chinese, keeping paths, commands, identifiers and product names exactly as they are. A memory the model wrote in Chinese must not come back in English.',
   '- The injected summary shows only the title and roughly the first 100 characters of the body (the budget forces short previews), so lead with the trigger and the decision; put the detail after. This matters most when merging: the merged body must open with the one thing a future session needs.',
@@ -48,7 +49,7 @@ export const CONSOLIDATE_SYSTEM = [
   'When two or more memories together describe a repeatable procedure that would be worth running again, also return it as a skill: a short kebab-case name, a one-line description, and the ordered steps. Skills are drafts a human promotes; return at most 2.',
   '',
   'Reply with JSON only, no prose and no code fence:',
-  '{"memories":[{"id":string|null,"scope":"global"|"project","kind":string,"title":string,"body":string,"tags":string[],"keys":string[],"appliesTo":string}],"retire":[string],"skills":[{"name":string,"description":string,"steps":string[]}],"notes":string}',
+  '{"memories":[{"id":string|null,"scope":"global"|"project","kind":string,"title":string,"body":string,"tags":string[],"keys":string[],"appliesTo":string,"derivedFrom":string[]}],"retire":[string],"skills":[{"name":string,"description":string,"steps":string[]}],"notes":string}',
   'Use null for the id of a new memory. "retire" lists ids to delete. "notes" is one short sentence about what you changed.',
 ].join('\n')
 
@@ -77,6 +78,7 @@ export const CONSOLIDATE_JSON_SCHEMA = {
           appliesTo: { type: 'string' },
           durability: { type: 'string', enum: ['durable', 'snapshot'] },
           asOf: { type: 'string' },
+          derivedFrom: { type: 'array', items: { type: 'string' } },
         },
       },
     },
@@ -111,7 +113,7 @@ export interface SkillDraft {
 /** One consolidation proposal, already validated against the input. */
 export interface ConsolidationPlan {
   /** Memories to add or replace, keyed by the id they replace (or `undefined` to add). */
-  readonly upserts: readonly { id: string | null; scope: MemoryScope; kind: MemoryKind; title: string; body: string; tags: readonly string[]; keys?: readonly string[]; appliesTo?: string; durability?: 'durable' | 'snapshot'; asOf?: number }[]
+  readonly upserts: readonly { id: string | null; scope: MemoryScope; kind: MemoryKind; title: string; body: string; tags: readonly string[]; keys?: readonly string[]; appliesTo?: string; durability?: 'durable' | 'snapshot'; asOf?: number; derivedFrom?: readonly string[] }[]
   /** Ids to delete. */
   readonly retire: readonly string[]
   /** Skill drafts extracted from the memory set. */
@@ -187,6 +189,11 @@ export function parsePlan(text: string, knownIds: ReadonlySet<string>, maxUpsert
     // the upsert preserves the stored value, so only an explicit field is passed.
     const snapshot = entry['durability'] === 'snapshot'
     const parsedAsOf = typeof entry['asOf'] === 'string' ? Date.parse(entry['asOf']) : Number.NaN
+    // Only ids the store has, never the entry itself: a merge trail that points
+    // at a memory nobody can open is worse than no trail, because it reads as
+    // evidence. The same discipline the `id` field already follows.
+    const rawDerived = Array.isArray(entry['derivedFrom']) ? entry['derivedFrom'] : []
+    const derivedFrom = [...new Set(rawDerived.filter((value): value is string => typeof value === 'string' && knownIds.has(value) && value !== id))]
     upserts.push({
       id,
       scope,
@@ -197,6 +204,7 @@ export function parsePlan(text: string, knownIds: ReadonlySet<string>, maxUpsert
       keys,
       ...appliesTo.length > 0 ? { appliesTo } : {},
       ...snapshot ? { durability: 'snapshot' as const, ...Number.isFinite(parsedAsOf) ? { asOf: parsedAsOf } : {} } : {},
+      ...derivedFrom.length > 0 ? { derivedFrom } : {},
     })
   }
   const rawRetire = Array.isArray(record['retire']) ? record['retire'] : []
@@ -707,6 +715,7 @@ export async function applyPlan(
         tags: item.tags,
         keys: item.keys ?? [],
         ...item.appliesTo === undefined ? {} : { appliesTo: item.appliesTo },
+        ...item.derivedFrom === undefined ? {} : { derivedFrom: item.derivedFrom },
       }
       const result = await target.upsert(
         draft,

@@ -95,6 +95,17 @@ export interface MemoryEntry {
    * rollout summary its read path can open.
    */
   readonly sourceSession?: string
+  /**
+   * Ids of the memories this one was built from, when it was merged from others.
+   *
+   * The answer to "why does it say that": `sourceSession` names the conversation
+   * a memory was learned in, this names the *entries* a consolidation folded
+   * into it. Without it a merge is a one-way door — the sources are archived and
+   * the surviving entry gives no sign that three memories became one, so the
+   * claim it now makes cannot be checked against what it replaced. Only ids the
+   * store could still resolve at write time are kept.
+   */
+  readonly derivedFrom?: readonly string[]
   /** Unix epoch milliseconds when the entry was first written. */
   readonly createdAt: number
   /** Unix epoch milliseconds of the most recent write. */
@@ -224,6 +235,8 @@ export interface MemoryDraft {
   readonly supersedes?: string
   /** Session the draft came from, recorded as {@link MemoryEntry.sourceSession}. */
   readonly sourceSession?: string
+  /** Entries this draft was merged from, recorded as {@link MemoryEntry.derivedFrom}. */
+  readonly derivedFrom?: readonly string[]
   /** Extra search keys (aliases, keyphrases) that should also find this memory. */
   readonly keys?: readonly string[]
 }
@@ -274,6 +287,14 @@ export interface MemoryHit {
   readonly entry: MemoryEntry
   /** Relevance score; higher is better. */
   readonly score: number
+  /**
+   * The entry this one was reached from, when it did not match the query itself.
+   *
+   * Set only by the one-hop expansion: the hit shares the seed's `keys`/`tags`
+   * rather than its words. Renderers say so out loud, because a result the query
+   * does not match must never be presented as one that does.
+   */
+  readonly via?: string
 }
 
 /** The source this plugin stamps on every message it injects. */

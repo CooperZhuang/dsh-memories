@@ -132,6 +132,7 @@ export function formatEntry(entry: MemoryEntry): string {
     ...entry.pinned === true ? ['pinned: true'] : [],
     ...entry.supersedes !== undefined && entry.supersedes.length > 0 ? [`supersedes: ${entry.supersedes}`] : [],
     ...entry.sourceSession !== undefined && entry.sourceSession.length > 0 ? [`session: ${entry.sourceSession}`] : [],
+    ...entry.derivedFrom !== undefined && entry.derivedFrom.length > 0 ? [`derivedFrom: ${entry.derivedFrom.join(', ')}`] : [],
     `created: ${new Date(entry.createdAt).toISOString()}`,
     `updated: ${new Date(entry.updatedAt).toISOString()}`,
     `source: ${entry.source}`,
@@ -189,6 +190,9 @@ export function parseEntry(text: string, scope: MemoryScope, fallbackId: string)
   const pinned = fields.get('pinned') === 'true'
   const supersedes = fields.get('supersedes')
   const sourceSession = fields.get('session')
+  // A list of ids in one comma-separated line, the same shape `tags` and `keys`
+  // use; an entry written before the field existed simply has none.
+  const derivedFrom = (fields.get('derivedfrom') ?? '').split(',').map((value) => value.trim()).filter((value) => value.length > 0)
   const keys = (fields.get('keys') ?? '').split(',').map(normalizeKey).filter((key) => key.length > 0)
   return {
     id: fields.get('id') ?? fallbackId,
@@ -205,6 +209,7 @@ export function parseEntry(text: string, scope: MemoryScope, fallbackId: string)
     ...pinned ? { pinned: true } : {},
     ...supersedes !== undefined && supersedes.length > 0 ? { supersedes } : {},
     ...sourceSession !== undefined && sourceSession.length > 0 ? { sourceSession } : {},
+    ...derivedFrom.length > 0 ? { derivedFrom } : {},
     createdAt: parseTime(fields.get('created'), updatedAt),
     updatedAt,
     uses: Number.isFinite(rawUses) && rawUses > 0 ? Math.trunc(rawUses) : 0,
@@ -868,6 +873,15 @@ export class MemoryStore {
     const asOf = durability === 'snapshot' ? (draft.asOf ?? existing?.asOf) : undefined
     const pinned = draft.pinned ?? existing?.pinned ?? false
     const sourceSession = draft.sourceSession?.trim() ?? existing?.sourceSession
+    // The merge trail. A draft may name what it was folded from (a consolidation
+    // does), and a supersede is itself evidence: the entry this one replaces is
+    // one of the things it was built from. Carried through a rewrite rather than
+    // recomputed, so re-wording a merged memory does not erase its sources, and
+    // never allowed to name the entry itself.
+    const derivedFrom = [...new Set([
+      ...(draft.derivedFrom ?? existing?.derivedFrom ?? []),
+      ...(draft.supersedes?.trim() !== undefined && draft.supersedes.trim().length > 0 ? [draft.supersedes.trim()] : []),
+    ])].filter((source) => source.length > 0 && source !== id)
     // An explicit `supersedes` always wins; otherwise a near-identical memory
     // already in the scope is treated as the thing this one rewrites, so a
     // re-worded lesson replaces its predecessor instead of joining it.
@@ -892,6 +906,7 @@ export class MemoryStore {
       // Provenance survives a rewrite: a consolidation that re-words an entry
       // must not erase which conversation it came from.
       ...sourceSession !== undefined && sourceSession.length > 0 ? { sourceSession } : {},
+      ...derivedFrom.length > 0 ? { derivedFrom } : {},
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
       uses: existing?.uses ?? 0,

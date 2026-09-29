@@ -9,8 +9,9 @@
  */
 import { MEMORY_KIND_HEADINGS, MEMORY_KINDS } from './types.js'
 import type { MemoryEntry, MemoryHit, MemoryKind } from './types.js'
-import { decayOf, importanceOf, matchCredit, recencyOf, relevanceOf } from './search.js'
+import { decayOf, importanceOf, matchCredit, recencyOf, relevanceOf, timeBoost } from './search.js'
 import type { ScopeEntries } from './search.js'
+import { parseTimeRange } from './time.js'
 import type { SessionNote } from './storage.js'
 
 /** Opening and closing frame of the injected, once-per-conversation block. */
@@ -90,6 +91,11 @@ function bullet(entry: MemoryEntry, maxChars: number, flag?: string): string {
  */
 export function rankForSummary(entries: readonly MemoryEntry[], now = Date.now(), query?: string): MemoryEntry[] {
   const needle = query?.trim() ?? ''
+  // Parsed once for the whole scope: an opening turn that names a date
+  // (「上个月那个发票接口的问题」) should order the tier it fills by that date, and
+  // resolving the window per entry would run the same regex sweep hundreds of
+  // times at the start of every conversation.
+  const window = needle.length === 0 ? undefined : parseTimeRange(needle, now)
   // Scored once per entry, because both the tier and the within-tier order need
   // the same number and the scorer is the expensive part.
   const verdicts = new Map<string, { about: boolean; relevance: number }>()
@@ -98,10 +104,10 @@ export function rankForSummary(entries: readonly MemoryEntry[], now = Date.now()
       verdicts.set(entry.id, { about: false, relevance: 0 })
       continue
     }
-    const credit = matchCredit(entry, needle, TOPIC_TIER_MIN_SCORE, TOPIC_TIER_MIN_TERMS, { singleTerm: false, now })
+    const credit = matchCredit(entry, needle, TOPIC_TIER_MIN_SCORE, TOPIC_TIER_MIN_TERMS, { singleTerm: false, now, range: window ?? null })
     verdicts.set(entry.id, { about: credit.about, relevance: credit.relevance })
   }
-  const weight = (entry: MemoryEntry): number => importanceOf(entry) * decayOf(entry, now)
+  const weight = (entry: MemoryEntry): number => importanceOf(entry) * decayOf(entry, now) * timeBoost(entry, window)
   return [...entries].sort((left, right) => {
     const a = verdicts.get(left.id)
     const b = verdicts.get(right.id)
@@ -514,8 +520,11 @@ export function renderMemorySummaryResult(
 export function renderHit(hit: MemoryHit, index: number): string {
   const { entry } = hit
   const tags = entry.tags.length > 0 ? ` tags=${entry.tags.join(',')}` : ''
+  // A hit the query did not match says so. Without the marker the model reads a
+  // one-hop neighbour as an answer to what it asked, and quotes it as one.
+  const via = hit.via === undefined ? '' : ` via=${hit.via}`
   return [
-    `${index + 1}. [${entry.scope}] ${entry.title}${tags} (id=${entry.id}, updated=${new Date(entry.updatedAt).toISOString()})`,
+    `${index + 1}. [${entry.scope}] ${entry.title}${tags} (id=${entry.id}, updated=${new Date(entry.updatedAt).toISOString()})${via}`,
     `   ${entry.body.replace(/\n+/gu, ' ')}`,
   ].join('\n')
 }

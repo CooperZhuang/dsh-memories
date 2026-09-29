@@ -89,3 +89,96 @@ test('a key-only query still clears the recall threshold', () => {
   // floor; the gate the delta actually applies is the relevance floor.
   assert.ok(hit !== undefined && relevanceOf(hit.entry, 'monorepo') >= 20, 'the key-only match clears the relevance floor')
 })
+
+// ── The four shapes a word-matching retriever actually fails ───────────────
+//
+// The corpus above is single-hop and mostly positive: every query shares a noun
+// with its memory, so it measures regressions in the scorer and nothing else —
+// a hundred per cent hit rate there says the formula did not break, not that the
+// retrieval is good. These four are the shapes that make a memory architecture
+// necessary, taken from the failure taxonomy Hindsight's paper reports (multi-hop
+// chains, temporal range, entity consolidation, belief revision). Each case gets
+// its own small store so the mechanism under test is the only thing that can
+// carry the answer, and each is asserted on its own line — a generic hit rate
+// would let one shape regress while another covers for it.
+
+/** Tuesday, 29 September 2026, 19:00 local — fixed so decay and dates are stable. */
+const NOW = new Date(2026, 8, 29, 19, 0, 0).getTime()
+/** A day, for building timestamps relative to {@link NOW}. */
+const DAY = 86_400_000
+
+/** One hard-case entry with explicit links and timestamps. */
+function linked(id: string, title: string, body: string, keys: string[], extra: Partial<MemoryEntry> = {}): MemoryEntry {
+  return {
+    id,
+    scope: 'global',
+    kind: 'fact',
+    title,
+    body,
+    tags: [],
+    keys,
+    createdAt: NOW - 30 * DAY,
+    updatedAt: NOW - 30 * DAY,
+    uses: 0,
+    lastUsedAt: 0,
+    lastSurfacedAt: 0,
+    source: 'auto',
+    ...extra,
+  }
+}
+
+/** Rank one hard corpus for one query. */
+function rankHard(entries: readonly MemoryEntry[], query: string, limit: number): string[] {
+  return searchMemories([{ scope: 'global', label: 'global', entries }], query, { limit, now: NOW, expand: true })
+    .map((hit) => hit.entry.id)
+}
+
+test('multi-hop: an entry linked to a match but sharing none of its words is still reachable', () => {
+  // The query names Alice; the answer is the cluster that failed. Nothing in the
+  // outage memory shares a word with the question — it is reachable only by
+  // following Alice → Project Atlas → Kubernetes, which is what the keys are for.
+  const corpus = [
+    linked('alice-role', 'Alice 是 Project Atlas 的技术负责人', '她带这个项目两年了。', ['alice', 'project-atlas']),
+    linked('atlas-migration', 'Alice 最近在忙 Project Atlas 的迁移', '她这阵子都在弄这件事。', ['project-atlas', 'kubernetes']),
+    linked('cluster-outage', 'Kubernetes 集群周二出过故障', '那次故障持续了四十分钟。', ['kubernetes', 'project-atlas']),
+  ]
+  const ids = rankHard(corpus, 'Alice 最近有没有受影响', 3)
+  assert.ok(ids.includes('alice-role') || ids.includes('atlas-migration'), `no direct match at all: ${ids.join(', ')}`)
+  assert.ok(ids.includes('cluster-outage'), `the linked memory was not reached: ${ids.join(', ')}`)
+})
+
+test('temporal: a question about a period prefers what was learned in it', () => {
+  // Identical wording, different months: the only thing that can order these two
+  // is the date, which is exactly what the time channel exists to supply.
+  const corpus = [
+    linked('async-spring', 'Alice 在做异步改造', '她那阵子在改异步数据库调用。', [], { createdAt: new Date(2025, 3, 10).getTime(), updatedAt: new Date(2025, 3, 10).getTime() }),
+    linked('async-autumn', 'Alice 在做异步改造', '她那阵子在改异步数据库调用。', [], { createdAt: new Date(2025, 10, 10).getTime(), updatedAt: new Date(2025, 10, 10).getTime() }),
+  ]
+  const query = 'Alice 去年春天在做什么'
+  assert.equal(relevanceOf(corpus[0]!, query), relevanceOf(corpus[1]!, query), 'the two are lexically identical')
+  assert.deepEqual(rankHard(corpus, query, 2), ['async-spring', 'async-autumn'])
+})
+
+test('entity consolidation: fragments filed under the same account arrive together', () => {
+  const KEYS = ['用户账户', 'profile']
+  const corpus = [
+    linked('account-login', '用户账户的登录方式', '走的是 SSO。', KEYS),
+    linked('account-timezone', '用户偏好的时区', '排期按 Asia/Shanghai 算。', KEYS),
+    linked('account-team', '用户所在的团队', '他在平台组。', KEYS),
+    linked('account-payment', '用户的支付方式', '走对公转账。', KEYS),
+  ]
+  const ids = rankHard(corpus, '你了解我的账户吗', 4)
+  assert.ok(ids.includes('account-login'), `the direct match is missing: ${ids.join(', ')}`)
+  const fragments = ids.filter((id) => id !== 'account-login')
+  assert.ok(fragments.length >= 2, `only the matching fragment came back: ${ids.join(', ')}`)
+})
+
+test('belief revision: the newer, deliberately written conclusion outranks the old one', () => {
+  const corpus = [
+    linked('async-multithread', '用户在 async Python 上挣扎', '最后用多线程跑通了。', [], { source: 'auto' }),
+    linked('async-asyncio', '用户已经转向 asyncio', '他已经在写异步数据库调用了。', [], { source: 'tool' }),
+  ]
+  const ids = rankHard(corpus, '用户现在的异步方案是什么', 2)
+  assert.deepEqual(ids, ['async-asyncio', 'async-multithread'])
+})
+

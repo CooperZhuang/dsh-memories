@@ -253,6 +253,7 @@ export function registerMemoryTool(ctx: Context, runtime: MemoriesRuntime): () =
           // session id directly when the note mentioned it.
           let target = args.evidenceSession?.trim()
           let context = ''
+          let trail = ''
           const id = args.id?.trim()
           if ((target === undefined || target.length === 0) && id !== undefined && id.length > 0) {
             const order: readonly MemoryScope[] = args.scope === undefined ? ['project', 'global'] : [args.scope]
@@ -265,9 +266,30 @@ export function registerMemoryTool(ctx: Context, runtime: MemoriesRuntime): () =
               return { ok: false, action: args.action, message: `No memory with id ${JSON.stringify(id)}.`, results: [] }
             }
             context = `Memory ${JSON.stringify(found.title)}: `
+            // The merge trail. A consolidation folds several memories into one
+            // and archives the sources, so without this the only record of what
+            // the surviving claim was built from is a list of ids nobody can
+            // open. Resolved here, and a source that is really gone says so
+            // instead of being dropped silently.
+            const sources = found.derivedFrom ?? []
+            if (sources.length > 0) {
+              const lines: string[] = []
+              for (const source of sources) {
+                let origin
+                for (const scope of order) {
+                  origin = await runtime.read(session, scope, source, false)
+                  if (origin !== undefined) break
+                }
+                lines.push(origin === undefined
+                  ? `  - ${source} (no longer in the store)`
+                  : `  - ${source}: ${origin.title}`)
+              }
+              trail = `merged from ${sources.length} ${sources.length === 1 ? 'memory' : 'memories'}:\n${lines.join('\n')}\n\n`
+            }
             target = found.sourceSession
             if (target === undefined || target.length === 0) {
-              return { ok: true, action: args.action, message: `${context}this memory records no source session.`, results: [toResult(found)] }
+              const note = trail.length === 0 ? '' : `\n\n${trail.trimEnd()}`
+              return { ok: true, action: args.action, message: `${context}this memory records no source session.${note}`, results: [toResult(found)] }
             }
           }
           if (target === undefined || target.length === 0) {
@@ -275,9 +297,9 @@ export function registerMemoryTool(ctx: Context, runtime: MemoriesRuntime): () =
           }
           const note = await runtime.store.readSessionNote(target)
           if (note === undefined) {
-            return { ok: true, action: args.action, message: `No evidence note for session ${JSON.stringify(target)} (only mined sessions have one).`, results: [] }
+            return { ok: true, action: args.action, message: `${trail}No evidence note for session ${JSON.stringify(target)} (only mined sessions have one).`, results: [] }
           }
-          return { ok: true, action: args.action, message: `${context}${renderEvidence(note)}`, results: [] }
+          return { ok: true, action: args.action, message: `${context}${trail}${renderEvidence(note)}`, results: [] }
         }
         /* c8 ignore next 2 -- the registry validates the action enum before dispatch */
         default:
